@@ -1,0 +1,177 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: netbackup-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-netbackup}
+      POSTGRES_USER: ${POSTGRES_USER:-netbackup}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-netbackup}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: netbackup-redis
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netbackup-backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-${SECRET_KEY}}
+      BACKUP_BASE_PATH: ${BACKUP_BASE_PATH:-/backups}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - backup_data:/backups
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netbackup-celery-worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      BACKUP_BASE_PATH: ${BACKUP_BASE_PATH:-/backups}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - backup_data:/backups
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netbackup-celery-beat
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+    restart: unless-stopped
+    command: celery -A app.celery_app beat --loglevel=info
+
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: netbackup-flower
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_BROKER_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${REDIS_URL:-redis://redis:6379/0}
+      SECRET_KEY: ${SECRET_KEY}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+    depends_on:
+      - redis
+      - celery_worker
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "5555:5555"
+    restart: unless-stopped
+    command: celery -A app.celery_app flower --port=5555
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+    container_name: netbackup-frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - frontend
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    command: npm run dev -- --host 0.0.0.0
+
+  nginx:
+    image: nginx:alpine
+    container_name: netbackup-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - frontend
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  backup_data:
+    driver: local
+
+networks:
+  backend:
+    driver: bridge
+  frontend:
+    driver: bridge
