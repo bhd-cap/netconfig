@@ -47,27 +47,6 @@ export const Compare: React.FC = () => {
     setSelectedConfigs(null);
   };
 
-  // Fetch config content for diff viewer
-  const [configContents, setConfigContents] = useState<{ old: string; new: string } | null>(null);
-
-  React.useEffect(() => {
-    const fetchContents = async () => {
-      if (compareResult && selectedConfigs) {
-        try {
-          // For now, we'll use the unified_diff from the API
-          // In a real implementation, you might want to fetch the full config files
-          setConfigContents({
-            old: '', // Would fetch from API if needed
-            new: '', // Would fetch from API if needed
-          });
-        } catch (error) {
-          console.error('Failed to fetch config contents:', error);
-        }
-      }
-    };
-    fetchContents();
-  }, [compareResult, selectedConfigs]);
-
   return (
     <div className="space-y-6">
       {/* Header */}

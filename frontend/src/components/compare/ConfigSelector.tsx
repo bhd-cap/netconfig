@@ -4,7 +4,7 @@
  */
 import React, { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Server, Calendar, HardDrive } from 'lucide-react';
+import { Calendar, HardDrive } from 'lucide-react';
 import api from '../../lib/api';
 import { Device, Configuration, PaginatedResponse } from '../../types';
 import { format } from 'date-fns';

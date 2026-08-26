@@ -25,53 +25,50 @@ const HEALTH_COLORS = {
   Healthy: '#10b981', // green
   Warning: '#f59e0b', // amber
   Critical: '#ef4444', // red
-  Inactive: '#6b7280', // gray
+  Unknown: '#6b7280', // gray
 };
+
+interface DeviceHealthResponse {
+  summary: {
+    total_devices: number;
+    healthy: number;
+    warning: number;
+    critical: number;
+    unknown: number;
+  };
+}
 
 export const DeviceHealthChart: React.FC = () => {
   const { data, isLoading, error } = useQuery({
     queryKey: ['device-health'],
     queryFn: async () => {
-      const response = await api.get('/devices', {
-        params: {
-          limit: 100,
-          skip: 0,
-        },
-      });
+      // The backend aggregates health buckets in SQL. This used to pull a
+      // page of 100 full device records every minute and count them here,
+      // which both transferred far more data than the four numbers it needed
+      // and silently ignored every device past the first 100.
+      const response = await api.get<DeviceHealthResponse>(
+        '/statistics/device-health',
+        { params: { limit: 1 } }
+      );
 
-      const devices = response.data.items;
+      const { healthy, warning, critical, unknown } = response.data.summary;
 
-      // Count devices by status
-      const healthCounts = {
-        Healthy: 0,
-        Warning: 0,
-        Critical: 0,
-        Inactive: 0,
-      };
+      const counts: Array<[keyof typeof HEALTH_COLORS, number]> = [
+        ['Healthy', healthy],
+        ['Warning', warning],
+        ['Critical', critical],
+        ['Unknown', unknown],
+      ];
 
-      devices.forEach((device: any) => {
-        if (!device.is_active) {
-          healthCounts.Inactive++;
-        } else if (device.status === 'healthy') {
-          healthCounts.Healthy++;
-        } else if (device.status === 'failed') {
-          healthCounts.Critical++;
-        } else {
-          healthCounts.Warning++;
-        }
-      });
-
-      // Convert to chart data
-      const chartData: DeviceHealthData[] = Object.entries(healthCounts)
-        .filter(([_, value]) => value > 0)
+      return counts
+        .filter(([, value]) => value > 0)
         .map(([name, value]) => ({
           name,
           value,
-          color: HEALTH_COLORS[name as keyof typeof HEALTH_COLORS],
-        }));
-
-      return chartData;
+          color: HEALTH_COLORS[name],
+        })) as DeviceHealthData[];
     },
+    staleTime: 60000,
     refetchInterval: 60000, // Refetch every minute
   });
 

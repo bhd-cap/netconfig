@@ -2,7 +2,7 @@
  * Settings Page - User and application settings
  */
 import React, { useState } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useMutation } from '@tanstack/react-query';
 import { User, Settings as SettingsIcon, Users, Lock, Save } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import api from '../lib/api';

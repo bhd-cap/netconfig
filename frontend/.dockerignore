@@ -1,0 +1,11 @@
+# node_modules is reinstalled inside the image; copying the host's copy in
+# would bloat the context by hundreds of MB and can carry the wrong platform
+# binaries.
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+*.md
+.eslintcache

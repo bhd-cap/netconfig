@@ -1,3 +1,17 @@
+# Production-oriented stack.
+#
+# Notable differences from the previous revision, all of them memory or CPU:
+#   * the backend runs plain uvicorn workers instead of --reload, which kept a
+#     filesystem watcher and a duplicate application process alive;
+#   * the frontend is a static nginx image built from the compiled bundle
+#     rather than the Vite dev server plus node_modules;
+#   * source bind mounts are gone, so containers run the code they were built
+#     with (use docker-compose.override.yml for a dev loop);
+#   * flower moved behind an optional profile - it is a whole extra Python
+#     process holding its own Redis connections and event history;
+#   * every service declares a memory limit so one runaway container cannot
+#     take the host down with it.
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -6,6 +20,25 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-netbackup}
       POSTGRES_USER: ${POSTGRES_USER:-netbackup}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      # Data checksums cost a little CPU but catch silent corruption of the
+      # configuration history.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-100}
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - track_io_timing=on
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -16,10 +49,27 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEMORY_LIMIT:-1g}
 
   redis:
     image: redis:7-alpine
     container_name: netbackup-redis
+    # Redis holds the Celery broker queues and task results. Capping it means
+    # a backlog is bounded instead of consuming all available memory; results
+    # already expire after a day (see celery_app.py).
+    command:
+      - redis-server
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-256mb}
+      - --maxmemory-policy
+      - noeviction
+      - --save
+      - ""
+      - --appendonly
+      - "no"
     networks:
       - backend
     healthcheck:
@@ -28,11 +78,16 @@ services:
       timeout: 3s
       retries: 5
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEMORY_LIMIT:-384m}
 
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: netbackup-backend:latest
     container_name: netbackup-backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
@@ -42,9 +97,13 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-${SECRET_KEY}}
       BACKUP_BASE_PATH: ${BACKUP_BASE_PATH:-/backups}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost}
+      # Pool per worker process, so keep it small: WEB_CONCURRENCY workers
+      # each open up to DB_POOL_SIZE + DB_MAX_OVERFLOW connections.
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
     volumes:
       - backup_data:/backups
-      - ./backend:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,16 +113,24 @@ services:
       - backend
       - frontend
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: ${BACKEND_MEMORY_LIMIT:-768m}
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+             uvicorn app.main:app --host 0.0.0.0 --port 8000
+             --workers ${WEB_CONCURRENCY:-2}
+             --no-access-log
+             --timeout-keep-alive 15"
 
   celery_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: netbackup-backend:latest
     container_name: netbackup-celery-worker
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
@@ -72,9 +139,11 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       BACKUP_BASE_PATH: ${BACKUP_BASE_PATH:-/backups}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      MAX_CONCURRENT_BACKUPS: ${MAX_CONCURRENT_BACKUPS:-10}
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-2}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-4}
     volumes:
       - backup_data:/backups
-      - ./backend:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -83,12 +152,33 @@ services:
     networks:
       - backend
     restart: unless-stopped
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=4
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME | grep -q pong"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEMORY_LIMIT:-1g}
+    # A backup task spends its time waiting on SSH, and each task already
+    # opens several sessions in parallel internally, so a small pool of
+    # processes is enough. -Ofair stops a slow task from blocking the
+    # prefetched work behind it.
+    command: >
+      celery -A app.celery_app worker
+      --loglevel=${CELERY_LOG_LEVEL:-INFO}
+      --concurrency=${CELERY_CONCURRENCY:-2}
+      -Ofair
+      --max-tasks-per-child=200
+      --without-gossip --without-mingle
 
   celery_beat:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: netbackup-backend:latest
     container_name: netbackup-celery-beat
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
@@ -96,6 +186,10 @@ services:
       SECRET_KEY: ${SECRET_KEY}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DB_POOL_SIZE: 1
+      DB_MAX_OVERFLOW: 2
+    volumes:
+      - beat_data:/var/lib/celery
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,13 +198,26 @@ services:
     networks:
       - backend
     restart: unless-stopped
-    command: celery -A app.celery_app beat --loglevel=info
+    # Beat only publishes messages; it has no HTTP surface to probe.
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: ${BEAT_MEMORY_LIMIT:-256m}
+    command: >
+      celery -A app.celery_app beat
+      --loglevel=${CELERY_LOG_LEVEL:-INFO}
+      --schedule=/var/lib/celery/celerybeat-schedule
 
+  # Optional task monitor: docker compose --profile monitoring up -d
   flower:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    image: netbackup-backend:latest
     container_name: netbackup-flower
+    profiles: ["monitoring"]
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://netbackup:changeme@postgres:5432/netbackup}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
@@ -120,37 +227,53 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
     depends_on:
       - redis
-      - celery_worker
     networks:
       - backend
       - frontend
     ports:
-      - "5555:5555"
+      - "${FLOWER_PORT:-5555}:5555"
     restart: unless-stopped
-    command: celery -A app.celery_app flower --port=5555
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: ${FLOWER_MEMORY_LIMIT:-384m}
+    # Bound the in-memory event history; the default keeps growing.
+    command: >
+      celery -A app.celery_app flower
+      --port=5555
+      --max-tasks=1000
+      --basic-auth=${FLOWER_BASIC_AUTH:-admin:changeme}
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000}
+        - VITE_API_URL=${VITE_API_URL:-http://localhost:8000/api/v1}
+    image: netbackup-frontend:latest
     container_name: netbackup-frontend
-    volumes:
-      - ./frontend:/app
-      - /app/node_modules
     depends_on:
       - backend
     networks:
       - frontend
     ports:
-      - "3000:3000"
+      - "${FRONTEND_PORT:-3000}:80"
     restart: unless-stopped
-    command: npm run dev -- --host 0.0.0.0
+    deploy:
+      resources:
+        limits:
+          memory: ${FRONTEND_MEMORY_LIMIT:-128m}
 
+  # Optional single-origin TLS terminating proxy in front of both services:
+  #   docker compose --profile proxy up -d
+  # The frontend container already serves the UI directly on FRONTEND_PORT, so
+  # this is only needed for TLS or to put everything on one origin.
   nginx:
     image: nginx:alpine
     container_name: netbackup-nginx
+    profiles: ["proxy"]
     ports:
       - "80:80"
       - "443:443"
@@ -163,11 +286,17 @@ services:
     networks:
       - frontend
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 128m
 
 volumes:
   postgres_data:
     driver: local
   backup_data:
+    driver: local
+  beat_data:
     driver: local
 
 networks:

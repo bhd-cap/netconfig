@@ -28,60 +28,48 @@ interface BackupTrendsChartProps {
   days?: number;
 }
 
+interface BackupTrendsResponse {
+  trends: Array<{
+    date: string;
+    total: number;
+    successful: number;
+    failed: number;
+  }>;
+}
+
 export const BackupTrendsChart: React.FC<BackupTrendsChartProps> = ({ days = 30 }) => {
   const { data, isLoading, error } = useQuery({
     queryKey: ['backup-trends', days],
     queryFn: async () => {
-      // Calculate date range
-      const endDate = new Date();
-      const startDate = new Date();
-      startDate.setDate(startDate.getDate() - days);
+      // Grouped by day in SQL over the whole requested window. The previous
+      // version asked for the most recent 100 backups and bucketed them
+      // client-side, so a busy install saw a 30-day chart built from perhaps
+      // a single day of data.
+      const response = await api.get<BackupTrendsResponse>(
+        '/statistics/backup-trends',
+        { params: { days } }
+      );
 
-      // Fetch backups in date range
-      const response = await api.get('/backups', {
-        params: {
-          limit: 100,
-          skip: 0,
-        },
-      });
+      const byDate = new Map(response.data.trends.map((t) => [t.date, t]));
 
-      const backups = response.data.items;
-
-      // Group by date
-      const trendsMap = new Map<string, { successful: number; failed: number }>();
-
-      // Initialize all dates with 0 counts
-      for (let i = 0; i < days; i++) {
+      // Fill gaps so days with no backups still appear on the axis.
+      const filled: BackupTrendsData[] = [];
+      for (let i = days - 1; i >= 0; i--) {
         const date = new Date();
         date.setDate(date.getDate() - i);
-        const dateStr = format(date, 'yyyy-MM-dd');
-        trendsMap.set(dateStr, { successful: 0, failed: 0 });
+        const key = format(date, 'yyyy-MM-dd');
+        const entry = byDate.get(key);
+
+        filled.push({
+          date: format(date, 'MMM d'),
+          successful: entry?.successful ?? 0,
+          failed: entry?.failed ?? 0,
+        });
       }
 
-      // Count backups by date and status
-      backups.forEach((backup: any) => {
-        const backupDate = format(new Date(backup.backed_up_at), 'yyyy-MM-dd');
-        if (trendsMap.has(backupDate)) {
-          const counts = trendsMap.get(backupDate)!;
-          if (backup.status === 'success') {
-            counts.successful++;
-          } else if (backup.status === 'failed') {
-            counts.failed++;
-          }
-        }
-      });
-
-      // Convert to array and sort by date
-      const trendsData: BackupTrendsData[] = Array.from(trendsMap.entries())
-        .map(([date, counts]) => ({
-          date: format(new Date(date), 'MMM d'),
-          successful: counts.successful,
-          failed: counts.failed,
-        }))
-        .reverse(); // Oldest to newest
-
-      return trendsData;
+      return filled;
     },
+    staleTime: 60000,
     refetchInterval: 60000, // Refetch every minute
   });
 

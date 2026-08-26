@@ -11,9 +11,7 @@ import {
   Power,
   PowerOff,
   Clock,
-  PlayCircle,
-  CheckCircle,
-  XCircle
+  PlayCircle
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import api from '../lib/api';

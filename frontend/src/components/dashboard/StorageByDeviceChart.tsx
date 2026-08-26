@@ -30,59 +30,40 @@ const formatFileSize = (bytes: number): string => {
   return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
 };
 
+interface StorageByDeviceResponse {
+  devices: Array<{
+    device_id: number;
+    hostname: string;
+    backup_count: number;
+    total_bytes: number;
+    total_mb: number;
+    avg_bytes: number;
+    avg_mb: number;
+  }>;
+}
+
 export const StorageByDeviceChart: React.FC = () => {
   const { data, isLoading, error } = useQuery({
     queryKey: ['storage-by-device'],
     queryFn: async () => {
-      // Fetch all devices
-      const devicesResponse = await api.get('/devices', {
-        params: {
-          limit: 100,
-          skip: 0,
-        },
-      });
+      // One grouped query server-side. Previously this fetched 100 devices
+      // and 100 backups and joined them in the browser, so per-device totals
+      // were wrong as soon as the organization had more than 100 backups.
+      const response = await api.get<StorageByDeviceResponse>(
+        '/statistics/storage-by-device',
+        { params: { limit: 10 } }
+      );
 
-      const devices = devicesResponse.data.items;
-
-      // Fetch all backups
-      const backupsResponse = await api.get('/backups', {
-        params: {
-          limit: 100,
-          skip: 0,
-        },
-      });
-
-      const backups = backupsResponse.data.items;
-
-      // Calculate storage per device
-      const storageMap = new Map<number, { hostname: string; storage: number }>();
-
-      devices.forEach((device: any) => {
-        storageMap.set(device.id, { hostname: device.hostname, storage: 0 });
-      });
-
-      backups.forEach((backup: any) => {
-        if (backup.status === 'success' && backup.file_size) {
-          const deviceData = storageMap.get(backup.device_id);
-          if (deviceData) {
-            deviceData.storage += backup.file_size;
-          }
-        }
-      });
-
-      // Convert to array and sort by storage (descending)
-      const storageData: StorageData[] = Array.from(storageMap.values())
-        .filter((item) => item.storage > 0)
-        .sort((a, b) => b.storage - a.storage)
-        .slice(0, 10) // Top 10 devices
-        .map((item) => ({
-          hostname: item.hostname.length > 15 ? item.hostname.substring(0, 15) + '...' : item.hostname,
-          storage: Math.round(item.storage / 1024), // Convert to KB for chart
-          storageFormatted: formatFileSize(item.storage),
-        }));
-
-      return storageData;
+      return response.data.devices.map((device) => ({
+        hostname:
+          device.hostname.length > 15
+            ? device.hostname.substring(0, 15) + '...'
+            : device.hostname,
+        storage: Math.round(device.total_bytes / 1024), // KB for the chart
+        storageFormatted: formatFileSize(device.total_bytes),
+      })) as StorageData[];
     },
+    staleTime: 60000,
     refetchInterval: 60000, // Refetch every minute
   });
 
@@ -136,7 +117,7 @@ export const StorageByDeviceChart: React.FC = () => {
               border: '1px solid #e5e7eb',
               borderRadius: '0.5rem',
             }}
-            formatter={(value: any, name: any, props: any) => [
+            formatter={(_value: any, _name: any, props: any) => [
               props.payload.storageFormatted,
               'Storage',
             ]}
