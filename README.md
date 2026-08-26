@@ -20,10 +20,17 @@ Email: [info@blackhawk11.com](mailto:info@blackhawk11.com)
 
 ### Prerequisites
 
+For the Docker deployment:
+
 - Docker 20.10+
 - Docker Compose 2.0+
 - 4GB RAM minimum
 - 50GB disk space
+
+For the [LXC deployment](lxc/README.md):
+
+- Debian 11/12 or Ubuntu 22.04/24.04 with systemd
+- 2 vCPU / 2GB RAM / 8GB disk minimum
 
 ### Installation (one line)
 
@@ -69,6 +76,24 @@ device password; if you lose it, saved credentials cannot be recovered.
 ```bash
 INSTALL_DIR=/opt/netconfig WITH_MONITORING=true ./install.sh
 ```
+
+### Install into an LXC container instead (no Docker)
+
+Runs natively under systemd - PostgreSQL, Redis, nginx and the application as
+ordinary services. On a Proxmox VE host, this creates the container for you:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/proxmox-create-lxc.sh)"
+```
+
+Inside an existing Debian/Ubuntu container, VM or server:
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/install.sh)"
+```
+
+The UI and API are served from one origin on port 80. See
+[lxc/README.md](lxc/README.md) for options, layout and operations.
 
 ### Manual installation
 

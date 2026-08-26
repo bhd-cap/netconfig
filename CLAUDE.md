@@ -382,6 +382,34 @@ generates `.env` with random secrets, builds, waits for `/api/v1/health`,
 migrates, and creates the admin user with the temporary password `changeme`.
 Re-running keeps existing secrets. `deploy.sh` now just delegates to it.
 
+### LXC / systemd deployment (`lxc/`)
+
+A second, Docker-free deployment installs the same code natively:
+`lxc/install.sh` runs inside a Debian/Ubuntu container or host,
+`lxc/proxmox-create-lxc.sh` runs on a Proxmox host and creates the container
+first. See `lxc/README.md`.
+
+Things to know before changing it:
+- Config lives at `/etc/netconfig-backup/netconfig.env`, **not**
+  `/etc/netconfig` - that path is a regular file on every Debian/Ubuntu system
+  (`libtirpc-common`, see `netconfig(5)`), so a directory cannot be created
+  there.
+- That file is a systemd `EnvironmentFile`: bare `KEY=value`, no shell
+  quoting. Never `source` it from a shell - `ADMIN_ORG_NAME=Default
+  Organization` would execute `Organization` as a command. `run_as_service`
+  parses it literally the way systemd does.
+- The unit files in `lxc/systemd/` are templates; `@APP_DIR@`, `@DATA_DIR@`,
+  `@CONFIG_FILE@` and `@USER@` are substituted at install time. Same for
+  `@HTTP_PORT@`, `@API_PORT@` and `@LISTEN6@` in `lxc/nginx/netconfig.conf`.
+- The IPv6 listener is added only when `/proc/net/if_inet6` exists; a
+  hard-coded `listen [::]:80` makes nginx fail to start on IPv4-only hosts.
+- `$APP_DIR` is deliberately not world-readable. nginx runs as `www-data`, so
+  only traversal on `$APP_DIR` and `$APP_DIR/frontend` plus read on
+  `frontend/dist` is granted (`publish_bundle`).
+- The LXC build sets `VITE_API_URL=/api/v1`, so nginx serves the UI and proxies
+  the API on one origin and CORS is not involved. The Docker build bakes in an
+  absolute URL because the API is published on a separate port there.
+
 ## Current Status
 
 **Complete**:

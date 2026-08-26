@@ -16,6 +16,25 @@ migrations and creates the admin user.
 
 -----------------------------------------------------------------------
 
+NO DOCKER? LXC / systemd INSTALL
+
+Installs natively instead: PostgreSQL, Redis, nginx and the application
+as ordinary systemd services, all on port 80.
+
+   On a Proxmox host (creates the container for you):
+
+      bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/proxmox-create-lxc.sh)"
+
+   Inside an existing Debian/Ubuntu container or server:
+
+      bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/install.sh)"
+
+   Manage with:  systemctl status netconfig-api
+                 journalctl -u netconfig-worker -f
+   Details:      lxc/README.md
+
+-----------------------------------------------------------------------
+
 OPEN
 
    Web UI      http://localhost:3000

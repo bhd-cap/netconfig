@@ -1,0 +1,53 @@
+[Unit]
+Description=NetConfig Backup API (uvicorn)
+Documentation=https://github.com/bhd-cap/netconfig
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP_DIR@/backend
+EnvironmentFile=@CONFIG_FILE@
+
+# Apply any pending migrations before serving. Idempotent, and a no-op once
+# the schema is current, so a restart after a code update is safe.
+ExecStartPre=@APP_DIR@/venv/bin/alembic upgrade head
+
+ExecStart=@APP_DIR@/venv/bin/uvicorn app.main:app \
+    --host 127.0.0.1 \
+    --port ${API_PORT} \
+    --workers ${WEB_CONCURRENCY} \
+    --no-access-log \
+    --timeout-keep-alive 15
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+
+# Return freed memory to the OS instead of letting glibc grow one arena per
+# thread; the backup paths are threaded and handle large configuration strings.
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# Roughly the container memory limit the Docker deployment sets. MemoryMax is
+# a hard ceiling; MemoryHigh throttles and reclaims before reaching it.
+MemoryHigh=640M
+MemoryMax=768M
+
+# Hardening. Kept to options that work in an unprivileged LXC container.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=@DATA_DIR@
+
+[Install]
+WantedBy=multi-user.target
