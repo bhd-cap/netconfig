@@ -3,6 +3,7 @@ BackupJob repository
 """
 from typing import List, Optional
 from datetime import datetime
+from sqlalchemy import func, select, update as sql_update
 from sqlalchemy.orm import Session
 from app.models.backup_job import BackupJob
 from app.repositories.base import BaseRepository
@@ -38,7 +39,7 @@ class BackupJobRepository(BaseRepository[BackupJob]):
         )
 
         if enabled_only:
-            query = query.filter(BackupJob.is_enabled == True)
+            query = query.filter(BackupJob.is_enabled.is_(True))
 
         return query.order_by(BackupJob.name).offset(skip).limit(limit).all()
 
@@ -71,7 +72,11 @@ class BackupJobRepository(BaseRepository[BackupJob]):
         Returns:
             List of enabled backup jobs
         """
-        return self.db.query(BackupJob).filter(BackupJob.is_enabled == True).all()
+        return list(
+            self.db.scalars(
+                select(BackupJob).where(BackupJob.is_enabled.is_(True))
+            ).all()
+        )
 
     def get_jobs_due(self, current_time: datetime) -> List[BackupJob]:
         """
@@ -83,36 +88,79 @@ class BackupJobRepository(BaseRepository[BackupJob]):
         Returns:
             List of jobs due for execution
         """
-        return (
-            self.db.query(BackupJob)
-            .filter(
-                BackupJob.is_enabled == True,
-                BackupJob.next_run_at <= current_time,
-            )
-            .all()
+        return list(
+            self.db.scalars(
+                select(BackupJob).where(
+                    BackupJob.is_enabled.is_(True),
+                    BackupJob.next_run_at <= current_time,
+                )
+            ).all()
         )
 
+    def get_due_job_identifiers(self, current_time: datetime) -> List[tuple]:
+        """
+        Get (id, name) of jobs due to run
+
+        This runs once a minute forever, so it selects two columns instead of
+        hydrating whole BackupJob entities (including their JSONB filters)
+        just to read an ID off each one.
+
+        Args:
+            current_time: Current datetime
+
+        Returns:
+            List of (job_id, job_name) tuples
+        """
+        return [
+            (row.id, row.name)
+            for row in self.db.execute(
+                select(BackupJob.id, BackupJob.name).where(
+                    BackupJob.is_enabled.is_(True),
+                    BackupJob.next_run_at <= current_time,
+                )
+            ).all()
+        ]
+
     def update_last_run(
-        self, job_id: int, last_run: datetime, next_run: datetime
-    ) -> Optional[BackupJob]:
+        self, job_id: int, last_run: datetime, next_run: Optional[datetime]
+    ) -> None:
         """
         Update job's last and next run times
+
+        Issues a targeted UPDATE rather than loading the row, mutating it and
+        re-reading it.
 
         Args:
             job_id: Job ID
             last_run: Last run timestamp
             next_run: Next scheduled run timestamp
+        """
+        self.db.execute(
+            sql_update(BackupJob)
+            .where(BackupJob.id == job_id)
+            .values(last_run_at=last_run, next_run_at=next_run)
+            .execution_options(synchronize_session=False)
+        )
+        self.db.commit()
+
+    def count_totals_by_organization(self, organization_id: int) -> dict:
+        """
+        Get total and enabled job counts in a single query
+
+        Args:
+            organization_id: Organization ID (tenant scope)
 
         Returns:
-            Updated job or None
+            dict with 'total' and 'enabled'
         """
-        job = self.get(job_id)
-        if job:
-            job.last_run_at = last_run
-            job.next_run_at = next_run
-            self.db.commit()
-            self.db.refresh(job)
-        return job
+        row = self.db.execute(
+            select(
+                func.count(BackupJob.id),
+                func.count(BackupJob.id).filter(BackupJob.is_enabled.is_(True)),
+            ).where(BackupJob.organization_id == organization_id)
+        ).one()
+
+        return {"total": row[0], "enabled": row[1]}
 
     def count_by_organization(
         self, organization_id: int, is_enabled: Optional[bool] = None
@@ -127,14 +175,14 @@ class BackupJobRepository(BaseRepository[BackupJob]):
         Returns:
             Job count
         """
-        query = self.db.query(BackupJob).filter(
+        stmt = select(func.count(BackupJob.id)).where(
             BackupJob.organization_id == organization_id
         )
 
         if is_enabled is not None:
-            query = query.filter(BackupJob.is_enabled == is_enabled)
+            stmt = stmt.where(BackupJob.is_enabled.is_(is_enabled))
 
-        return query.count()
+        return self.db.scalar(stmt) or 0
 
     def get_by_name_and_organization(
         self, name: str, organization_id: int

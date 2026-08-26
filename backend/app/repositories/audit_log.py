@@ -3,6 +3,7 @@ AuditLog repository
 """
 from typing import List, Optional
 from datetime import datetime, timedelta
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from app.models.audit_log import AuditLog
 from app.repositories.base import BaseRepository
@@ -124,15 +125,15 @@ class AuditLogRepository(BaseRepository[AuditLog]):
             Audit log count
         """
         cutoff = datetime.utcnow() - timedelta(days=days)
-        query = self.db.query(AuditLog).filter(AuditLog.timestamp >= cutoff)
+        stmt = select(func.count(AuditLog.id)).where(AuditLog.timestamp >= cutoff)
 
         if user_id:
-            query = query.filter(AuditLog.user_id == user_id)
+            stmt = stmt.where(AuditLog.user_id == user_id)
 
         if action:
-            query = query.filter(AuditLog.action == action)
+            stmt = stmt.where(AuditLog.action == action)
 
-        return query.count()
+        return self.db.scalar(stmt) or 0
 
     def log_action(
         self,
@@ -144,6 +145,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         ip_address: Optional[str] = None,
         status: str = "success",
         error_message: Optional[str] = None,
+        commit: bool = True,
     ) -> AuditLog:
         """
         Create an audit log entry
@@ -157,6 +159,9 @@ class AuditLogRepository(BaseRepository[AuditLog]):
             ip_address: IP address of user
             status: Action status
             error_message: Error message if failed
+            commit: Commit immediately. Pass False when the caller is already
+                writing other rows in the same transaction, so the audit entry
+                rides along instead of forcing its own round trip.
 
         Returns:
             Created audit log
@@ -172,6 +177,8 @@ class AuditLogRepository(BaseRepository[AuditLog]):
             error_message=error_message,
         )
         self.db.add(log_entry)
-        self.db.commit()
-        self.db.refresh(log_entry)
+
+        if commit:
+            self.db.commit()
+
         return log_entry

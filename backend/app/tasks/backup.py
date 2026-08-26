@@ -129,17 +129,14 @@ def scheduled_backup_task(job_id: int):
                 "message": "Job is disabled",
             }
 
-        # Get devices to backup based on job filter
-        if job.device_filter:
-            # Apply filters from job configuration
-            # For now, backup all active devices in the organization
-            # Can be enhanced to support complex filtering
-            devices = device_repo.get_active_by_organization(job.organization_id)
-        else:
-            # No filter, backup all active devices
-            devices = device_repo.get_active_by_organization(job.organization_id)
+        # Get devices to backup based on job filter.
+        #
+        # Complex per-job filtering is still unimplemented (both branches were
+        # already identical), but only IDs are needed here, so this no longer
+        # loads every device row - credentials and all - to read an id off each.
+        device_ids = device_repo.get_active_ids_by_organization(job.organization_id)
 
-        if not devices:
+        if not device_ids:
             logger.warning(f"No devices found for job {job_id}")
             return {
                 "success": True,
@@ -147,8 +144,6 @@ def scheduled_backup_task(job_id: int):
                 "devices_backed_up": 0,
             }
 
-        # Backup all devices
-        device_ids = [d.id for d in devices]
         logger.info(f"Job {job_id}: backing up {len(device_ids)} devices")
 
         result = retriever.backup_multiple_devices(device_ids, user_id=None)
@@ -189,7 +184,9 @@ def scheduled_backup_task(job_id: int):
         db.close()
 
 
-@celery_app.task(name="app.tasks.backup.apply_retention_policy_task")
+@celery_app.task(
+    name="app.tasks.backup.apply_retention_policy_task", ignore_result=True
+)
 def apply_retention_policy_task(device_id: int, keep_count: int = None):
     """
     Apply retention policy to a device's configurations
@@ -228,7 +225,9 @@ def apply_retention_policy_task(device_id: int, keep_count: int = None):
         db.close()
 
 
-@celery_app.task(name="app.tasks.backup.check_scheduled_jobs_task")
+@celery_app.task(
+    name="app.tasks.backup.check_scheduled_jobs_task", ignore_result=True
+)
 def check_scheduled_jobs_task():
     """
     Check for scheduled backup jobs that are due to run
@@ -246,8 +245,9 @@ def check_scheduled_jobs_task():
         job_repo = BackupJobRepository(db)
         current_time = datetime.utcnow()
 
-        # Get jobs that are due
-        due_jobs = job_repo.get_jobs_due(current_time)
+        # Get jobs that are due. Only (id, name) is selected: this runs every
+        # 60 seconds forever and almost always finds nothing to do.
+        due_jobs = job_repo.get_due_job_identifiers(current_time)
 
         if not due_jobs:
             logger.debug("No scheduled jobs due at this time")
@@ -260,17 +260,17 @@ def check_scheduled_jobs_task():
         logger.info(f"Found {len(due_jobs)} job(s) due for execution")
 
         triggered_count = 0
-        for job in due_jobs:
+        for job_id, job_name in due_jobs:
             try:
                 # Trigger the scheduled backup task
-                task = scheduled_backup_task.delay(job.id)
+                task = scheduled_backup_task.delay(job_id)
                 logger.info(
-                    f"Triggered job '{job.name}' (ID: {job.id}, Task: {task.id})"
+                    f"Triggered job '{job_name}' (ID: {job_id}, Task: {task.id})"
                 )
                 triggered_count += 1
 
             except Exception as e:
-                logger.error(f"Failed to trigger job {job.id}: {e}")
+                logger.error(f"Failed to trigger job {job_id}: {e}")
 
         return {
             "success": True,

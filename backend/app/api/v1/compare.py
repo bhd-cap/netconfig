@@ -12,6 +12,7 @@ from app.repositories.configuration import ConfigurationRepository
 from app.repositories.device import DeviceRepository
 from app.repositories.audit_log import AuditLogRepository
 from app.services.config_comparison import config_comparison
+from app.services.storage import StorageError
 from pydantic import BaseModel
 
 
@@ -79,21 +80,21 @@ def compare_configurations(
             detail=f"Configuration {compare_request.config2_id} not found",
         )
 
-    # Verify both devices belong to organization
-    device1 = device_repo.get_by_id_and_organization(config1.device_id, organization_id)
-    device2 = device_repo.get_by_id_and_organization(config2.device_id, organization_id)
-
-    if not device1 or not device2:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
-
-    # Verify both configs are from the same device
+    # Verify both configs are from the same device before any device lookup,
+    # so the mismatch case costs no queries at all.
     if config1.device_id != config2.device_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Configurations must be from the same device",
+        )
+
+    # Verify the device belongs to organization
+    device1 = device_repo.get_by_id_and_organization(config1.device_id, organization_id)
+
+    if not device1:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
         )
 
     # Perform comparison
@@ -104,6 +105,7 @@ def compare_configurations(
             config1_label=f"{device1.hostname} - {config1.backed_up_at.strftime('%Y-%m-%d %H:%M:%S')}",
             config2_label=f"{device1.hostname} - {config2.backed_up_at.strftime('%Y-%m-%d %H:%M:%S')}",
             context_lines=compare_request.context_lines,
+            include_html=compare_request.include_html,
         )
 
         # Log comparison
@@ -121,11 +123,13 @@ def compare_configurations(
             },
         )
 
-        # Remove HTML diff if not requested
-        if not compare_request.include_html:
-            result.pop("html_diff", None)
-
         return result
+
+    except (StorageError, FileNotFoundError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Stored configuration file is unavailable: {str(e)}",
+        )
 
     except Exception as e:
         raise HTTPException(
@@ -190,13 +194,16 @@ def compare_latest_vs_previous(
             config1_label=f"{device.hostname} - {config1.backed_up_at.strftime('%Y-%m-%d %H:%M:%S')}",
             config2_label=f"{device.hostname} - {config2.backed_up_at.strftime('%Y-%m-%d %H:%M:%S')}",
             context_lines=context_lines,
+            include_html=include_html,
         )
 
-        # Remove HTML diff if not requested
-        if not include_html:
-            result.pop("html_diff", None)
-
         return result
+
+    except (StorageError, FileNotFoundError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Stored configuration file is unavailable: {str(e)}",
+        )
 
     except Exception as e:
         raise HTTPException(
@@ -242,21 +249,17 @@ def get_comparison_summary(
             detail="One or both configurations not found",
         )
 
-    # Verify devices belong to organization
-    device1 = device_repo.get_by_id_and_organization(config1.device_id, organization_id)
-    device2 = device_repo.get_by_id_and_organization(config2.device_id, organization_id)
-
-    if not device1 or not device2:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
-
-    # Verify same device
+    # Verify same device first; then one device lookup covers both configs.
     if config1.device_id != config2.device_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Configurations must be from the same device",
+        )
+
+    if not device_repo.get_by_id_and_organization(config1.device_id, organization_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
         )
 
     try:
@@ -266,6 +269,12 @@ def get_comparison_summary(
         )
 
         return summary
+
+    except (StorageError, FileNotFoundError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Stored configuration file is unavailable: {str(e)}",
+        )
 
     except Exception as e:
         raise HTTPException(

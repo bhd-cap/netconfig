@@ -51,14 +51,23 @@ def trigger_backup(
     device_repo = DeviceRepository(db)
     audit_repo = AuditLogRepository(db)
 
-    # Verify all devices belong to user's organization
-    for device_id in request.device_ids:
-        device = device_repo.get_by_id_and_organization(device_id, organization_id)
-        if not device:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Device {device_id} not found or access denied",
-            )
+    # Verify all devices belong to user's organization. One IN query rather
+    # than a round trip per requested device.
+    found_ids = {
+        device.id
+        for device in device_repo.get_by_ids_and_organization(
+            request.device_ids, organization_id
+        )
+    }
+    missing = [
+        device_id for device_id in request.device_ids if device_id not in found_ids
+    ]
+
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Device {missing[0]} not found or access denied",
+        )
 
     # Trigger backup task(s)
     if len(request.device_ids) == 1:
@@ -107,20 +116,25 @@ def get_task_status(
     """
     task_result = AsyncResult(task_id, app=celery_app)
 
+    # Read state and payload once. Every state predicate on AsyncResult
+    # (successful(), failed(), .state) can hit the result backend again.
+    state = task_result.state
+    info = task_result.info
+
     response = {
         "task_id": task_id,
-        "status": task_result.state,
+        "status": state,
         "result": None,
         "error": None,
         "progress": None,
     }
 
-    if task_result.successful():
-        response["result"] = task_result.result
-    elif task_result.failed():
-        response["error"] = str(task_result.info)
-    elif task_result.state == "PROGRESS":
-        response["progress"] = task_result.info.get("progress", 0)
+    if state == "SUCCESS":
+        response["result"] = info
+    elif state == "FAILURE":
+        response["error"] = str(info)
+    elif state == "PROGRESS" and isinstance(info, dict):
+        response["progress"] = info.get("progress", 0)
 
     return response
 
@@ -154,7 +168,6 @@ def list_configurations(
     device_repo = DeviceRepository(db)
 
     if device_id:
-        # Get configurations for specific device
         # Verify device belongs to organization
         device = device_repo.get_by_id_and_organization(device_id, organization_id)
         if not device:
@@ -163,22 +176,31 @@ def list_configurations(
                 detail="Device not found",
             )
 
-        configurations = config_repo.get_by_device(device_id, skip, limit)
-        total = config_repo.count_by_device(device_id)
-    else:
-        # Get all configurations for organization
-        configurations = config_repo.get_by_organization(
-            organization_id, skip, limit, status
-        )
-        total = config_repo.count_by_organization(organization_id, status)
+    # The listing query already joins devices for the tenant filter, so the
+    # hostname/IP come from that join. Reading config.device per row used to
+    # fire an extra SELECT for every item on the page.
+    configurations = config_repo.get_by_organization(
+        organization_id,
+        skip=skip,
+        limit=limit,
+        status=status,
+        device_id=device_id,
+        with_device=True,
+    )
+    total = config_repo.count_by_organization(
+        organization_id, status=status, device_id=device_id
+    )
 
     # Enrich with device information
-    response_items = []
-    for config in configurations:
-        config_dict = config.__dict__.copy()
-        config_dict["device_hostname"] = config.device.hostname if config.device else None
-        config_dict["device_ip"] = config.device.ip_address if config.device else None
-        response_items.append(config_dict)
+    response_items = [
+        ConfigurationResponse.model_validate(config).model_copy(
+            update={
+                "device_hostname": config.device.hostname if config.device else None,
+                "device_ip": config.device.ip_address if config.device else None,
+            }
+        )
+        for config in configurations
+    ]
 
     return {
         "total": total,
@@ -212,29 +234,30 @@ def get_configuration(
         HTTPException: If configuration not found or access denied
     """
     config_repo = ConfigurationRepository(db)
-    device_repo = DeviceRepository(db)
 
-    config = config_repo.get(config_id)
-    if not config:
+    # Configuration and device in one joined query instead of two.
+    found = config_repo.get_with_device(config_id)
+    if not found:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Configuration not found",
         )
 
-    # Verify device belongs to organization
-    device = device_repo.get_by_id_and_organization(config.device_id, organization_id)
-    if not device:
+    config, device = found
+
+    if device.organization_id != organization_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
         )
 
     # Enrich with device info
-    config_dict = config.__dict__.copy()
-    config_dict["device_hostname"] = device.hostname
-    config_dict["device_ip"] = device.ip_address
-
-    return config_dict
+    return ConfigurationResponse.model_validate(config).model_copy(
+        update={
+            "device_hostname": device.hostname,
+            "device_ip": device.ip_address,
+        }
+    )
 
 
 @router.get("/{config_id}/download")
@@ -260,31 +283,30 @@ def download_configuration(
         HTTPException: If configuration not found or access denied
     """
     config_repo = ConfigurationRepository(db)
-    device_repo = DeviceRepository(db)
     audit_repo = AuditLogRepository(db)
 
-    config = config_repo.get(config_id)
-    if not config:
+    found = config_repo.get_with_device(config_id)
+    if not found:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Configuration not found",
         )
 
-    # Verify device belongs to organization
-    device = device_repo.get_by_id_and_organization(config.device_id, organization_id)
-    if not device:
+    config, device = found
+
+    if device.organization_id != organization_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
         )
 
-    # Check if file exists
-    try:
-        content = storage_service.get_config(config.file_path)
-    except Exception as e:
+    # Check the file is present with a stat() call. This used to read the
+    # entire configuration into memory and discard it, only for FileResponse
+    # to stream the same file again from disk.
+    if not storage_service.exists(config.file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Configuration file not found: {str(e)}",
+            detail=f"Configuration file not found: {config.filename}",
         )
 
     # Log download
@@ -330,19 +352,18 @@ def delete_configuration(
         HTTPException: If configuration not found or access denied
     """
     config_repo = ConfigurationRepository(db)
-    device_repo = DeviceRepository(db)
     audit_repo = AuditLogRepository(db)
 
-    config = config_repo.get(config_id)
-    if not config:
+    found = config_repo.get_with_device(config_id)
+    if not found:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Configuration not found",
         )
 
-    # Verify device belongs to organization
-    device = device_repo.get_by_id_and_organization(config.device_id, organization_id)
-    if not device:
+    config, device = found
+
+    if device.organization_id != organization_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -354,15 +375,8 @@ def delete_configuration(
     # Delete from database
     config_repo.delete(config_id)
 
-    # Delete file from storage
-    try:
-        import os
-        if os.path.exists(file_path):
-            os.remove(file_path)
-    except Exception as e:
-        # Log but don't fail
-        import logging
-        logging.warning(f"Failed to delete config file {file_path}: {e}")
+    # Delete file from storage; a missing file is not an error here.
+    storage_service.delete_file(file_path)
 
     # Log deletion
     audit_repo.log_action(

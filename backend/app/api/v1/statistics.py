@@ -2,17 +2,15 @@
 Dashboard Statistics API endpoints
 """
 from typing import Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, select
 
 from app.core.database import get_db
 from app.api.deps import get_current_user, get_organization_id
 from app.models.user import User
 from app.models.device import Device
-from app.models.configuration import Configuration
-from app.models.backup_job import BackupJob
 from app.repositories.device import DeviceRepository
 from app.repositories.configuration import ConfigurationRepository
 from app.repositories.backup_job import BackupJobRepository
@@ -40,6 +38,10 @@ def get_dashboard_statistics(
     """
     Get comprehensive dashboard statistics for the organization
 
+    This is the most frequently polled endpoint in the application. It used to
+    issue ten separate queries plus one lazy load per recent-activity row; the
+    counters are now folded into conditional aggregates, so it costs four.
+
     Args:
         current_user: Current authenticated user
         organization_id: Organization ID (from token)
@@ -52,99 +54,49 @@ def get_dashboard_statistics(
     config_repo = ConfigurationRepository(db)
     job_repo = BackupJobRepository(db)
 
-    # Device statistics
-    total_devices = device_repo.count_by_organization(organization_id)
-    active_devices = device_repo.count_by_organization(organization_id, is_active=True)
-    inactive_devices = total_devices - active_devices
+    # 1: device totals and per-type breakdown
+    device_stats = device_repo.count_grouped_by_status(organization_id)
 
-    # Backup statistics
-    total_backups = config_repo.count_by_organization(organization_id)
-    successful_backups = config_repo.count_by_organization(organization_id, status="success")
-    failed_backups = config_repo.count_by_organization(organization_id, status="failed")
+    # 2: every backup counter plus storage totals
+    backup_stats = config_repo.get_organization_summary(organization_id)
 
-    # Recent backup activity (last 24 hours)
-    last_24h = datetime.utcnow() - timedelta(hours=24)
-    recent_successful = db.query(Configuration).join(Device).filter(
-        Device.organization_id == organization_id,
-        Configuration.backed_up_at >= last_24h,
-        Configuration.status == "success",
-    ).count()
+    # 3: job totals
+    job_stats = job_repo.count_totals_by_organization(organization_id)
 
-    recent_failed = db.query(Configuration).join(Device).filter(
-        Device.organization_id == organization_id,
-        Configuration.backed_up_at >= last_24h,
-        Configuration.status == "failed",
-    ).count()
+    # 4: recent activity, hostname read from the join
+    recent_activity_list = config_repo.get_recent_activity(organization_id, limit=10)
 
-    # Backup job statistics
-    total_jobs = job_repo.count_by_organization(organization_id)
-    enabled_jobs = job_repo.count_by_organization(organization_id, is_enabled=True)
-
-    # Storage statistics
-    storage_result = db.query(
-        func.sum(Configuration.file_size).label("total_size"),
-        func.avg(Configuration.file_size).label("avg_size"),
-    ).join(Device).filter(
-        Device.organization_id == organization_id
-    ).first()
-
-    total_storage = storage_result.total_size or 0
-    avg_backup_size = storage_result.avg_size or 0
-
-    # Device type breakdown
-    device_types = db.query(
-        Device.device_type,
-        func.count(Device.id).label("count")
-    ).filter(
-        Device.organization_id == organization_id
-    ).group_by(Device.device_type).all()
-
-    device_type_breakdown = {dt: count for dt, count in device_types}
-
-    # Recent backups (last 10)
-    recent_backups = db.query(Configuration).join(Device).filter(
-        Device.organization_id == organization_id
-    ).order_by(Configuration.backed_up_at.desc()).limit(10).all()
-
-    recent_activity_list = []
-    for backup in recent_backups:
-        recent_activity_list.append({
-            "config_id": backup.id,
-            "device_id": backup.device_id,
-            "device_hostname": backup.device.hostname if backup.device else None,
-            "backed_up_at": backup.backed_up_at.isoformat(),
-            "status": backup.status,
-            "file_size": backup.file_size,
-            "duration": backup.backup_duration,
-        })
-
-    # Success rate
+    total_backups = backup_stats["total"]
     success_rate = (
-        (successful_backups / total_backups * 100) if total_backups > 0 else 0
+        (backup_stats["successful"] / total_backups * 100) if total_backups else 0
     )
+
+    total_storage = backup_stats["total_size"]
+    avg_backup_size = backup_stats["avg_size"]
 
     return {
         "devices": {
-            "total": total_devices,
-            "active": active_devices,
-            "inactive": inactive_devices,
-            "by_type": device_type_breakdown,
+            "total": device_stats["total"],
+            "active": device_stats["active"],
+            "inactive": device_stats["total"] - device_stats["active"],
+            "by_type": device_stats["by_type"],
         },
         "backups": {
             "total": total_backups,
-            "successful": successful_backups,
-            "failed": failed_backups,
+            "successful": backup_stats["successful"],
+            "failed": backup_stats["failed"],
             "success_rate": round(success_rate, 2),
             "last_24h": {
-                "successful": recent_successful,
-                "failed": recent_failed,
-                "total": recent_successful + recent_failed,
+                "successful": backup_stats["recent_successful"],
+                "failed": backup_stats["recent_failed"],
+                "total": backup_stats["recent_successful"]
+                + backup_stats["recent_failed"],
             },
         },
         "jobs": {
-            "total": total_jobs,
-            "enabled": enabled_jobs,
-            "disabled": total_jobs - enabled_jobs,
+            "total": job_stats["total"],
+            "enabled": job_stats["enabled"],
+            "disabled": job_stats["total"] - job_stats["enabled"],
         },
         "storage": {
             "total_bytes": int(total_storage),
@@ -179,59 +131,39 @@ def get_backup_trends(
     Returns:
         dict: Backup trends data for charting
     """
-    start_date = datetime.utcnow() - timedelta(days=days)
+    config_repo = ConfigurationRepository(db)
 
-    # Query backup counts by day
-    daily_stats = db.query(
-        func.date(Configuration.backed_up_at).label("date"),
-        func.count(Configuration.id).label("total"),
-        func.sum(func.case(
-            (Configuration.status == "success", 1),
-            else_=0
-        )).label("successful"),
-        func.sum(func.case(
-            (Configuration.status == "failed", 1),
-            else_=0
-        )).label("failed"),
-    ).join(Device).filter(
-        Device.organization_id == organization_id,
-        Configuration.backed_up_at >= start_date
-    ).group_by(
-        func.date(Configuration.backed_up_at)
-    ).order_by(
-        func.date(Configuration.backed_up_at)
-    ).all()
+    # The per-day success/failure split is computed with aggregate FILTER
+    # clauses. The previous implementation called func.case(...), which emits a
+    # call to a SQL function literally named "case" - Postgres has no such
+    # function, so this endpoint raised as soon as it was hit.
+    trends = config_repo.get_daily_trends(organization_id, days)
 
-    trends = []
-    for stat in daily_stats:
-        trends.append({
-            "date": stat.date.isoformat(),
-            "total": stat.total,
-            "successful": stat.successful,
-            "failed": stat.failed,
-        })
+    total = sum(t["total"] for t in trends)
+    start_date = datetime.utcnow().date()
+
+    if trends:
+        start_date = datetime.fromisoformat(trends[0]["date"]).date()
 
     return {
         "period": {
-            "start_date": start_date.date().isoformat(),
+            "start_date": start_date.isoformat(),
             "end_date": datetime.utcnow().date().isoformat(),
             "days": days,
         },
         "trends": trends,
         "summary": {
-            "total_backups": sum(t["total"] for t in trends),
+            "total_backups": total,
             "total_successful": sum(t["successful"] for t in trends),
             "total_failed": sum(t["failed"] for t in trends),
-            "avg_per_day": round(
-                sum(t["total"] for t in trends) / len(trends) if trends else 0,
-                2
-            ),
+            "avg_per_day": round(total / len(trends), 2) if trends else 0,
         },
     }
 
 
 @router.get("/device-health")
 def get_device_health(
+    limit: int = Query(500, ge=1, le=2000, description="Maximum devices to list"),
     current_user: User = Depends(get_current_user),
     organization_id: int = Depends(get_organization_id),
     db: Session = Depends(get_db),
@@ -239,7 +171,12 @@ def get_device_health(
     """
     Get device health status based on recent backups
 
+    The summary counts are aggregated in the database over all devices; the
+    per-device list selects three columns rather than loading whole Device
+    entities (encrypted credentials included) to bucket them in Python.
+
     Args:
+        limit: Maximum devices to include in the detail list
         current_user: Current authenticated user
         organization_id: Organization ID (from token)
         db: Database session
@@ -247,57 +184,89 @@ def get_device_health(
     Returns:
         dict: Device health statistics
     """
-    device_repo = DeviceRepository(db)
+    now = datetime.now(timezone.utc)
 
-    # Get all devices
-    devices = device_repo.get_by_organization(organization_id, skip=0, limit=1000)
+    # Health is defined by last_backup_status and the age of last_backup_at:
+    # never backed up -> unknown, failed -> critical, under 24h -> healthy,
+    # under 72h -> warning, older -> critical.
+    #
+    # Age is computed against the database's own now() so that the comparison
+    # stays in one timezone-aware clock; last_backup_at is a timestamptz and
+    # passing a client-side naive datetime would have it silently reinterpreted
+    # in whatever timezone the session happens to be set to.
+    age_hours = func.extract("epoch", func.now() - Device.last_backup_at) / 3600.0
 
-    now = datetime.utcnow()
-    healthy = 0
-    warning = 0
-    critical = 0
-    unknown = 0
+    is_unknown = Device.last_backup_at.is_(None)
+    is_failed = (~is_unknown) & (Device.last_backup_status == "failed")
+    is_healthy = (~is_unknown) & (~is_failed) & (age_hours <= 24)
+    is_warning = (~is_unknown) & (~is_failed) & (age_hours > 24) & (age_hours <= 72)
+    is_critical = is_failed | ((~is_unknown) & (~is_failed) & (age_hours > 72))
+
+    summary_row = db.execute(
+        select(
+            func.count(Device.id).label("total"),
+            func.count(Device.id).filter(is_healthy).label("healthy"),
+            func.count(Device.id).filter(is_warning).label("warning"),
+            func.count(Device.id).filter(is_critical).label("critical"),
+            func.count(Device.id).filter(is_unknown).label("unknown"),
+        ).where(Device.organization_id == organization_id)
+    ).one()
+
+    rows = db.execute(
+        select(
+            Device.id,
+            Device.hostname,
+            Device.last_backup_at,
+            Device.last_backup_status,
+        )
+        .where(Device.organization_id == organization_id)
+        .order_by(Device.hostname)
+        .limit(limit)
+    ).all()
 
     device_health_list = []
 
-    for device in devices:
-        if not device.last_backup_at:
+    for row in rows:
+        if row.last_backup_at is None:
             status = "unknown"
-            unknown += 1
-        elif device.last_backup_status == "failed":
+        elif row.last_backup_status == "failed":
             status = "critical"
-            critical += 1
         else:
-            # Check time since last backup
-            time_since_backup = (now - device.last_backup_at).total_seconds() / 3600  # hours
+            last_backup_at = row.last_backup_at
+            if last_backup_at.tzinfo is None:
+                last_backup_at = last_backup_at.replace(tzinfo=timezone.utc)
 
-            if time_since_backup <= 24:
+            hours_since = (now - last_backup_at).total_seconds() / 3600
+
+            if hours_since <= 24:
                 status = "healthy"
-                healthy += 1
-            elif time_since_backup <= 72:
+            elif hours_since <= 72:
                 status = "warning"
-                warning += 1
             else:
                 status = "critical"
-                critical += 1
 
-        device_health_list.append({
-            "device_id": device.id,
-            "hostname": device.hostname,
-            "status": status,
-            "last_backup_at": device.last_backup_at.isoformat() if device.last_backup_at else None,
-            "last_backup_status": device.last_backup_status,
-        })
+        device_health_list.append(
+            {
+                "device_id": row.id,
+                "hostname": row.hostname,
+                "status": status,
+                "last_backup_at": (
+                    row.last_backup_at.isoformat() if row.last_backup_at else None
+                ),
+                "last_backup_status": row.last_backup_status,
+            }
+        )
 
     return {
         "summary": {
-            "total_devices": len(devices),
-            "healthy": healthy,
-            "warning": warning,
-            "critical": critical,
-            "unknown": unknown,
+            "total_devices": summary_row.total,
+            "healthy": summary_row.healthy,
+            "warning": summary_row.warning,
+            "critical": summary_row.critical,
+            "unknown": summary_row.unknown,
         },
         "devices": device_health_list,
+        "truncated": summary_row.total > len(device_health_list),
     }
 
 
@@ -320,34 +289,16 @@ def get_storage_by_device(
     Returns:
         dict: Storage usage by device
     """
-    # Query storage usage per device
-    storage_by_device = db.query(
-        Device.id,
-        Device.hostname,
-        func.count(Configuration.id).label("backup_count"),
-        func.sum(Configuration.file_size).label("total_size"),
-        func.avg(Configuration.file_size).label("avg_size"),
-    ).join(
-        Configuration, Device.id == Configuration.device_id
-    ).filter(
-        Device.organization_id == organization_id
-    ).group_by(
-        Device.id, Device.hostname
-    ).order_by(
-        func.sum(Configuration.file_size).desc()
-    ).limit(limit).all()
+    config_repo = ConfigurationRepository(db)
 
-    devices = []
-    for device in storage_by_device:
-        devices.append({
-            "device_id": device.id,
-            "hostname": device.hostname,
-            "backup_count": device.backup_count,
-            "total_bytes": int(device.total_size),
-            "total_mb": round(device.total_size / (1024 * 1024), 2),
-            "avg_bytes": int(device.avg_size),
-            "avg_mb": round(device.avg_size / (1024 * 1024), 2),
-        })
+    devices = [
+        {
+            **row,
+            "total_mb": round(row["total_bytes"] / (1024 * 1024), 2),
+            "avg_mb": round(row["avg_bytes"] / (1024 * 1024), 2),
+        }
+        for row in config_repo.get_storage_by_device(organization_id, limit)
+    ]
 
     return {
         "devices": devices,

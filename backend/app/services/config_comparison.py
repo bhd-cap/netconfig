@@ -3,25 +3,224 @@ Configuration comparison service
 Compares two device configurations and generates diff output
 """
 import difflib
-from typing import Dict, Any, List, Optional
-from datetime import datetime
+from typing import Dict, Any, List, Optional, Sequence, Tuple
 import logging
 
-from app.services.storage import storage_service
+from app.core.config import settings
+from app.services.storage import StorageError, storage_service
 
 logger = logging.getLogger(__name__)
+
+
+def _format_range(start: int, stop: int) -> str:
+    """
+    Format one side of a unified diff hunk header
+
+    Args:
+        start: 0-based start index
+        stop: 0-based stop index (exclusive)
+
+    Returns:
+        str: Range in unified diff notation
+    """
+    length = stop - start
+    beginning = start + 1
+
+    if length == 1:
+        return str(beginning)
+
+    if not length:
+        beginning -= 1
+
+    return f"{beginning},{length}"
 
 
 class ConfigurationComparison:
     """Service for comparing device configurations"""
 
     @staticmethod
+    def _build_matcher(
+        lines1: Sequence[str], lines2: Sequence[str]
+    ) -> difflib.SequenceMatcher:
+        """
+        Build a SequenceMatcher for configuration text
+
+        Keeps difflib's autojunk heuristic on by default, which is what the
+        stdlib helpers this service used to call did - it is the difference
+        between a fast match and a several-times-slower one on configs full of
+        repeated marker lines. COMPARE_ACCURATE_DIFF trades that CPU back for
+        better hunk alignment, capped by line count so the cost stays bounded.
+
+        Args:
+            lines1: Lines of the first configuration
+            lines2: Lines of the second configuration
+
+        Returns:
+            difflib.SequenceMatcher: Prepared matcher
+        """
+        autojunk = True
+
+        if settings.COMPARE_ACCURATE_DIFF:
+            longest = max(len(lines1), len(lines2))
+            autojunk = longest > settings.COMPARE_ACCURATE_DIFF_MAX_LINES
+
+        return difflib.SequenceMatcher(None, lines1, lines2, autojunk=autojunk)
+
+    @staticmethod
+    def _unified_from_opcodes(
+        matcher: difflib.SequenceMatcher,
+        lines1: Sequence[str],
+        lines2: Sequence[str],
+        fromfile: str,
+        tofile: str,
+        context_lines: int,
+    ) -> str:
+        """
+        Render a unified diff from an already-computed matcher
+
+        difflib.unified_diff() would build a second SequenceMatcher and repeat
+        the whole match. get_grouped_opcodes() reuses this matcher's cached
+        opcodes instead.
+
+        Args:
+            matcher: Matcher whose opcodes have already been computed
+            lines1: Lines of the first configuration
+            lines2: Lines of the second configuration
+            fromfile: Label for the first configuration
+            tofile: Label for the second configuration
+            context_lines: Context lines around each hunk
+
+        Returns:
+            str: Unified diff text ('' when the inputs are identical)
+        """
+        chunks: List[str] = []
+
+        for group in matcher.get_grouped_opcodes(context_lines):
+            if not chunks:
+                chunks.append(f"--- {fromfile}\n")
+                chunks.append(f"+++ {tofile}\n")
+
+            first, last = group[0], group[-1]
+            chunks.append(
+                f"@@ -{_format_range(first[1], last[2])} "
+                f"+{_format_range(first[3], last[4])} @@\n"
+            )
+
+            for tag, i1, i2, j1, j2 in group:
+                if tag == "equal":
+                    chunks.extend(f" {line}" for line in lines1[i1:i2])
+                    continue
+
+                if tag in ("replace", "delete"):
+                    chunks.extend(f"-{line}" for line in lines1[i1:i2])
+
+                if tag in ("replace", "insert"):
+                    chunks.extend(f"+{line}" for line in lines2[j1:j2])
+
+        if not chunks:
+            return ""
+
+        # Configuration files often lack a trailing newline; without this the
+        # last diff line would run into whatever follows it.
+        return "".join(
+            chunk if chunk.endswith("\n") else chunk + "\n" for chunk in chunks
+        )
+
+    @staticmethod
+    def _structured_from_opcodes(
+        opcodes: Sequence[Tuple[str, int, int, int, int]],
+        lines1: Sequence[str],
+        lines2: Sequence[str],
+        max_blocks: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """
+        Build the structured diff from opcodes the caller already has
+
+        Args:
+            opcodes: Opcodes from the shared matcher
+            lines1: Lines of the first configuration
+            lines2: Lines of the second configuration
+            max_blocks: Stop after this many change blocks
+
+        Returns:
+            Tuple of (blocks, truncated)
+        """
+        if max_blocks is None:
+            max_blocks = settings.COMPARE_MAX_STRUCTURED_BLOCKS
+
+        structured: List[Dict[str, Any]] = []
+
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                continue
+
+            if len(structured) >= max_blocks:
+                # A response carrying every line of a wholesale rewrite is
+                # neither useful to render nor cheap to serialise.
+                return structured, True
+
+            structured.append(
+                {
+                    "type": tag,  # 'replace', 'delete', 'insert'
+                    "old_start": i1 + 1,  # 1-indexed line numbers
+                    "old_end": i2,
+                    "new_start": j1 + 1,
+                    "new_end": j2,
+                    "old_lines": [line.rstrip("\n") for line in lines1[i1:i2]],
+                    "new_lines": [line.rstrip("\n") for line in lines2[j1:j2]],
+                }
+            )
+
+        return structured, False
+
+    @staticmethod
+    def _statistics_from_opcodes(
+        opcodes: Sequence[Tuple[str, int, int, int, int]]
+    ) -> Dict[str, int]:
+        """
+        Derive change statistics from opcodes
+
+        Counting from opcodes replaces a second pass that re-scanned every
+        rendered diff line and inspected its leading character.
+
+        Args:
+            opcodes: Opcodes from the shared matcher
+
+        Returns:
+            dict: Change statistics
+        """
+        added = 0
+        removed = 0
+        sections = 0
+
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                continue
+
+            sections += 1
+
+            if tag in ("replace", "delete"):
+                removed += i2 - i1
+
+            if tag in ("replace", "insert"):
+                added += j2 - j1
+
+        return {
+            "added_lines": added,
+            "removed_lines": removed,
+            "changed_sections": sections,
+            "total_changes": added + removed,
+        }
+
+    @classmethod
     def compare_configs(
+        cls,
         config1_path: str,
         config2_path: str,
         config1_label: Optional[str] = None,
         config2_label: Optional[str] = None,
         context_lines: int = 3,
+        include_html: bool = False,
     ) -> Dict[str, Any]:
         """
         Compare two configuration files and generate diff
@@ -32,87 +231,58 @@ class ConfigurationComparison:
             config1_label: Label for first config (e.g., timestamp)
             config2_label: Label for second config
             context_lines: Number of context lines to show around changes
+            include_html: Also render the side-by-side HTML diff. This is by
+                far the most expensive part of a comparison (difflib compares
+                every changed line character by character and emits a full
+                HTML document), so it is only produced when asked for.
 
         Returns:
             Dict containing diff results and statistics
         """
-        try:
-            # Read both configuration files
-            config1_text = storage_service.get_config(config1_path)
-            config2_text = storage_service.get_config(config2_path)
+        label1 = config1_label or "Configuration 1"
+        label2 = config2_label or "Configuration 2"
 
-            if not config1_text or not config2_text:
+        try:
+            max_bytes = settings.COMPARE_MAX_FILE_BYTES
+            config1_lines = storage_service.read_lines(config1_path, max_bytes)
+            config2_lines = storage_service.read_lines(config2_path, max_bytes)
+
+            if not config1_lines or not config2_lines:
                 raise ValueError("One or both configuration files are empty")
 
-            # Split into lines for comparison
-            config1_lines = config1_text.splitlines(keepends=True)
-            config2_lines = config2_text.splitlines(keepends=True)
+            # One matching pass drives the unified diff, the structured diff
+            # and the statistics. The previous implementation built three
+            # independent matchers over the same two files.
+            matcher = cls._build_matcher(config1_lines, config2_lines)
+            opcodes = matcher.get_opcodes()
 
-            # Generate unified diff
-            diff_lines = list(
-                difflib.unified_diff(
+            is_identical = all(tag == "equal" for tag, *_ in opcodes)
+
+            unified = (
+                ""
+                if is_identical
+                else cls._unified_from_opcodes(
+                    matcher,
                     config1_lines,
                     config2_lines,
-                    fromfile=config1_label or "Configuration 1",
-                    tofile=config2_label or "Configuration 2",
-                    n=context_lines,
+                    label1,
+                    label2,
+                    context_lines,
                 )
             )
 
-            # Generate HTML diff for rich display
-            html_diff = difflib.HtmlDiff(wrapcolumn=80)
-            html_output = html_diff.make_file(
-                config1_lines,
-                config2_lines,
-                fromdesc=config1_label or "Configuration 1",
-                todesc=config2_label or "Configuration 2",
-                context=True,
-                numlines=context_lines,
+            structured_diff, truncated = cls._structured_from_opcodes(
+                opcodes, config1_lines, config2_lines
             )
 
-            # Calculate statistics
-            added_lines = 0
-            removed_lines = 0
-            changed_sections = 0
-            in_change_block = False
+            statistics = cls._statistics_from_opcodes(opcodes)
+            statistics["structured_diff_truncated"] = truncated
 
-            for line in diff_lines:
-                if line.startswith("+") and not line.startswith("+++"):
-                    added_lines += 1
-                    if not in_change_block:
-                        changed_sections += 1
-                        in_change_block = True
-                elif line.startswith("-") and not line.startswith("---"):
-                    removed_lines += 1
-                    if not in_change_block:
-                        changed_sections += 1
-                        in_change_block = True
-                elif line.startswith("@@"):
-                    in_change_block = False
-
-            # Check if configurations are identical
-            is_identical = len(diff_lines) == 0 or (
-                len(diff_lines) == 2 and all(
-                    line.startswith(("---", "+++")) for line in diff_lines
-                )
-            )
-
-            # Generate structured diff for programmatic consumption
-            structured_diff = ConfigurationComparison._generate_structured_diff(
-                config1_lines, config2_lines
-            )
-
-            return {
+            result = {
                 "is_identical": is_identical,
-                "unified_diff": "".join(diff_lines),
-                "html_diff": html_output,
+                "unified_diff": unified,
                 "structured_diff": structured_diff,
-                "statistics": {
-                    "added_lines": added_lines,
-                    "removed_lines": removed_lines,
-                    "changed_sections": changed_sections,
-                    "total_changes": added_lines + removed_lines,
-                },
+                "statistics": statistics,
                 "config1": {
                     "path": config1_path,
                     "label": config1_label,
@@ -125,51 +295,29 @@ class ConfigurationComparison:
                 },
             }
 
-        except FileNotFoundError as e:
-            logger.error(f"Configuration file not found: {e}")
-            raise ValueError(f"Configuration file not found: {e}")
+            if include_html:
+                result["html_diff"] = difflib.HtmlDiff(wrapcolumn=80).make_file(
+                    config1_lines,
+                    config2_lines,
+                    fromdesc=label1,
+                    todesc=label2,
+                    context=True,
+                    numlines=context_lines,
+                )
+
+            return result
+
+        except (StorageError, FileNotFoundError):
+            raise
+        except ValueError:
+            raise
         except Exception as e:
             logger.exception("Error comparing configurations")
             raise ValueError(f"Error comparing configurations: {e}")
 
-    @staticmethod
-    def _generate_structured_diff(
-        lines1: List[str], lines2: List[str]
-    ) -> List[Dict[str, Any]]:
-        """
-        Generate structured diff for easier frontend consumption
-
-        Args:
-            lines1: Lines from first configuration
-            lines2: Lines from second configuration
-
-        Returns:
-            List of change blocks with line numbers and change types
-        """
-        structured = []
-        matcher = difflib.SequenceMatcher(None, lines1, lines2)
-
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-            if tag == "equal":
-                # Skip equal sections in structured diff
-                continue
-
-            block = {
-                "type": tag,  # 'replace', 'delete', 'insert'
-                "old_start": i1 + 1,  # 1-indexed line numbers
-                "old_end": i2,
-                "new_start": j1 + 1,
-                "new_end": j2,
-                "old_lines": [line.rstrip() for line in lines1[i1:i2]],
-                "new_lines": [line.rstrip() for line in lines2[j1:j2]],
-            }
-
-            structured.append(block)
-
-        return structured
-
-    @staticmethod
+    @classmethod
     def get_change_summary(
+        cls,
         config1_path: str,
         config2_path: str,
     ) -> Dict[str, Any]:
@@ -184,51 +332,52 @@ class ConfigurationComparison:
             Dict with change summary
         """
         try:
-            # Read configurations
-            config1_text = storage_service.get_config(config1_path)
-            config2_text = storage_service.get_config(config2_path)
-
-            # Quick comparison
-            is_identical = config1_text == config2_text
-
-            if is_identical:
+            # Hash the files first. When nothing changed - the common case for
+            # a scheduled backup - this answers the question in one streamed
+            # read per file and skips the diff entirely.
+            if storage_service.calculate_file_checksum(
+                config1_path
+            ) == storage_service.calculate_file_checksum(config2_path):
                 return {
                     "is_identical": True,
                     "has_changes": False,
                     "change_count": 0,
+                    "similarity_ratio": 1.0,
+                    "line_count_diff": 0,
                 }
 
-            # Calculate basic statistics
-            config1_lines = config1_text.splitlines()
-            config2_lines = config2_text.splitlines()
+            max_bytes = settings.COMPARE_MAX_FILE_BYTES
+            config1_lines = storage_service.read_lines(config1_path, max_bytes)
+            config2_lines = storage_service.read_lines(config2_path, max_bytes)
 
-            matcher = difflib.SequenceMatcher(None, config1_lines, config2_lines)
-            ratio = matcher.ratio()
+            matcher = cls._build_matcher(config1_lines, config2_lines)
 
-            # Count changes
-            changes = 0
-            for tag, _, _, _, _ in matcher.get_opcodes():
-                if tag != "equal":
-                    changes += 1
+            # ratio() and get_opcodes() share the same cached matching blocks,
+            # so this is a single pass rather than two.
+            changes = sum(1 for tag, *_ in matcher.get_opcodes() if tag != "equal")
 
             return {
                 "is_identical": False,
                 "has_changes": True,
                 "change_count": changes,
-                "similarity_ratio": round(ratio, 4),
+                "similarity_ratio": round(matcher.ratio(), 4),
                 "line_count_diff": len(config2_lines) - len(config1_lines),
             }
 
+        except (StorageError, FileNotFoundError):
+            raise
         except Exception as e:
             logger.exception("Error generating change summary")
             raise ValueError(f"Error generating change summary: {e}")
 
-    @staticmethod
+    @classmethod
     def compare_config_texts(
+        cls,
         config1_text: str,
         config2_text: str,
         config1_label: str = "Configuration 1",
         config2_label: str = "Configuration 2",
+        context_lines: int = 3,
     ) -> Dict[str, Any]:
         """
         Compare two configuration texts directly (without file paths)
@@ -238,37 +387,50 @@ class ConfigurationComparison:
             config2_text: Second configuration text
             config1_label: Label for first config
             config2_label: Label for second config
+            context_lines: Number of context lines to show around changes
 
         Returns:
             Dict containing diff results
         """
-        # Split into lines
+        if config1_text == config2_text:
+            return {
+                "is_identical": True,
+                "unified_diff": "",
+                "structured_diff": [],
+                "statistics": {
+                    "added_lines": 0,
+                    "removed_lines": 0,
+                    "changed_sections": 0,
+                    "total_changes": 0,
+                    "structured_diff_truncated": False,
+                },
+            }
+
         config1_lines = config1_text.splitlines(keepends=True)
         config2_lines = config2_text.splitlines(keepends=True)
 
-        # Generate unified diff
-        diff_lines = list(
-            difflib.unified_diff(
-                config1_lines,
-                config2_lines,
-                fromfile=config1_label,
-                tofile=config2_label,
-                n=3,
-            )
+        matcher = cls._build_matcher(config1_lines, config2_lines)
+        opcodes = matcher.get_opcodes()
+
+        structured_diff, truncated = cls._structured_from_opcodes(
+            opcodes, config1_lines, config2_lines
         )
 
-        # Check if identical
-        is_identical = config1_text == config2_text
-
-        # Generate structured diff
-        structured_diff = ConfigurationComparison._generate_structured_diff(
-            config1_lines, config2_lines
-        )
+        statistics = cls._statistics_from_opcodes(opcodes)
+        statistics["structured_diff_truncated"] = truncated
 
         return {
-            "is_identical": is_identical,
-            "unified_diff": "".join(diff_lines),
+            "is_identical": False,
+            "unified_diff": cls._unified_from_opcodes(
+                matcher,
+                config1_lines,
+                config2_lines,
+                config1_label,
+                config2_label,
+                context_lines,
+            ),
             "structured_diff": structured_diff,
+            "statistics": statistics,
         }
 
 

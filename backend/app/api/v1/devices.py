@@ -1,11 +1,13 @@
 """
 Device API endpoints with multi-tenant support
 """
+import logging
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import get_current_user, get_organization_id
 from app.models.user import User
@@ -22,6 +24,8 @@ from app.schemas.common import PaginatedResponse, SuccessResponse
 from app.services.device_connector import DeviceConnector
 from app.utils.encryption import encryption_service
 from app.utils.csv_parser import parse_device_csv, generate_csv_template, CSVParseError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -429,57 +433,87 @@ def bulk_upload_devices(
         )
 
     try:
-        # Read CSV content
-        content = file.file.read().decode('utf-8')
+        # Read CSV content, bounded so an oversized upload cannot be pulled
+        # into memory in full before being rejected.
+        content_bytes = file.file.read(settings.MAX_UPLOAD_BYTES + 1)
+
+        if len(content_bytes) > settings.MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=(
+                    f"CSV file exceeds the "
+                    f"{settings.MAX_UPLOAD_BYTES // (1024 * 1024)} MB upload limit"
+                ),
+            )
+
+        content = content_bytes.decode("utf-8")
+        del content_bytes
 
         # Parse CSV
         devices, parse_errors = parse_device_csv(content)
+        del content
 
         # Process valid devices
         created_devices = []
         creation_errors = []
 
+        # Resolve every duplicate in two queries rather than two per row, and
+        # track candidates seen in this file so a CSV that repeats a hostname
+        # is caught too.
+        taken_hostnames, taken_ips = device_repo.get_existing_hostnames_and_ips(
+            organization_id,
+            [d.hostname for d in devices],
+            [d.ip_address for d in devices],
+        )
+
+        pending_rows = []
+
         for device_in in devices:
-            try:
-                # Check for duplicates
-                existing = device_repo.get_by_hostname(device_in.hostname, organization_id)
-                if existing:
-                    creation_errors.append({
-                        "hostname": device_in.hostname,
-                        "error": "Hostname already exists",
-                    })
-                    continue
-
-                existing = device_repo.get_by_ip(device_in.ip_address, organization_id)
-                if existing:
-                    creation_errors.append({
-                        "hostname": device_in.hostname,
-                        "error": f"IP {device_in.ip_address} already exists",
-                    })
-                    continue
-
-                # Encrypt credentials
-                encrypted_password = encryption_service.encrypt(device_in.password)
-                encrypted_enable_secret = None
-                if device_in.enable_secret:
-                    encrypted_enable_secret = encryption_service.encrypt(device_in.enable_secret)
-
-                # Create device
-                device_data = device_in.dict(exclude={"password", "enable_secret"})
-                device_data.update({
-                    "organization_id": organization_id,
-                    "encrypted_password": encrypted_password,
-                    "enable_secret": encrypted_enable_secret,
-                    "created_by": current_user.id,
-                })
-
-                device = device_repo.create(device_data)
-                created_devices.append(device)
-
-            except Exception as e:
+            if device_in.hostname in taken_hostnames:
                 creation_errors.append({
                     "hostname": device_in.hostname,
-                    "error": str(e),
+                    "error": "Hostname already exists",
+                })
+                continue
+
+            if device_in.ip_address in taken_ips:
+                creation_errors.append({
+                    "hostname": device_in.hostname,
+                    "error": f"IP {device_in.ip_address} already exists",
+                })
+                continue
+
+            taken_hostnames.add(device_in.hostname)
+            taken_ips.add(device_in.ip_address)
+
+            # Encrypt credentials
+            encrypted_password = encryption_service.encrypt(device_in.password)
+            encrypted_enable_secret = None
+            if device_in.enable_secret:
+                encrypted_enable_secret = encryption_service.encrypt(
+                    device_in.enable_secret
+                )
+
+            device_data = device_in.dict(exclude={"password", "enable_secret"})
+            device_data.update({
+                "organization_id": organization_id,
+                "encrypted_password": encrypted_password,
+                "enable_secret": encrypted_enable_secret,
+                "created_by": current_user.id,
+            })
+            pending_rows.append(device_data)
+
+        if pending_rows:
+            try:
+                # One multi-row INSERT and one commit for the whole file,
+                # instead of a commit and a refresh per device.
+                created_devices = device_repo.create_many(pending_rows)
+            except Exception as e:
+                db.rollback()
+                logger.exception("Bulk device insert failed")
+                creation_errors.append({
+                    "hostname": None,
+                    "error": f"Bulk insert failed: {e}",
                 })
 
         # Log bulk upload
@@ -507,6 +541,9 @@ def bulk_upload_devices(
             "created_devices": [{"id": d.id, "hostname": d.hostname} for d in created_devices],
         }
 
+    except HTTPException:
+        raise
+
     except CSVParseError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -514,6 +551,7 @@ def bulk_upload_devices(
         )
 
     except Exception as e:
+        logger.exception("Failed to process device CSV upload")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process CSV: {str(e)}",
