@@ -25,45 +25,76 @@ Email: [info@blackhawk11.com](mailto:info@blackhawk11.com)
 - 4GB RAM minimum
 - 50GB disk space
 
-### Installation
+### Installation (one line)
 
-1. **Clone the repository**:
 ```bash
-git clone https://github.com/yourorg/netconfig-backup.git
-cd netconfig-backup
+curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/install.sh | bash
 ```
 
-2. **Configure environment variables**:
+The installer checks Docker, fetches the source, generates a `.env` with a
+random database password, JWT secret and encryption key, builds the images,
+waits for the API to report healthy, applies migrations, and creates the
+admin user.
+
+Already have a checkout? Run it from inside the repository:
+
+```bash
+./install.sh
+```
+
+Then open:
+
+- Web UI: http://localhost:3000
+- API documentation: http://localhost:8000/docs
+
+Sign in with:
+
+- Username: `admin`
+- Password: `changeme` — **temporary, change it after first login**
+
+Back up the generated `.env`. Its `ENCRYPTION_KEY` decrypts every stored
+device password; if you lose it, saved credentials cannot be recovered.
+
+#### Installer options
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `INSTALL_DIR` | `./netconfig` | Where to install |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `changeme` | Initial admin account |
+| `FRONTEND_PORT` / `BACKEND_PORT` | `3000` / `8000` | Published ports |
+| `WITH_MONITORING` | `false` | Also start Flower on `FLOWER_PORT` |
+| `SKIP_BUILD` | `false` | Reuse existing images |
+| `BRANCH` | `main` | Branch to clone |
+
+```bash
+INSTALL_DIR=/opt/netconfig WITH_MONITORING=true ./install.sh
+```
+
+### Manual installation
+
 ```bash
 cp .env.example .env
-nano .env
-```
-
-3. **Generate encryption keys**:
-```bash
+# Set SECRET_KEY, and generate ENCRYPTION_KEY with:
 python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
-Add the generated key to `.env` as `ENCRYPTION_KEY`
 
-4. **Deploy the application**:
+docker compose up -d --build
+docker compose exec backend python init_db.py
+```
+
+### Optional services
+
+Both are off by default so they cost nothing when unused:
+
 ```bash
-docker-compose up -d
+docker compose --profile monitoring up -d   # Flower task monitor, :5555
+docker compose --profile proxy up -d        # single-origin TLS proxy, :80/:443
 ```
-
-5. **Access the application**:
-- Web UI: http://localhost
-- API Documentation: http://localhost:8000/docs
-- Celery Flower (Task Monitor): http://localhost:5555
-
-6. **Login with default credentials**:
-- Username: `admin`
-- Password: `changeme` (change this immediately!)
 
 ## Architecture
 
 ```
 ┌─────────────┐
-│   Nginx     │  :80, :443
+│   Nginx     │  :80, :443  (optional --profile proxy)
 │ (Reverse    │
 │   Proxy)    │
 └──────┬──────┘
@@ -72,8 +103,9 @@ docker-compose up -d
    │                    │
 ┌──▼──────┐      ┌─────▼──────┐
 │ React   │      │  FastAPI   │
-│Frontend │      │  Backend   │
-│  :3000  │      │   :8000    │
+│ (static │      │  Backend   │
+│  nginx) │      │   :8000    │
+│  :3000  │      │            │
 └─────────┘      └─────┬──────┘
                        │
           ┌────────────┼────────────┐
