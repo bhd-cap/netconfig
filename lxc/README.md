@@ -23,19 +23,27 @@ prints the URL and credentials. Run it on the **host**, not inside a container.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CTID` | next free | Container ID |
-| `HOSTNAME` | `netconfig` | Container hostname |
+| `CT_HOSTNAME` | `netconfig` | Container hostname |
 | `CORES` / `MEMORY` | `2` / `2048` | CPU cores, MB of RAM |
 | `DISK` / `SWAP` | `8` / `512` | GB of disk, MB of swap |
 | `BRIDGE` | `vmbr0` | Network bridge |
 | `IPCONFIG` | `dhcp` | `dhcp`, or `192.168.1.50/24,gw=192.168.1.1` |
+| `NAMESERVER` | host's resolver | DNS server for the container |
 | `STORAGE` | first active | Storage for the root filesystem |
 | `TEMPLATE_STORAGE` | first active | Storage holding the Debian template |
 | `ADMIN_PASSWORD` | `changeme` | Initial admin password |
+| `DEBUG` | `0` | Set to `1` to trace every command |
 
 ```bash
 CTID=210 MEMORY=4096 DISK=32 IPCONFIG=192.168.1.50/24,gw=192.168.1.1 \
   bash -c "$(curl -fsSL .../lxc/proxmox-create-lxc.sh)"
 ```
+
+Every step prints what it is doing and has its own time limit, so a stall is
+reported with the command that stalled rather than sitting there silently.
+Raise a limit with the matching `T_*` variable (`T_STORAGE`,
+`T_TEMPLATE_DOWNLOAD`, `T_CREATE`, `T_BOOT`, `T_NETWORK`, `T_INSTALL`), and
+run with `DEBUG=1` to trace every command.
 
 ### Inside an existing container, VM or server
 
@@ -157,3 +165,32 @@ temporarily, or install with `SKIP_FRONTEND=true` and build elsewhere.
 **Scheduled backups do not run** — beat queues them and the worker executes
 them, so both must be up:
 `systemctl status netconfig-beat netconfig-worker`.
+
+### The Proxmox host script
+
+**It stops at "Selecting storage"** — `pvesm status` probes every configured
+storage, so one unreachable NFS or CIFS share blocks it. The script now times
+out and says so. Name the storages explicitly to skip the probe:
+
+```bash
+STORAGE=local-lvm TEMPLATE_STORAGE=local bash -c "$(curl -fsSL .../lxc/proxmox-create-lxc.sh)"
+```
+
+**It stops while downloading the template** — that is a ~130 MB pull from
+download.proxmox.com and its progress is now shown. If the host cannot reach
+it, fetch a template by hand and re-run:
+
+```bash
+pveam update && pveam download local debian-12-standard_12.7-1_amd64.tar.zst
+```
+
+**"never got an IP address"** — no DHCP server on `$BRIDGE`. Use a static
+address: `IPCONFIG=192.168.1.50/24,gw=192.168.1.1`.
+
+**"cannot resolve deb.debian.org"** — the container has an address but no
+working resolver, which would otherwise hang the first `apt-get` for a very
+long time. Re-run with `NAMESERVER=1.1.1.1`, or fix an existing container with
+`pct set <ctid> --nameserver 1.1.1.1`.
+
+**Starting over** — the container is left in place on failure so you can look
+at it. Remove it with `pct stop <ctid> && pct destroy <ctid>`.

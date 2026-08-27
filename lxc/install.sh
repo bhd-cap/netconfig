@@ -79,6 +79,50 @@ ok()    { printf '      %s+%s %s\n' "$GREEN" "$NC" "$1"; }
 warn()  { printf '      %s!%s %s\n' "$YELLOW" "$NC" "$1"; }
 die()   { printf '\n%serror:%s %s\n' "$RED" "$NC" "$1" >&2; exit 1; }
 
+# Run a long command with a time limit, a dot every 10s so it is visibly
+# alive, and its log dumped on failure. Several of these steps take minutes;
+# with no output at all they are indistinguishable from a hang.
+# Returns the command's exit status (124 on timeout) instead of aborting, for
+# callers that have a fallback.
+try_with_progress() {
+    local limit=$1 log=$2; shift 2
+    local rc=0 dots=""
+
+    if [ -t 1 ]; then
+        ( while true; do sleep 10; printf '.'; done ) &
+        dots=$!
+    fi
+
+    timeout --foreground "$limit" "$@" >"$log" 2>&1 || rc=$?
+
+    if [ -n "$dots" ]; then
+        kill "$dots" 2>/dev/null || true
+        wait "$dots" 2>/dev/null || true
+        printf '\n'
+    fi
+
+    return "$rc"
+}
+
+with_progress() {
+    local limit=$1 log=$2 desc=$3; shift 3
+    local rc=0
+
+    try_with_progress "$limit" "$log" "$@" || rc=$?
+
+    if [ "$rc" -eq 124 ]; then
+        tail -20 "$log" >&2 || true
+        die "$desc timed out after ${limit}s (full log: $log)"
+    fi
+
+    if [ "$rc" -ne 0 ]; then
+        tail -20 "$log" >&2 || true
+        die "$desc failed (full log: $log)"
+    fi
+
+    return 0
+}
+
 on_error() {
     printf '\n%sinstall failed%s (line %s)\n' "$RED" "$NC" "$1" >&2
     if [ -n "${SERVICES_STARTED:-}" ]; then
@@ -136,6 +180,7 @@ preflight() {
     fi
 
     command -v systemctl >/dev/null 2>&1 || die "systemctl not found"
+    command -v timeout >/dev/null 2>&1 || die "timeout not found (install coreutils)"
 }
 
 # --------------------------------------------------------------------------
@@ -147,7 +192,8 @@ install_packages() {
     export DEBIAN_FRONTEND=noninteractive
 
     info "Updating package lists..."
-    apt-get update -qq
+    with_progress 600 /tmp/netconfig-apt-update.log "apt-get update" \
+        apt-get update -qq
 
     local packages=(
         ca-certificates curl git
@@ -158,8 +204,9 @@ install_packages() {
         sudo
     )
 
-    info "Installing PostgreSQL, Redis, nginx and Python..."
-    apt-get install -y -qq --no-install-recommends "${packages[@]}" >/dev/null
+    info "Installing PostgreSQL, Redis, nginx and Python (a few minutes)..."
+    with_progress 1800 /tmp/netconfig-apt-install.log "Package installation" \
+        apt-get install -y -qq --no-install-recommends "${packages[@]}"
     ok "Base packages installed"
 
     if [ "$SKIP_FRONTEND" != "true" ]; then
@@ -207,8 +254,14 @@ ensure_nodejs() {
 obtain_source() {
     step "Installing application source into $APP_DIR"
 
-    local here
-    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+    # ${BASH_SOURCE[0]} is unset when this script is run as
+    # bash -c "$(curl ...)", and under 'set -u' referencing it aborts the
+    # subshell, so it needs a default.
+    local self="${BASH_SOURCE[0]:-}"
+    local here=""
+    if [ -n "$self" ]; then
+        here="$(cd "$(dirname "$self")/.." 2>/dev/null && pwd || true)"
+    fi
 
     if [ -n "$here" ] && [ -f "$here/docker-compose.yml" ] && [ -d "$here/backend" ]; then
         if [ "$here" = "$APP_DIR" ]; then
@@ -307,17 +360,18 @@ setup_virtualenv() {
     "$venv/bin/pip" install --quiet --upgrade pip wheel >/dev/null 2>&1 || true
 
     info "Installing Python dependencies (a minute or two)..."
-    if ! "$venv/bin/pip" install --quiet --requirement "$APP_DIR/backend/requirements.txt" >/tmp/netconfig-pip.log 2>&1; then
+    if ! try_with_progress 1800 /tmp/netconfig-pip.log \
+            "$venv/bin/pip" install --quiet --requirement "$APP_DIR/backend/requirements.txt"; then
         # Every dependency publishes wheels for the common platforms, so
         # compilers are only needed on an architecture that has none. Install
         # them on demand rather than carrying ~200 MB of toolchain in every
         # container.
         warn "Falling back to building from source; installing build dependencies"
-        apt-get install -y -qq --no-install-recommends \
-            build-essential python3-dev libpq-dev libffi-dev >/dev/null
-        "$venv/bin/pip" install --quiet --requirement "$APP_DIR/backend/requirements.txt" \
-            >/tmp/netconfig-pip.log 2>&1 \
-            || { tail -20 /tmp/netconfig-pip.log >&2; die "Failed to install Python dependencies"; }
+        with_progress 900 /tmp/netconfig-builddeps.log "Build dependency installation" \
+            apt-get install -y -qq --no-install-recommends \
+            build-essential python3-dev libpq-dev libffi-dev
+        with_progress 2400 /tmp/netconfig-pip.log "Python dependency build" \
+            "$venv/bin/pip" install --quiet --requirement "$APP_DIR/backend/requirements.txt"
     fi
 
     chown -R root:"$SERVICE_USER" "$venv"
@@ -541,20 +595,20 @@ PLACEHOLDER
 
     cd "$APP_DIR/frontend"
 
-    info "Installing UI dependencies..."
+    info "Installing UI dependencies (a few minutes)..."
     if [ -f package-lock.json ]; then
-        npm ci --no-audit --no-fund --silent >/tmp/netconfig-npm.log 2>&1 \
-            || { tail -20 /tmp/netconfig-npm.log >&2; die "npm ci failed"; }
+        with_progress 1800 /tmp/netconfig-npm.log "npm ci" \
+            npm ci --no-audit --no-fund --silent
     else
-        npm install --no-audit --no-fund --silent >/tmp/netconfig-npm.log 2>&1 \
-            || { tail -20 /tmp/netconfig-npm.log >&2; die "npm install failed"; }
+        with_progress 1800 /tmp/netconfig-npm.log "npm install" \
+            npm install --no-audit --no-fund --silent
     fi
 
     info "Compiling the bundle..."
     # Relative base URL: nginx serves the UI and proxies /api on the same
     # origin, so the browser never makes a cross-origin request.
-    VITE_API_URL=/api/v1 npm run build >/tmp/netconfig-build.log 2>&1 \
-        || { tail -30 /tmp/netconfig-build.log >&2; die "Frontend build failed"; }
+    with_progress 1200 /tmp/netconfig-build.log "Frontend build" \
+        env VITE_API_URL=/api/v1 npm run build
 
     # node_modules is ~200 MB and is not needed once the bundle exists.
     rm -rf node_modules
