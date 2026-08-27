@@ -47,14 +47,21 @@ class HostResponse(BaseModel):
     """One host seen on a switch port"""
 
     id: int
-    device_id: int
+    # Null once the switch has been deleted: the row is kept as history and
+    # device_hostname still says where the host was seen.
+    device_id: Optional[int] = None
     device_hostname: Optional[str] = None
     interface: str
     mac_address: str
     vlan: Optional[int]
     entry_type: Optional[str]
     ip_address: Optional[str]
+    # Entered by a person.
     hostname: Optional[str]
+    # Announced by the host over LLDP or CDP on this port.
+    discovered_hostname: Optional[str] = None
+    discovered_via: Optional[str] = None
+    discovered_platform: Optional[str] = None
     vendor: Optional[str]
     first_seen: datetime
     last_seen: datetime
@@ -134,15 +141,19 @@ def list_hosts(
             HostInventory.mac_address.ilike(pattern)
             | HostInventory.ip_address.ilike(pattern)
             | HostInventory.hostname.ilike(pattern)
+            | HostInventory.discovered_hostname.ilike(pattern)
         )
 
     total = db.scalar(
         select(func.count(HostInventory.id)).where(*filters)
     ) or 0
 
+    # An outer join: a host whose switch has been deleted is still inventory,
+    # and an inner join would silently drop exactly the history this table
+    # exists to keep.
     rows = db.execute(
         select(HostInventory, Device.hostname)
-        .join(Device, HostInventory.device_id == Device.id)
+        .outerjoin(Device, HostInventory.device_id == Device.id)
         .where(*filters)
         .order_by(HostInventory.last_seen.desc())
         .offset(skip)
@@ -151,7 +162,8 @@ def list_hosts(
 
     items = [
         HostResponse.model_validate(host).model_copy(
-            update={"device_hostname": device_hostname}
+            # Fall back to the name stored on the row when the device is gone.
+            update={"device_hostname": device_hostname or host.device_hostname}
         )
         for host, device_hostname in rows
     ]
@@ -648,7 +660,7 @@ def export_inventory(
 
     rows = db.execute(
         select(
-            Device.hostname.label("switch"),
+            func.coalesce(Device.hostname, HostInventory.device_hostname).label("switch"),
             HostInventory.interface,
             HostInventory.vlan,
             HostInventory.mac_address,
@@ -657,13 +669,16 @@ def export_inventory(
             # Both tables have a 'hostname'; label the host's so neither is
             # shadowed when the row is read by name.
             HostInventory.hostname.label("host_name"),
+            HostInventory.discovered_hostname,
+            HostInventory.discovered_via,
             HostInventory.entry_type,
             HostInventory.first_seen,
             HostInventory.last_seen,
             HostInventory.is_active,
             HostInventory.notes,
         )
-        .join(Device, HostInventory.device_id == Device.id)
+        # Outer, so a host whose switch was deleted still exports.
+        .outerjoin(Device, HostInventory.device_id == Device.id)
         .where(*filters)
         .order_by(Device.hostname, HostInventory.interface, HostInventory.mac_address)
         .limit(50000)
@@ -674,7 +689,8 @@ def export_inventory(
     writer.writerow(
         [
             "switch", "interface", "vlan", "mac_address", "vendor", "ip_address",
-            "host_name", "entry_type", "first_seen", "last_seen", "active", "notes",
+            "host_name", "discovered_hostname", "discovered_via", "entry_type",
+            "first_seen", "last_seen", "active", "notes",
         ]
     )
 
@@ -688,6 +704,8 @@ def export_inventory(
                 row.vendor or "",
                 row.ip_address or "",
                 row.host_name or "",
+                row.discovered_hostname or "",
+                row.discovered_via or "",
                 row.entry_type or "",
                 row.first_seen.isoformat() if row.first_seen else "",
                 row.last_seen.isoformat() if row.last_seen else "",

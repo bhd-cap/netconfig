@@ -373,7 +373,16 @@ def test_both_ends_of_a_link_collapse_into_one_edge(
 
 
 def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switches):
-    add_neighbor(db, org, switches[0], "unmanaged-sw", remote_mgmt_ip="10.9.9.9")
+    """
+    An unmanaged neighbour advertising Bridge is infrastructure
+
+    It shows in the default view; an end host does not. That distinction is
+    the point of the tiered graph.
+    """
+    add_neighbor(
+        db, org, switches[0], "unmanaged-sw",
+        remote_mgmt_ip="10.9.9.9", capabilities="Bridge",
+    )
 
     session = as_user(client, operator)
 
@@ -382,12 +391,151 @@ def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switche
     unmanaged = next(n for n in included["nodes"] if not n["managed"])
     assert unmanaged["label"] == "unmanaged-sw"
     assert unmanaged["ip_address"] == "10.9.9.9"
+    assert unmanaged["tier"] == "edge"
 
     excluded = session.get(
         "/api/v1/discovery/topology", params={"include_unmanaged": False}
     ).json()
     assert excluded["stats"]["unmanaged_nodes"] == 0
     assert excluded["stats"]["links"] == 0
+
+
+def test_end_hosts_are_hidden_from_the_default_view(client, db, org, operator, switches):
+    """
+    The reported problem: every connected host on one diagram
+
+    A phone or a PC is inventory, not topology. It is excluded by default and
+    counted, so the UI can offer a drill-down rather than silently omitting
+    it.
+    """
+    add_neighbor(
+        db, org, switches[0], "desk-phone-204",
+        local_interface="Gi1/0/4", capabilities="Telephone, Bridge",
+    )
+    add_neighbor(
+        db, org, switches[0], "laptop-jc",
+        local_interface="Gi1/0/5", capabilities="Station",
+    )
+    add_neighbor(
+        db, org, switches[0], "idf-2-sw",
+        local_interface="Gi1/0/24", capabilities="Bridge, Router",
+    )
+
+    session = as_user(client, operator)
+    body = session.get("/api/v1/discovery/topology").json()
+
+    labels = {node["label"] for node in body["nodes"]}
+    assert "idf-2-sw" in labels
+    # A phone advertising Bridge as well as Telephone is still a phone.
+    assert "desk-phone-204" not in labels
+    assert "laptop-jc" not in labels
+
+    assert body["stats"]["hidden_hosts"] == 2
+    assert body["stats"]["total_hosts"] == 2
+    assert body["stats"]["by_tier"]["host"] == 2
+
+    # The switch says how many hosts are behind it, so a drill-down can be
+    # offered without fetching them.
+    switch_node = next(n for n in body["nodes"] if n["label"] == "core-01")
+    assert switch_node["host_count"] == 2
+
+
+def test_a_single_node_can_be_drilled_into(client, db, org, operator, switches):
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+    add_neighbor(
+        db, org, switches[1], "phone-b",
+        local_interface="Gi1/0/9", capabilities="Telephone",
+    )
+
+    session = as_user(client, operator)
+    core_key = f"device:{switches[0].id}"
+
+    body = session.get(
+        "/api/v1/discovery/topology", params={"expand": core_key}
+    ).json()
+
+    labels = {node["label"] for node in body["nodes"]}
+    # Only the expanded switch's hosts appear, not the whole network's.
+    assert "phone-a" in labels
+    assert "phone-b" not in labels
+
+
+def test_every_host_can_be_asked_for_explicitly(client, db, org, operator, switches):
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+
+    body = as_user(client, operator).get(
+        "/api/v1/discovery/topology",
+        params={"tiers": "core,distribution,access,edge,host"},
+    ).json()
+
+    assert "phone-a" in {node["label"] for node in body["nodes"]}
+    assert body["stats"]["hidden_hosts"] == 0
+
+
+def test_an_unknown_tier_is_rejected(client, operator):
+    response = as_user(client, operator).get(
+        "/api/v1/discovery/topology", params={"tiers": "core,mezzanine"}
+    )
+
+    assert response.status_code == 400
+    assert "mezzanine" in response.json()["detail"]
+
+
+def test_managed_devices_are_tiered_by_infrastructure_links(
+    client, db, org, operator, switches
+):
+    """
+    A device's tier comes from links to other infrastructure, not its total
+
+    An access switch with 40 hosts on it is still an access switch; counting
+    those would promote it above the core.
+    """
+    # core-01 <-> access-01, plus two more managed devices off core-01.
+    extra = []
+    for index, hostname in enumerate(("dist-01", "dist-02"), start=10):
+        device = Device(
+            organization_id=org.id,
+            hostname=hostname,
+            ip_address=f"10.0.0.{index}",
+            device_type="cisco_ios",
+            username="admin",
+            encrypted_password=encryption_service.encrypt("secret"),
+            is_active=True,
+        )
+        db.add(device)
+        extra.append(device)
+    db.commit()
+
+    add_neighbor(db, org, switches[0], "access-01", remote_device_id=switches[1].id)
+    add_neighbor(
+        db, org, switches[0], "dist-01",
+        local_interface="Gi1/0/2", remote_device_id=extra[0].id,
+    )
+    add_neighbor(
+        db, org, switches[0], "dist-02",
+        local_interface="Gi1/0/3", remote_device_id=extra[1].id,
+    )
+    # And 5 end hosts on the access switch, which must not promote it.
+    for port in range(1, 6):
+        add_neighbor(
+            db, org, switches[1], f"pc-{port}",
+            local_interface=f"Gi1/0/{port}", capabilities="Station",
+        )
+
+    body = as_user(client, operator).get("/api/v1/discovery/topology").json()
+    by_label = {node["label"]: node for node in body["nodes"]}
+
+    assert by_label["core-01"]["tier"] == "core"
+    assert by_label["access-01"]["tier"] == "distribution"
+    assert by_label["dist-01"]["tier"] == "distribution"
+    # Its five hosts did not count.
+    assert by_label["access-01"]["infrastructure_links"] == 1
 
 
 def test_a_saved_layout_is_applied_over_a_fresh_graph(

@@ -289,12 +289,24 @@ class DiscoveryService:
     # Persistence (single threaded)
     # ------------------------------------------------------------------
 
+    def _hostname_of(self, device_id: Optional[int]) -> Optional[str]:
+        """
+        The hostname of a device, for denormalising onto a discovery row
+
+        One small query rather than making every caller pass it, and it is
+        only reached when a caller did not.
+        """
+        if not device_id:
+            return None
+        return self.db.scalar(select(Device.hostname).where(Device.id == device_id))
+
     def save_neighbors(
         self,
         organization_id: int,
         device_id: int,
         neighbors: Sequence[parsers.Neighbor],
         seen_at: Optional[datetime] = None,
+        device_hostname: Optional[str] = None,
     ) -> int:
         """
         Upsert adjacencies for one device
@@ -304,6 +316,9 @@ class DiscoveryService:
             device_id: The device that reported them
             neighbors: Parsed adjacencies
             seen_at: Timestamp for this observation
+            device_hostname: The reporting device's name, stored on the row so
+                the adjacency still reads sensibly if that device is later
+                deleted
 
         Returns:
             Number of rows written
@@ -312,6 +327,7 @@ class DiscoveryService:
             return 0
 
         seen_at = seen_at or _now()
+        device_hostname = device_hostname or self._hostname_of(device_id)
 
         rows = []
         keys: Set[Tuple] = set()
@@ -335,6 +351,7 @@ class DiscoveryService:
                 {
                     "organization_id": organization_id,
                     "device_id": device_id,
+                    "device_hostname": device_hostname,
                     "local_interface": key[0],
                     "remote_hostname": key[1],
                     "remote_interface": key[2],
@@ -358,6 +375,7 @@ class DiscoveryService:
             set_={
                 "last_seen": statement.excluded.last_seen,
                 "is_active": True,
+                "device_hostname": statement.excluded.device_hostname,
                 "remote_platform": statement.excluded.remote_platform,
                 "remote_mgmt_ip": statement.excluded.remote_mgmt_ip,
                 "remote_chassis_id": statement.excluded.remote_chassis_id,
@@ -376,6 +394,8 @@ class DiscoveryService:
         mac_entries: Sequence[parsers.MacEntry],
         arp_entries: Sequence[parsers.ArpEntry] = (),
         seen_at: Optional[datetime] = None,
+        neighbors: Sequence[parsers.Neighbor] = (),
+        device_hostname: Optional[str] = None,
     ) -> int:
         """
         Upsert host inventory for one device
@@ -386,6 +406,11 @@ class DiscoveryService:
             mac_entries: MAC address table rows
             arp_entries: ARP rows, used to attach IP addresses
             seen_at: Timestamp for this observation
+            neighbors: Adjacencies from the same sweep. A MAC on a port where
+                LLDP or CDP saw a neighbour is that neighbour, which is how a
+                switch, an AP or a phone gets a name instead of just a vendor.
+            device_hostname: The switch's name, stored on the row so it still
+                reads sensibly if the switch is later deleted
 
         Returns:
             Number of rows written
@@ -394,6 +419,23 @@ class DiscoveryService:
             return 0
 
         seen_at = seen_at or _now()
+        device_hostname = device_hostname or self._hostname_of(device_id)
+
+        # What LLDP/CDP announced on each port, so a MAC seen there can be
+        # named. A port with several neighbours is an uplink or a hub, and
+        # naming a host after one of many would be a guess, so those are
+        # skipped.
+        by_port: Dict[str, List[parsers.Neighbor]] = {}
+        for neighbor in neighbors or ():
+            port = parsers.canonical_interface(neighbor.local_interface or "")
+            if port:
+                by_port.setdefault(port, []).append(neighbor)
+
+        announced = {
+            port: found[0]
+            for port, found in by_port.items()
+            if len(found) == 1 and found[0].remote_hostname
+        }
 
         # Resolve vendors from the in-process OUI cache rather than a query
         # per host.
@@ -413,16 +455,22 @@ class DiscoveryService:
                 continue
             keys.add(key)
 
+            neighbor = announced.get(parsers.canonical_interface(entry.interface))
+
             rows.append(
                 {
                     "organization_id": organization_id,
                     "device_id": device_id,
+                    "device_hostname": device_hostname,
                     "interface": entry.interface,
                     "mac_address": entry.mac,
                     "vlan": entry.vlan or 0,
                     "entry_type": entry.entry_type,
                     "ip_address": ip_by_mac.get(entry.mac),
                     "vendor": oui_lookup.lookup(entry.mac, self.db),
+                    "discovered_hostname": neighbor.remote_hostname if neighbor else None,
+                    "discovered_via": neighbor.protocol if neighbor else None,
+                    "discovered_platform": neighbor.remote_platform if neighbor else None,
                     "first_seen": seen_at,
                     "last_seen": seen_at,
                     "is_active": True,
@@ -445,6 +493,20 @@ class DiscoveryService:
                     statement.excluded.ip_address, HostInventory.ip_address
                 ),
                 "vendor": statement.excluded.vendor,
+                "device_hostname": statement.excluded.device_hostname,
+                # Same reasoning as ip_address: a sweep that happened not to
+                # read LLDP must not erase a name an earlier one learned.
+                "discovered_hostname": func_coalesce(
+                    statement.excluded.discovered_hostname,
+                    HostInventory.discovered_hostname,
+                ),
+                "discovered_via": func_coalesce(
+                    statement.excluded.discovered_via, HostInventory.discovered_via
+                ),
+                "discovered_platform": func_coalesce(
+                    statement.excluded.discovered_platform,
+                    HostInventory.discovered_platform,
+                ),
             },
         )
         self.db.execute(statement)
@@ -729,10 +791,22 @@ class DiscoveryService:
         summary.devices_probed += 1
 
         summary.neighbors_found += self.save_neighbors(
-            organization_id, device_id, result.neighbors, seen_at
+            organization_id,
+            device_id,
+            result.neighbors,
+            seen_at,
+            device_hostname=result.snapshot.hostname,
         )
         summary.hosts_found += self.save_inventory(
-            organization_id, device_id, result.mac_entries, result.arp_entries, seen_at
+            organization_id,
+            device_id,
+            result.mac_entries,
+            result.arp_entries,
+            seen_at,
+            # From the same sweep, so a MAC on a port where LLDP or CDP saw a
+            # neighbour gets that neighbour's name.
+            neighbors=result.neighbors,
+            device_hostname=result.snapshot.hostname,
         )
 
         self.db.execute(

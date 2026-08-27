@@ -25,6 +25,25 @@ _CONNECTION_COLUMNS = (
 )
 
 
+# Columns the Devices page may sort on. Anything not here falls back to
+# hostname rather than reaching the database.
+SORTABLE_COLUMNS = {
+    "hostname": Device.hostname,
+    "ip_address": Device.ip_address,
+    "device_type": Device.device_type,
+    "location": Device.location,
+    "transport": Device.transport,
+    "is_active": Device.is_active,
+    "last_auth_status": Device.last_auth_status,
+    "last_backup_at": Device.last_backup_at,
+    "last_backup_status": Device.last_backup_status,
+    "last_discovered_at": Device.last_discovered_at,
+    "model": Device.model,
+    "os_version": Device.os_version,
+    "created_at": Device.created_at,
+}
+
+
 class DeviceRepository(BaseRepository[Device]):
     """Repository for Device operations with multi-tenant support"""
 
@@ -68,9 +87,11 @@ class DeviceRepository(BaseRepository[Device]):
         device_type: Optional[str] = None,
         is_active: Optional[bool] = None,
         search: Optional[str] = None,
+        sort_by: str = "hostname",
+        sort_dir: str = "asc",
     ) -> List[Device]:
         """
-        Get devices by organization with filtering
+        Get devices by organization with filtering and sorting
 
         Args:
             organization_id: Organization ID (tenant scope)
@@ -79,6 +100,8 @@ class DeviceRepository(BaseRepository[Device]):
             device_type: Filter by device type
             is_active: Filter by active status
             search: Search in hostname or IP address
+            sort_by: Column to sort on; see SORTABLE_COLUMNS
+            sort_dir: 'asc' or 'desc'
 
         Returns:
             List of devices
@@ -86,9 +109,32 @@ class DeviceRepository(BaseRepository[Device]):
         stmt = self._apply_filters(
             self._scoped(organization_id), device_type, is_active, search
         )
-        stmt = stmt.order_by(Device.hostname).offset(skip).limit(limit)
+        stmt = stmt.order_by(*self._ordering(sort_by, sort_dir)).offset(skip).limit(limit)
 
         return list(self.db.scalars(stmt).all())
+
+    @staticmethod
+    def _ordering(sort_by: str, sort_dir: str):
+        """
+        The ORDER BY for a sortable column, with a stable tiebreak
+
+        Only catalogued columns are accepted: a column name straight from a
+        query string would otherwise be interpolated into SQL. Hostname is
+        appended as a tiebreak so paging through equal values - every device
+        with the same type, say - does not repeat or skip rows between pages.
+        """
+        column = SORTABLE_COLUMNS.get(sort_by, Device.hostname)
+        descending = str(sort_dir).lower() == "desc"
+
+        # NULLs last either way: an unsorted blank is noise at the top of a
+        # descending sort.
+        primary = (
+            column.desc().nullslast() if descending else column.asc().nullslast()
+        )
+
+        if column is Device.hostname:
+            return (primary,)
+        return (primary, Device.hostname.asc())
 
     def get_by_id_and_organization(
         self, id: int, organization_id: int

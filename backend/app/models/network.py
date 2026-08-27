@@ -34,9 +34,14 @@ class Neighbor(Base):
     organization_id = Column(
         Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
     )
+    # SET NULL, not CASCADE: deleting a switch must not erase the record of
+    # what it was cabled to. The row survives as history with the hostname it
+    # was seen on kept below.
     device_id = Column(
-        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True
     )
+    # Denormalised so an orphaned row still says which device reported it.
+    device_hostname = Column(String(255), nullable=True)
 
     local_interface = Column(String(100), nullable=False)
     remote_hostname = Column(String(255), nullable=False)
@@ -100,9 +105,15 @@ class HostInventory(Base):
     organization_id = Column(
         Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
     )
+    # SET NULL, not CASCADE. "Devices deleted from the device list should
+    # remain in the inventory": the inventory records what was plugged into a
+    # port, and removing the switch from the backup list is not a statement
+    # about the hosts that were on it.
     device_id = Column(
-        Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False
+        Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True
     )
+    # Denormalised so an orphaned row still names the switch it was seen on.
+    device_hostname = Column(String(255), nullable=True)
 
     interface = Column(String(100), nullable=False)
     mac_address = Column(String(17), nullable=False)
