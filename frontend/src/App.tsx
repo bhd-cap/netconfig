@@ -35,6 +35,18 @@ const Compare = lazy(() =>
 const Settings = lazy(() =>
   import('./pages/Settings').then((m) => ({ default: m.Settings }))
 );
+const Discovery = lazy(() =>
+  import('./pages/Discovery').then((m) => ({ default: m.Discovery }))
+);
+const Topology = lazy(() =>
+  import('./pages/Topology').then((m) => ({ default: m.Topology }))
+);
+const Inventory = lazy(() =>
+  import('./pages/Inventory').then((m) => ({ default: m.Inventory }))
+);
+const Reports = lazy(() =>
+  import('./pages/Reports').then((m) => ({ default: m.Reports }))
+);
 
 // Create React Query client
 const queryClient = new QueryClient({
@@ -114,6 +126,10 @@ function App() {
                   }
                 />
                 <Route path="compare" element={<Compare />} />
+                <Route path="discovery" element={<Discovery />} />
+                <Route path="topology" element={<Topology />} />
+                <Route path="inventory" element={<Inventory />} />
+                <Route path="reports" element={<Reports />} />
                 <Route path="settings" element={<Settings />} />
               </Route>
 

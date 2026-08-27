@@ -1,270 +1,275 @@
 /**
- * Settings Page - User and application settings
+ * Settings Page
+ *
+ * Tabs for the caller's own profile, user and role administration, the
+ * organization's application settings, and the remote backup targets.
+ *
+ * Which tabs appear is decided by the permissions the caller actually holds,
+ * so the page never offers an action the API would refuse.
  */
 import React, { useState } from 'react';
-import { useMutation } from '@tanstack/react-query';
-import { User, Settings as SettingsIcon, Users, Lock, Save } from 'lucide-react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-hot-toast';
+import {
+  HardDriveUpload,
+  Loader2,
+  Lock,
+  Settings as SettingsIcon,
+  Shield,
+  User,
+  Users,
+} from 'lucide-react';
 import api from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
+import { usePermissions } from '../hooks/usePermissions';
+import { ApplicationTab } from '../components/settings/ApplicationTab';
+import { RolesTab } from '../components/settings/RolesTab';
+import { TargetsTab } from '../components/settings/TargetsTab';
+import { UsersTab } from '../components/settings/UsersTab';
+
+type TabId = 'profile' | 'users' | 'roles' | 'application' | 'targets';
+
+interface Tab {
+  id: TabId;
+  label: string;
+  icon: React.ElementType;
+  permission?: string;
+}
+
+const TABS: Tab[] = [
+  { id: 'profile', label: 'Profile', icon: User },
+  { id: 'users', label: 'Users', icon: Users, permission: 'users:read' },
+  { id: 'roles', label: 'Roles', icon: Shield, permission: 'users:read' },
+  {
+    id: 'application',
+    label: 'Application',
+    icon: SettingsIcon,
+    permission: 'settings:read',
+  },
+  {
+    id: 'targets',
+    label: 'Backup targets',
+    icon: HardDriveUpload,
+    permission: 'targets:read',
+  },
+];
+
+const ProfileTab: React.FC = () => {
+  const { user } = useAuth();
+  const { me, isLoading } = usePermissions();
+  const queryClient = useQueryClient();
+
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+
+  const changePassword = useMutation({
+    mutationFn: async () =>
+      api.post('/users/me/password', {
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    onSuccess: () => {
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      queryClient.invalidateQueries({ queryKey: ['me'] });
+      toast.success('Password changed');
+    },
+  });
+
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+
+    if (newPassword !== confirmPassword) {
+      toast.error('The new passwords do not match');
+      return;
+    }
+    if (newPassword.length < 8) {
+      toast.error('The new password must be at least 8 characters');
+      return;
+    }
+
+    changePassword.mutate();
+  };
+
+  if (isLoading) {
+    return (
+      <div className="py-12 flex justify-center">
+        <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <section>
+        <h3 className="text-lg font-semibold text-gray-900 mb-4">Your account</h3>
+
+        <dl className="space-y-3 max-w-md text-sm">
+          <div className="flex justify-between border-b border-gray-100 pb-2">
+            <dt className="text-gray-500">Username</dt>
+            <dd className="text-gray-900 font-medium">{me?.username ?? user?.username}</dd>
+          </div>
+          <div className="flex justify-between border-b border-gray-100 pb-2">
+            <dt className="text-gray-500">Email</dt>
+            <dd className="text-gray-900">{me?.email ?? user?.email}</dd>
+          </div>
+          <div className="flex justify-between border-b border-gray-100 pb-2">
+            <dt className="text-gray-500">Role</dt>
+            <dd className="text-gray-900">
+              {me?.role?.name ?? (user?.is_admin ? 'Administrator' : 'No role')}
+            </dd>
+          </div>
+          <div className="flex justify-between">
+            <dt className="text-gray-500">Permissions</dt>
+            <dd className="text-gray-900">{me?.permissions.length ?? 0} granted</dd>
+          </div>
+        </dl>
+
+        {me && me.permissions.length > 0 && (
+          <details className="mt-4 max-w-md">
+            <summary className="text-sm text-blue-600 cursor-pointer">
+              Show what you can do
+            </summary>
+            <ul className="mt-2 grid grid-cols-2 gap-1 text-xs text-gray-600">
+              {me.permissions.map((permission) => (
+                <li key={permission}>
+                  <code>{permission}</code>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </section>
+
+      <section className="pt-8 border-t">
+        <h3 className="text-lg font-semibold text-gray-900 mb-1">
+          Change your password
+        </h3>
+        <p className="text-sm text-gray-500 mb-4">
+          The current password is required, so a stolen session cannot lock you
+          out of your own account.
+        </p>
+
+        {me?.must_change_password && (
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-4 text-sm text-amber-900">
+            An administrator reset your password. Please choose your own.
+          </div>
+        )}
+
+        <form onSubmit={submit} className="space-y-4 max-w-md">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Current password
+            </label>
+            <input
+              type="password"
+              value={currentPassword}
+              onChange={(event) => setCurrentPassword(event.target.value)}
+              required
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              New password
+            </label>
+            <input
+              type="password"
+              value={newPassword}
+              onChange={(event) => setNewPassword(event.target.value)}
+              required
+              minLength={8}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Confirm new password
+            </label>
+            <input
+              type="password"
+              value={confirmPassword}
+              onChange={(event) => setConfirmPassword(event.target.value)}
+              required
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={changePassword.isPending}
+            className="inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            <Lock className="h-4 w-4 mr-2" />
+            {changePassword.isPending ? 'Changing…' : 'Change password'}
+          </button>
+        </form>
+      </section>
+    </div>
+  );
+};
 
 export const Settings: React.FC = () => {
-  const { user, refreshUser } = useAuth();
-  const [activeTab, setActiveTab] = useState<'profile' | 'users' | 'application'>('profile');
+  const { user } = useAuth();
+  const { can, isLoading } = usePermissions();
+  const [activeTab, setActiveTab] = useState<TabId>('profile');
 
-  // Profile form state
-  const [profileData, setProfileData] = useState({
-    username: user?.username || '',
-    email: user?.email || '',
-  });
+  const visible = TABS.filter((tab) => !tab.permission || can(tab.permission));
 
-  const [passwordData, setPasswordData] = useState({
-    current_password: '',
-    new_password: '',
-    confirm_password: '',
-  });
-
-  // Update profile mutation
-  const updateProfileMutation = useMutation({
-    mutationFn: async (data: any) => {
-      const response = await api.put(`/users/${user?.id}`, data);
-      return response.data;
-    },
-    onSuccess: () => {
-      toast.success('Profile updated successfully');
-      refreshUser();
-    },
-    onError: (error: any) => {
-      toast.error(error.response?.data?.detail || 'Failed to update profile');
-    },
-  });
-
-  const handleProfileUpdate = (e: React.FormEvent) => {
-    e.preventDefault();
-    updateProfileMutation.mutate(profileData);
-  };
-
-  const handlePasswordChange = (e: React.FormEvent) => {
-    e.preventDefault();
-
-    if (passwordData.new_password !== passwordData.confirm_password) {
-      toast.error('New passwords do not match');
-      return;
-    }
-
-    if (passwordData.new_password.length < 8) {
-      toast.error('Password must be at least 8 characters');
-      return;
-    }
-
-    // API call to change password would go here
-    toast.success('Password change functionality coming soon');
-  };
+  // A permission change can hide the tab someone is looking at.
+  const current = visible.some((tab) => tab.id === activeTab)
+    ? activeTab
+    : 'profile';
 
   return (
     <div className="space-y-6">
-      {/* Header */}
       <div>
         <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
-        <p className="text-gray-600">Manage your account and application preferences</p>
+        <p className="text-gray-600">
+          Your account, the people who use this installation, and how it behaves.
+        </p>
       </div>
 
-      {/* Tabs */}
       <div className="bg-white rounded-lg shadow">
-        <div className="border-b border-gray-200">
+        <div className="border-b border-gray-200 overflow-x-auto">
           <nav className="flex -mb-px">
-            <button
-              onClick={() => setActiveTab('profile')}
-              className={`px-6 py-3 text-sm font-medium border-b-2 transition ${
-                activeTab === 'profile'
-                  ? 'border-blue-600 text-blue-600'
-                  : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300'
-              }`}
-            >
-              <User className="h-4 w-4 inline mr-2" />
-              Profile
-            </button>
-            {user?.is_admin && (
-              <button
-                onClick={() => setActiveTab('users')}
-                className={`px-6 py-3 text-sm font-medium border-b-2 transition ${
-                  activeTab === 'users'
-                    ? 'border-blue-600 text-blue-600'
-                    : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300'
-                }`}
-              >
-                <Users className="h-4 w-4 inline mr-2" />
-                Users
-              </button>
-            )}
-            {user?.is_admin && (
-              <button
-                onClick={() => setActiveTab('application')}
-                className={`px-6 py-3 text-sm font-medium border-b-2 transition ${
-                  activeTab === 'application'
-                    ? 'border-blue-600 text-blue-600'
-                    : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300'
-                }`}
-              >
-                <SettingsIcon className="h-4 w-4 inline mr-2" />
-                Application
-              </button>
-            )}
+            {visible.map((tab) => {
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`px-6 py-3 text-sm font-medium border-b-2 transition whitespace-nowrap ${
+                    current === tab.id
+                      ? 'border-blue-600 text-blue-600'
+                      : 'border-transparent text-gray-600 hover:text-gray-900 hover:border-gray-300'
+                  }`}
+                >
+                  <Icon className="h-4 w-4 inline mr-2" />
+                  {tab.label}
+                </button>
+              );
+            })}
           </nav>
         </div>
 
         <div className="p-6">
-          {/* Profile Tab */}
-          {activeTab === 'profile' && (
-            <div className="space-y-8">
-              {/* Profile Information */}
-              <div>
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Profile Information</h3>
-                <form onSubmit={handleProfileUpdate} className="space-y-4 max-w-md">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Username
-                    </label>
-                    <input
-                      type="text"
-                      value={profileData.username}
-                      onChange={(e) => setProfileData({ ...profileData, username: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Email
-                    </label>
-                    <input
-                      type="email"
-                      value={profileData.email}
-                      onChange={(e) => setProfileData({ ...profileData, email: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Role
-                    </label>
-                    <input
-                      type="text"
-                      value={user?.is_admin ? 'Administrator' : 'User'}
-                      disabled
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-500"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={updateProfileMutation.isPending}
-                    className="inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50"
-                  >
-                    <Save className="h-4 w-4 mr-2" />
-                    {updateProfileMutation.isPending ? 'Saving...' : 'Save Changes'}
-                  </button>
-                </form>
-              </div>
-
-              {/* Change Password */}
-              <div className="pt-8 border-t">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Change Password</h3>
-                <form onSubmit={handlePasswordChange} className="space-y-4 max-w-md">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Current Password
-                    </label>
-                    <input
-                      type="password"
-                      value={passwordData.current_password}
-                      onChange={(e) => setPasswordData({ ...passwordData, current_password: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      New Password
-                    </label>
-                    <input
-                      type="password"
-                      value={passwordData.new_password}
-                      onChange={(e) => setPasswordData({ ...passwordData, new_password: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      required
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Confirm New Password
-                    </label>
-                    <input
-                      type="password"
-                      value={passwordData.confirm_password}
-                      onChange={(e) => setPasswordData({ ...passwordData, confirm_password: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                      required
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
-                    className="inline-flex items-center px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-700 transition"
-                  >
-                    <Lock className="h-4 w-4 mr-2" />
-                    Change Password
-                  </button>
-                </form>
-              </div>
+          {isLoading ? (
+            <div className="py-12 flex justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
             </div>
-          )}
-
-          {/* Users Tab */}
-          {activeTab === 'users' && user?.is_admin && (
-            <div>
-              <h3 className="text-lg font-semibold text-gray-900 mb-4">User Management</h3>
-              <p className="text-gray-600 mb-4">
-                User management functionality coming soon. This will allow you to add, edit, and manage users in your organization.
-              </p>
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                <p className="text-sm text-blue-800">
-                  <strong>Planned Features:</strong>
-                </p>
-                <ul className="list-disc list-inside text-sm text-blue-700 mt-2 space-y-1">
-                  <li>Add new users</li>
-                  <li>Edit user roles and permissions</li>
-                  <li>Deactivate/activate users</li>
-                  <li>Reset user passwords</li>
-                </ul>
-              </div>
-            </div>
-          )}
-
-          {/* Application Tab */}
-          {activeTab === 'application' && user?.is_admin && (
-            <div>
-              <h3 className="text-lg font-semibold text-gray-900 mb-4">Application Settings</h3>
-              <p className="text-gray-600 mb-4">
-                Application-wide settings and configuration options.
-              </p>
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-                <p className="text-sm text-blue-800">
-                  <strong>Planned Features:</strong>
-                </p>
-                <ul className="list-disc list-inside text-sm text-blue-700 mt-2 space-y-1">
-                  <li>Default backup retention policies</li>
-                  <li>Email notification settings</li>
-                  <li>Backup schedule defaults</li>
-                  <li>System maintenance windows</li>
-                </ul>
-              </div>
-            </div>
+          ) : (
+            <>
+              {current === 'profile' && <ProfileTab />}
+              {current === 'users' && <UsersTab currentUserId={user?.id} />}
+              {current === 'roles' && <RolesTab />}
+              {current === 'application' && <ApplicationTab />}
+              {current === 'targets' && <TargetsTab />}
+            </>
           )}
         </div>
       </div>
