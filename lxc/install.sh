@@ -31,12 +31,28 @@
 #   WEB_CONCURRENCY=2                 uvicorn worker processes
 #   CELERY_CONCURRENCY=2              Celery worker processes
 #   SKIP_FRONTEND=true                skip building the web UI (API only)
-#   BRANCH=main                       branch to clone
+#   BRANCH=main                       branch to install; when updating an
+#                                     existing install, defaults to the branch
+#                                     already checked out rather than main
 
 set -Eeuo pipefail
 
 REPO_URL="${REPO_URL:-https://github.com/bhd-cap/netconfig.git}"
+
+# Whether the caller named a branch. An update stays on the branch the
+# container was installed from unless told otherwise - silently moving a
+# container onto main is a downgrade nobody asked for.
+if [ -n "${BRANCH:-}" ]; then
+    BRANCH_EXPLICIT=true
+else
+    BRANCH_EXPLICIT=false
+fi
 BRANCH="${BRANCH:-main}"
+
+# Filled in by obtain_source, reported in the summary so "did the update take"
+# has an answer that does not involve reading the log.
+SOURCE_REVISION="unknown"
+SOURCE_BRANCH=""
 
 APP_DIR="${APP_DIR:-/opt/netconfig}"
 DATA_DIR="${DATA_DIR:-/var/lib/netconfig}"
@@ -265,7 +281,18 @@ obtain_source() {
 
     if [ -n "$here" ] && [ -f "$here/docker-compose.yml" ] && [ -d "$here/backend" ]; then
         if [ "$here" = "$APP_DIR" ]; then
-            ok "Already installed at $APP_DIR"
+            # Re-run from inside the installation - the update path, and by far
+            # the most common way this script is used a second time. It has to
+            # actually refresh the source: returning here on the grounds that
+            # the files are already in place rebuilt the same code and changed
+            # nothing, while reporting success.
+            if [ -d "$APP_DIR/.git" ]; then
+                update_checkout
+            else
+                warn "$APP_DIR is not a git checkout, so there is nothing to update from"
+                info "Rebuilding it as it stands. To pull the latest code, either"
+                info "re-clone into $APP_DIR or run the curl one-liner from the README."
+            fi
         else
             info "Copying the local checkout from $here..."
             mkdir -p "$APP_DIR"
@@ -282,18 +309,14 @@ obtain_source() {
             ok "Copied into $APP_DIR"
         fi
         drop_stray_env
+        record_revision
         return
     fi
 
     if [ -d "$APP_DIR/.git" ]; then
-        info "Updating the existing checkout..."
-        git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH" >/dev/null 2>&1 \
-            || warn "Could not fetch updates; continuing with the local copy"
-        git -C "$APP_DIR" checkout -q "$BRANCH" 2>/dev/null || true
-        git -C "$APP_DIR" merge --ff-only "origin/$BRANCH" >/dev/null 2>&1 \
-            || warn "Local changes present; not updating"
-        ok "Updated $APP_DIR"
+        update_checkout
         drop_stray_env
+        record_revision
         return
     fi
 
@@ -302,6 +325,64 @@ obtain_source() {
         || die "Failed to clone $REPO_URL"
     ok "Cloned into $APP_DIR"
     drop_stray_env
+    record_revision
+}
+
+update_checkout() {
+    local target current before after
+
+    current=$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+    target="$BRANCH"
+    if [ "$BRANCH_EXPLICIT" != "true" ] && [ -n "$current" ] && [ "$current" != "HEAD" ]; then
+        target="$current"
+    fi
+
+    before=$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    info "Updating $APP_DIR from origin/$target (currently $before)..."
+
+    # An explicit refspec, because a --depth 1 clone configures a fetch
+    # refspec for its own branch only, and fetching any other branch would
+    # then update no remote-tracking ref at all.
+    if ! git -C "$APP_DIR" fetch --depth 1 origin \
+            "+refs/heads/$target:refs/remotes/origin/$target" \
+            >/tmp/netconfig-git.log 2>&1; then
+        tail -5 /tmp/netconfig-git.log >&2 || true
+        warn "Could not fetch origin/$target; continuing with the installed copy ($before)"
+        return
+    fi
+
+    # A modified tracked file is somebody's edit. Refusing to touch it is the
+    # right call, but it has to be said out loud, or the install looks like it
+    # updated when it did not.
+    if ! git -C "$APP_DIR" diff --quiet HEAD 2>/dev/null; then
+        warn "Uncommitted changes under $APP_DIR; the source was NOT updated"
+        info "Commit or discard them and re-run:  git -C $APP_DIR status"
+        return
+    fi
+
+    # Reset rather than merge --ff-only. The clone is shallow, so the commit
+    # currently installed is usually outside the fetched history and a
+    # fast-forward is impossible even when the remote is strictly newer -
+    # which is how this step used to fail while reporting "up to date".
+    if ! git -C "$APP_DIR" checkout -q -B "$target" "refs/remotes/origin/$target" \
+            >>/tmp/netconfig-git.log 2>&1; then
+        git -C "$APP_DIR" reset -q --hard "refs/remotes/origin/$target" \
+            >>/tmp/netconfig-git.log 2>&1 \
+            || { tail -5 /tmp/netconfig-git.log >&2; die "Could not check out origin/$target"; }
+    fi
+
+    after=$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+    if [ "$before" = "$after" ]; then
+        ok "Already at the latest $target ($after)"
+    else
+        ok "Updated to $target $before -> $after"
+    fi
+}
+
+record_revision() {
+    SOURCE_REVISION=$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    SOURCE_BRANCH=$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 }
 
 drop_stray_env() {
@@ -776,6 +857,14 @@ summary() {
 
     printf '  %sWeb UI%s        %s\n' "$BOLD" "$NC" "$url"
     printf '  %sAPI docs%s      %s/docs\n' "$BOLD" "$NC" "$url"
+
+    # Printed so an update can be confirmed at a glance, rather than by
+    # hunting through the UI for a feature that may not have arrived.
+    if [ -n "$SOURCE_BRANCH" ]; then
+        printf '  %sSource%s        %s @ %s\n' "$BOLD" "$NC" "$SOURCE_BRANCH" "$SOURCE_REVISION"
+    else
+        printf '  %sSource%s        %s\n' "$BOLD" "$NC" "$SOURCE_REVISION"
+    fi
 
     printf '\n  %sSign in with%s\n' "$BOLD" "$NC"
     printf '    username  %s\n' "$ADMIN_USERNAME"
