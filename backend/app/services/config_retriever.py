@@ -509,6 +509,7 @@ class ConfigurationRetriever:
                     "success": device_result["success"],
                     "message": device_result["message"],
                     "duration": device_result["duration"],
+                    "configuration_id": device_result.get("configuration_id"),
                 }
             )
 

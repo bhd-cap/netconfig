@@ -7,6 +7,9 @@ pytest-asyncio==0.23.3
 pytest-cov==4.1.0
 httpx==0.26.0
 faker==22.2.0
+# In-process FTP server, so the FTP export is tested against a real server
+# rather than a mock. Its tests skip themselves when it is absent.
+pyftpdlib==1.5.9
 
 # Code Quality
 black==24.1.1

@@ -158,3 +158,52 @@ def get_organization_id(
         int: Organization ID
     """
     return current_user.organization_id
+
+
+def require_permission(permission: str):
+    """
+    Build a dependency that enforces one permission
+
+    Used as: current_user: User = Depends(require_permission("devices:write"))
+
+    Permissions come from the user's role; an account with no role falls back
+    to the legacy is_admin/is_superuser flags, so nothing that worked before
+    roles existed stops working now.
+
+    Args:
+        permission: The permission string the endpoint requires
+
+    Returns:
+        A FastAPI dependency
+    """
+
+    def dependency(
+        current_user: User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ) -> User:
+        from app.services.user_admin import user_has_permission
+
+        if not user_has_permission(db, current_user, permission):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This action requires the '{permission}' permission",
+            )
+
+        return current_user
+
+    return dependency
+
+
+def get_current_permissions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> list:
+    """
+    The permissions the current user holds
+
+    The frontend uses this to decide what to render, so it does not offer
+    actions the API will refuse.
+    """
+    from app.services.user_admin import effective_permissions
+
+    return effective_permissions(db, current_user)

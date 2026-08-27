@@ -10,7 +10,7 @@ celery_app = Celery(
     "netconfig_backup",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.tasks.backup", "app.tasks.cleanup"],
+    include=["app.tasks.backup", "app.tasks.cleanup", "app.tasks.discovery"],
 )
 
 # Celery configuration
@@ -53,6 +53,13 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.cleanup.cleanup_old_backups_task",
         "schedule": crontab(hour=3, minute=0),
         "options": {"expires": 3600},
+    },
+    # Mark adjacencies and hosts that have stopped being seen. Hourly, so
+    # last_seen stays meaningful without a full crawl.
+    "age-inventory": {
+        "task": "app.tasks.discovery.age_inventory_task",
+        "schedule": crontab(minute=20),
+        "options": {"expires": 3000},
     },
 }
 

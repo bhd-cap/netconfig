@@ -250,6 +250,22 @@ def import_entries(db: Session, entries: List[Tuple[str, str]]) -> int:
     if not entries:
         return 0
 
+    # Lookups normalise a MAC to lowercase hex, so a prefix stored in any
+    # other form is a row that can never match. The IEEE registry writes its
+    # prefixes in uppercase, so normalise here rather than trusting every
+    # caller to remember.
+    entries = [
+        (
+            "".join(c for c in (prefix or "").lower() if c in "0123456789abcdef")[:6],
+            vendor,
+        )
+        for prefix, vendor in entries
+    ]
+    entries = [(prefix, vendor) for prefix, vendor in entries if len(prefix) == 6]
+
+    if not entries:
+        return 0
+
     written = 0
     # Chunked so a full registry import (well over 30k rows) does not build
     # one enormous statement.
