@@ -5,6 +5,36 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 from app.core.config import settings
 
+# Connection arguments, kept as a module constant so the encoding setting
+# below is visible to tests rather than buried in a call.
+CONNECT_ARGS = {
+    "application_name": "netconfig-backup",
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+    # Do not inherit the server's idea of the client encoding.
+    #
+    # psycopg2 encodes query parameters using client_encoding, which defaults
+    # to the database's encoding. A PostgreSQL cluster initialised without a
+    # locale - the norm in a bare Debian or Ubuntu container, where initdb
+    # falls back to SQL_ASCII - therefore made psycopg2 encode as ASCII, and
+    # any non-ASCII character raised UnicodeEncodeError before the statement
+    # was ever sent:
+    #
+    #   'ascii' codec can't encode character '\xa0' in position 7
+    #
+    # That is not obscure input. Vendor names in the IEEE OUI registry contain
+    # non-breaking spaces, an SNMP sysDescr is whatever the device felt like
+    # sending, and a device hostname or LLDP neighbour name is not required to
+    # be ASCII either. Asking for UTF-8 explicitly makes the client encoding a
+    # property of this application instead of a property of how someone's
+    # container happened to be built. On a SQL_ASCII database the server does
+    # no conversion, so the bytes round-trip unchanged; on a UTF8 one this is
+    # already the default and changes nothing.
+    "client_encoding": "utf8",
+}
+
 # Create database engine.
 #
 # Pool sizing is deliberately conservative and environment-driven: every
@@ -23,13 +53,7 @@ engine = create_engine(
     # Cache compiled SQL per connection; repeated ORM queries then skip
     # statement compilation entirely.
     query_cache_size=1200,
-    connect_args={
-        "application_name": "netconfig-backup",
-        "keepalives": 1,
-        "keepalives_idle": 30,
-        "keepalives_interval": 10,
-        "keepalives_count": 5,
-    },
+    connect_args=CONNECT_ARGS,
 )
 
 # Create session factory.

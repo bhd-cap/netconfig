@@ -534,11 +534,76 @@ setup_postgres() {
     if [ "$db_exists" = "1" ]; then
         ok "Database $DB_NAME already exists"
     else
-        su postgres -c "createdb -O \"$DB_USER\" \"$DB_NAME\"" >/dev/null
-        ok "Created database $DB_NAME owned by $DB_USER"
+        create_database
     fi
 
+    check_database_encoding
+
     su postgres -c "psql -q -d \"$DB_NAME\" -c \"GRANT ALL ON SCHEMA public TO \\\"$DB_USER\\\"\"" >/dev/null 2>&1 || true
+}
+
+create_database() {
+    # Explicitly UTF8, from template0.
+    #
+    # createdb with no encoding inherits template1's, which initdb chose from
+    # the locale at cluster creation. A bare Debian or Ubuntu container often
+    # has no locale set, initdb then falls back to SQL_ASCII, and every
+    # database created afterwards inherits it. That is a cluster which cannot
+    # store text it has not been told the encoding of, and it made psycopg2
+    # encode parameters as ASCII - so a vendor name containing a non-breaking
+    # space, or an SNMP sysDescr with any accented character in it, failed
+    # before the statement was sent.
+    #
+    # C.UTF-8 gives correct case folding for non-ASCII; where it is not
+    # generated, plain C is the portable fallback, and PostgreSQL permits the
+    # encoding/locale mismatch precisely because C makes no claims about text.
+    if su postgres -c \
+        "createdb -E UTF8 -T template0 --locale=C.UTF-8 -O \"$DB_USER\" \"$DB_NAME\"" \
+        >/dev/null 2>&1; then
+        ok "Created database $DB_NAME (UTF8, C.UTF-8) owned by $DB_USER"
+        return
+    fi
+
+    if su postgres -c \
+        "createdb -E UTF8 -T template0 --lc-collate=C --lc-ctype=C -O \"$DB_USER\" \"$DB_NAME\"" \
+        >/dev/null 2>&1; then
+        ok "Created database $DB_NAME (UTF8, C) owned by $DB_USER"
+        return
+    fi
+
+    # Last resort: whatever the cluster defaults to, so an install still
+    # completes. check_database_encoding says what that costs.
+    su postgres -c "createdb -O \"$DB_USER\" \"$DB_NAME\"" >/dev/null \
+        || die "Could not create database $DB_NAME"
+    ok "Created database $DB_NAME owned by $DB_USER"
+}
+
+check_database_encoding() {
+    # An existing database cannot be re-encoded in place, so this is advisory.
+    # The application asks for a UTF-8 client encoding regardless, which is
+    # what stops non-ASCII text failing outright, but a SQL_ASCII database
+    # still stores bytes it cannot validate or convert - worth knowing about
+    # before it becomes a puzzle.
+    local encoding
+    encoding=$(su postgres -c \
+        "psql -tAc \"SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='$DB_NAME'\"" \
+        2>/dev/null | tr -d '[:space:]')
+
+    case "$encoding" in
+        UTF8) ok "Database encoding is UTF8" ;;
+        "")   warn "Could not determine the encoding of $DB_NAME" ;;
+        *)
+            warn "Database $DB_NAME is $encoding, not UTF8"
+            info "The application forces a UTF-8 client encoding, so this works,"
+            info "but the server cannot validate or convert what it stores. To"
+            info "convert (it needs a dump and restore, so take a backup first):"
+            info "  systemctl stop netconfig-api netconfig-worker netconfig-beat"
+            info "  su postgres -c \"pg_dump $DB_NAME\" > /root/$DB_NAME.sql"
+            info "  su postgres -c \"dropdb $DB_NAME\""
+            info "  su postgres -c \"createdb -E UTF8 -T template0 --locale=C.UTF-8 -O $DB_USER $DB_NAME\""
+            info "  su postgres -c \"psql -q $DB_NAME\" < /root/$DB_NAME.sql"
+            ;;
+    esac
 }
 
 # --------------------------------------------------------------------------

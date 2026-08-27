@@ -168,3 +168,44 @@ def test_ieee_sources_are_all_https():
     assert oui.IEEE_OUI_SOURCES
     for url in oui.IEEE_OUI_SOURCES:
         assert url.startswith("https://"), url
+
+
+# --------------------------------------------------------------------------
+# Vendor name normalisation
+#
+# The registry is hand-maintained and contains non-breaking spaces, stray
+# tabs and zero-width characters. On a SQL_ASCII cluster a U+00A0 in a vendor
+# name aborted the whole import with a UnicodeEncodeError; even on UTF8 it is
+# a name that no search for the same text typed normally will match.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("Atron\xa0electronic GmbH", "Atron electronic GmbH"),
+        ("Cisco Systems", "Cisco Systems"),          # figure space
+        ("Nokia​Networks", "NokiaNetworks"),          # zero width space
+        ("  Juniper   Networks  ", "Juniper Networks"),
+        ("Arista\tNetworks\r\n", "Arista Networks"),
+        ("HP  Inc.", "HP Inc."),
+        ("", ""),
+        ("   ", ""),
+        (None, ""),
+        # Letters outside ASCII belong to the name and must survive.
+        ("Télécom Sudparis", "Télécom Sudparis"),
+        ("北京小米移动软件", "北京小米移动软件"),
+        ("Sagemcom Broadband SAS", "Sagemcom Broadband SAS"),
+    ],
+)
+def test_normalise_vendor_name(raw, expected):
+    assert oui.normalise_vendor_name(raw) == expected
+
+
+def test_normalise_vendor_name_leaves_no_non_ascii_whitespace():
+    """Nothing that looks like a space may survive as a non-ASCII character"""
+    cleaned = oui.normalise_vendor_name("A\xa0B C​D　E")
+
+    for char in cleaned:
+        assert char == " " or not char.isspace(), repr(char)
+        assert char == " " or ord(char) < 0x2000 or char.isalnum(), repr(char)
