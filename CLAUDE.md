@@ -302,6 +302,74 @@ columns probably needs one too.
 
 **Important**: Always verify both configs belong to same device before comparing.
 
+## Discovery, Inventory and Topology
+
+**Transports**: `Device.transport` is `ssh`, `telnet` or `snmp`. SSH and telnet
+both drive the CLI through Netmiko (`app/config/discovery_commands.py` maps a
+device type to its `*_telnet` driver). SNMP is read-only, so an SNMP device can
+be discovered and inventoried but never backed up - `_retrieve_config` says so
+explicitly rather than failing later inside the transport.
+
+**pysnmp 7 is asyncio-only.** `app/services/snmp_client.py` drives it from sync
+code by building a fresh event loop and `SnmpEngine` per call, because an
+engine cannot outlive the loop it was created on. Do not hoist the engine into
+a module-level singleton.
+
+**Parsing**: `app/services/parsers.py` anchors on the MAC address rather than
+on column positions, because every vendor's table is laid out differently and
+several change layout between releases. `parse()` never raises - a device that
+returns something unexpected yields an empty result, not a failed crawl.
+
+**Upsert keys must be NOT NULL.** `neighbors.remote_interface` and
+`host_inventory.vlan` default to `''` and `0` for this reason: NULLs never
+compare equal, so `ON CONFLICT` would never match and every run would insert
+duplicates. Any new upsert key needs the same treatment.
+
+**Ageing, not deleting**: adjacencies and inventory rows are marked inactive
+once they stop being seen. "Last seen on port 12 three weeks ago" is the useful
+answer, and it needs the row to survive.
+
+**Topology**: the graph is always rebuilt from the current adjacencies and
+never stored. A saved diagram holds only the user's edits - positions, renamed
+labels, hidden nodes, hand-drawn links - so a device discovered afterwards
+still appears and a hand-arranged layout is not thrown away by a refresh.
+`_link_key` normalises direction, so a cable both ends report is one edge.
+
+**OUI**: prefixes are stored as six lowercase hex characters.
+`import_entries()` normalises whatever it is given, because the IEEE registry
+writes them uppercase and a lookup normalises the MAC to lowercase. The bundled
+`app/data/oui_common.csv` is a 12-prefix starter set, not the registry; the
+real thing is imported from the system, a URL or IEEE.
+
+## Permissions
+
+Permissions are `resource:action` strings from `app/core/permissions.py`.
+Endpoints use `Depends(require_permission("devices:write"))` rather than the
+`is_admin` flag. `*` and `resource:*` wildcards are supported, and the seeded
+Administrator role holds `*` so a permission added later needs no backfill.
+
+A user with no role falls back to the legacy `is_admin`/`is_superuser` flags,
+so accounts that predate roles keep working. `is_admin` is kept in step with
+the role's permissions whenever either changes.
+
+An organization can never be left without an administrator: demoting,
+deactivating or deleting the last active one, or stripping `users:write` from
+the role that grants it, is refused.
+
+The frontend reads `/users/me` to decide what to render. That is a courtesy,
+not a boundary - the API checks every permission itself.
+
+## Secrets
+
+Device passwords, enable secrets, SNMP communities and v3 keys, the SMTP
+password, and backup-target passwords and private keys are all Fernet
+encrypted with `ENCRYPTION_KEY`.
+
+Every one of them is write-only over the API: a read returns whether one is
+stored, never the value, and an update that omits the field leaves the stored
+secret alone. Clearing one takes an explicit flag. Follow this pattern for any
+new secret.
+
 ## Environment Variables
 
 **Backend** (`backend/.env`):
@@ -323,9 +391,24 @@ columns probably needs one too.
 1. Create Pydantic schema in `app/schemas/`
 2. Add repository method if needed in `app/repositories/`
 3. Create route in `app/api/v1/`
-4. Use `get_organization_id()` dependency for tenant scoping
+4. Use `get_organization_id()` for tenant scoping and
+   `Depends(require_permission("<resource>:<action>"))` for authorization
 5. Add audit logging for important actions
 6. Update API router in `app/api/v1/__init__.py`
+7. Add an API-level test under `tests/integration/test_api_*.py`
+
+Watch route ordering: a literal path has to be declared before a matching
+parameterised one, or `/users/roles` is swallowed by `/users/{user_id}`.
+
+### Adding a New Permission
+
+1. Add it to `PERMISSION_CATALOGUE` in `app/core/permissions.py`
+2. Add it to whichever entries in `SYSTEM_ROLES` should hold it - the
+   Administrator role holds `*`, so it needs no change
+3. Use it in `require_permission()` on the endpoints it guards
+
+The role editor and the permission list endpoint are both driven from the
+catalogue, so nothing in the frontend needs updating.
 
 ### Adding New Device Type
 
@@ -333,7 +416,11 @@ columns probably needs one too.
 2. Map to Netmiko type
 3. Specify configuration command
 4. Set enable mode requirement
-5. Update TypeScript types in `frontend/src/types/index.ts`
+5. Add its LLDP/CDP/MAC/ARP commands to `DISCOVERY_COMMANDS` in
+   `app/config/discovery_commands.py`, and a parser in
+   `app/services/parsers.py` if none of the existing formats fits
+6. Add it to `TELNET_DEVICE_TYPES` if Netmiko has a `*_telnet` driver for it
+7. Update TypeScript types in `frontend/src/types/index.ts`
 
 ### Creating Database Migration
 
@@ -348,9 +435,28 @@ alembic upgrade head
 
 ## Testing Strategy
 
-**Backend**: API endpoint tests connect to real database and Redis (use test fixtures to create/cleanup test data). Mock Netmiko connections for device tests.
+**Backend**: `backend/tests/` needs a real PostgreSQL and the same environment
+variables the app uses (`DATABASE_URL`, `SECRET_KEY`, `ENCRYPTION_KEY`). The
+integration tests truncate their tables on setup, so point `DATABASE_URL` at a
+scratch database, never a real one.
 
-**Frontend**: No test suite yet. `npm run build` runs `tsc` first, so type
+```bash
+cd backend
+pip install -r requirements-dev.txt
+alembic upgrade head
+pytest -q
+```
+
+- `tests/unit/` - parsers and transports, no database
+- `tests/integration/` - services and the API, against a real database
+- `tests/integration/test_api_*.py` go through the real FastAPI stack with only
+  `get_current_user` and `get_db` overridden, so route ordering, permission
+  dependencies and response shapes are all covered
+
+Mock at the connector boundary for device tests - the parsers have their own
+tests against real captured output, so a service test should not re-parse.
+
+**Frontend**: No unit test suite yet. `npm run build` runs `tsc` first, so type
 errors fail the build - treat that as the type-checking gate. There is no
 ESLint configuration file, so `npm run lint` does not currently run.
 
@@ -413,18 +519,25 @@ Things to know before changing it:
 ## Current Status
 
 **Complete**:
-- Backend API (35 endpoints)
-- Authentication system
-- Device management
-- Backup system (manual + scheduled, concurrent)
+- Backend API (83 endpoints)
+- Authentication, roles and per-permission authorization
+- Device management over SSH, telnet and SNMP
+- Backup system (manual + scheduled, concurrent), held during maintenance
+  windows
 - Configuration comparison
 - Dashboard statistics API
-- Frontend pages and dashboard charts
+- Neighbour discovery, seed crawl and the derived topology graph
+- Editable, saved topology diagrams
+- Host inventory with first/last seen and OUI vendor mapping
+- Connected-device reports and a CSV export
+- SFTP/FTP export of stored configurations
+- User administration, application settings and maintenance windows
+- Frontend pages for all of the above
+- Backend test suite (285 tests) and a browser smoke test
 - One-line installer
 
 **Incomplete**:
-- Automated test suite (no tests committed under `backend/tests/`)
-- Frontend tests and an ESLint configuration
+- Frontend unit tests and an ESLint configuration
 - Per-job device filtering: `BackupJob.device_filter` is stored but ignored;
   a scheduled job always backs up every active device in the organization
 - User documentation
@@ -432,6 +545,6 @@ Things to know before changing it:
 ## Key Files to Reference
 
 - `BACKEND_SUMMARY.md` - Complete backend feature overview
-- `API_REFERENCE.md` - All 35 API endpoints with examples
+- `API_REFERENCE.md` - API endpoints with examples
 - `CHECKPOINT.md` - Development resume point with setup instructions
 - `DOCKER_TESTING_GUIDE.md` - Deployment and troubleshooting
