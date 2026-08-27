@@ -39,6 +39,7 @@ from app.services.device_connector import (
     DeviceConnectionError,
     DeviceCommandError,
     DeviceConnector,
+    snmp_params,
 )
 from app.services.config_retriever import DeviceSnapshot
 from app.services.oui import ensure_populated, oui_lookup
@@ -77,18 +78,9 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _snapshot_snmp(device: Device) -> Dict[str, object]:
-    """Collect a device's SNMP parameters into the shape DeviceConnector wants"""
-    return {
-        "version": device.snmp_version,
-        "community": device.snmp_community,
-        "port": device.snmp_port,
-        "v3_user": device.snmp_v3_user,
-        "v3_auth_key": device.snmp_v3_auth_key,
-        "v3_priv_key": device.snmp_v3_priv_key,
-        "v3_auth_protocol": device.snmp_v3_auth_protocol,
-        "v3_priv_protocol": device.snmp_v3_priv_protocol,
-    }
+# Kept as a module-level alias: the mapping belongs with DeviceConnector, but
+# this module and its tests have always reached for it under this name.
+_snapshot_snmp = snmp_params
 
 
 class DiscoveryService:

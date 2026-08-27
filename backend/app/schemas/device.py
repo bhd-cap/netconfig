@@ -19,26 +19,55 @@ DeviceType = Literal[
 ]
 
 
+# How the device is reached. SSH and telnet both drive the CLI through
+# Netmiko; SNMP is read-only and cannot retrieve a configuration, so it is
+# only useful for discovery and inventory.
+Transport = Literal["ssh", "telnet", "snmp"]
+
+SnmpVersion = Literal["1", "2c", "3"]
+
+
 class DeviceBase(BaseModel):
     """Base device schema with common fields"""
     hostname: str = Field(..., min_length=1, max_length=255, description="Device hostname")
     ip_address: str = Field(..., description="Device IP address (IPv4 or IPv6)")
     device_type: DeviceType = Field(..., description="Device OS type")
-    port: int = Field(default=22, ge=1, le=65535, description="SSH port")
-    username: str = Field(..., min_length=1, max_length=100, description="SSH username")
+    port: int = Field(default=22, ge=1, le=65535, description="SSH or telnet port")
+    username: str = Field(..., min_length=1, max_length=100, description="Login username")
     description: str | None = Field(None, description="Device description")
     location: str | None = Field(None, max_length=255, description="Physical location")
     tags: Dict[str, Any] | None = Field(default=None, description="Custom tags/metadata")
 
+    transport: Transport = Field(
+        default="ssh", description="How to reach the device: ssh, telnet or snmp"
+    )
+    snmp_version: SnmpVersion | None = Field(None, description="SNMP version")
+    snmp_port: int = Field(default=161, ge=1, le=65535, description="SNMP port")
+    snmp_v3_user: str | None = Field(None, max_length=100)
+    snmp_v3_auth_protocol: str | None = Field(None, max_length=20)
+    snmp_v3_priv_protocol: str | None = Field(None, max_length=20)
 
-class DeviceCreate(DeviceBase):
+
+class SnmpCredentials(BaseModel):
+    """
+    Write-only SNMP secrets
+
+    Separate from DeviceBase so a read never returns them, the same way the
+    login password is handled.
+    """
+    snmp_community: str | None = Field(None, description="v1/v2c community (encrypted)")
+    snmp_v3_auth_key: str | None = Field(None, description="v3 auth key (encrypted)")
+    snmp_v3_priv_key: str | None = Field(None, description="v3 privacy key (encrypted)")
+
+
+class DeviceCreate(DeviceBase, SnmpCredentials):
     """Schema for creating a device"""
-    password: str = Field(..., min_length=1, description="SSH password (will be encrypted)")
+    password: str = Field(..., min_length=1, description="Login password (will be encrypted)")
     enable_secret: str | None = Field(None, description="Enable secret for Cisco devices")
     ssh_key_path: str | None = Field(None, description="Path to SSH private key")
 
 
-class DeviceUpdate(BaseModel):
+class DeviceUpdate(SnmpCredentials):
     """Schema for updating a device"""
     hostname: str | None = Field(None, min_length=1, max_length=255)
     ip_address: str | None = None
@@ -53,6 +82,13 @@ class DeviceUpdate(BaseModel):
     tags: Dict[str, Any] | None = None
     is_active: bool | None = None
 
+    transport: Transport | None = None
+    snmp_version: SnmpVersion | None = None
+    snmp_port: int | None = Field(None, ge=1, le=65535)
+    snmp_v3_user: str | None = Field(None, max_length=100)
+    snmp_v3_auth_protocol: str | None = Field(None, max_length=20)
+    snmp_v3_priv_protocol: str | None = Field(None, max_length=20)
+
 
 class DeviceInDB(DeviceBase):
     """Schema for device in database"""
@@ -64,6 +100,10 @@ class DeviceInDB(DeviceBase):
     created_at: datetime
     updated_at: datetime
     created_by: int | None
+
+    # Set when a discovery crawl registered the device rather than a person.
+    discovered: bool = False
+    last_discovered_at: datetime | None = None
 
     class Config:
         from_attributes = True

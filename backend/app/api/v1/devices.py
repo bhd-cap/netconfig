@@ -21,13 +21,34 @@ from app.schemas.device import (
     DeviceTestConnection,
 )
 from app.schemas.common import PaginatedResponse, SuccessResponse
-from app.services.device_connector import DeviceConnector
+from app.services.device_connector import DeviceConnector, snmp_params
 from app.utils.encryption import encryption_service
 from app.utils.csv_parser import parse_device_csv, generate_csv_template, CSVParseError
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# SNMP secrets are handled like the login password: encrypted on the way in,
+# never returned, and left alone when an update omits them.
+SNMP_SECRETS = {"snmp_community", "snmp_v3_auth_key", "snmp_v3_priv_key"}
+
+
+def _encrypted_snmp_secrets(device_in) -> dict:
+    """
+    Encrypt whichever SNMP secrets were supplied
+
+    Args:
+        device_in: A DeviceCreate or DeviceUpdate
+
+    Returns:
+        dict of column name to ciphertext, for the secrets that were set
+    """
+    return {
+        field: encryption_service.encrypt(getattr(device_in, field))
+        for field in SNMP_SECRETS
+        if getattr(device_in, field, None)
+    }
 
 
 @router.get("", response_model=PaginatedResponse[DeviceResponse])
@@ -161,13 +182,14 @@ def create_device(
         encrypted_enable_secret = encryption_service.encrypt(device_in.enable_secret)
 
     # Prepare device data
-    device_data = device_in.dict(exclude={"password", "enable_secret"})
+    device_data = device_in.dict(exclude={"password", "enable_secret"} | SNMP_SECRETS)
     device_data.update({
         "organization_id": organization_id,
         "encrypted_password": encrypted_password,
         "enable_secret": encrypted_enable_secret,
         "created_by": current_user.id,
     })
+    device_data.update(_encrypted_snmp_secrets(device_in))
 
     # Create device
     device = device_repo.create(device_data)
@@ -242,7 +264,9 @@ def update_device(
             )
 
     # Prepare update data
-    update_data = device_in.dict(exclude_unset=True, exclude={"password", "enable_secret"})
+    update_data = device_in.dict(
+        exclude_unset=True, exclude={"password", "enable_secret"} | SNMP_SECRETS
+    )
 
     # Encrypt new password if provided
     if device_in.password:
@@ -251,6 +275,9 @@ def update_device(
     # Encrypt new enable secret if provided
     if device_in.enable_secret:
         update_data["enable_secret"] = encryption_service.encrypt(device_in.enable_secret)
+
+    # Same for the SNMP secrets: omitting one leaves the stored value alone.
+    update_data.update(_encrypted_snmp_secrets(device_in))
 
     # Update device
     device = device_repo.update(device, update_data)
@@ -353,8 +380,11 @@ def test_device_connection(
             detail="Device not found",
         )
 
-    # Test connection
+    # Test connection over whichever transport the device is configured for,
+    # so a telnet or SNMP device is not tested as if it were SSH.
     try:
+        transport = device.transport or "ssh"
+
         connector = DeviceConnector(
             hostname=device.hostname,
             ip_address=device.ip_address,
@@ -364,6 +394,8 @@ def test_device_connection(
             port=device.port,
             enable_secret=device.enable_secret,
             ssh_key_path=device.ssh_key_path,
+            transport=transport,
+            snmp=snmp_params(device) if transport == "snmp" else None,
         )
 
         result = connector.test_connection()
@@ -494,13 +526,16 @@ def bulk_upload_devices(
                     device_in.enable_secret
                 )
 
-            device_data = device_in.dict(exclude={"password", "enable_secret"})
+            device_data = device_in.dict(
+                exclude={"password", "enable_secret"} | SNMP_SECRETS
+            )
             device_data.update({
                 "organization_id": organization_id,
                 "encrypted_password": encrypted_password,
                 "enable_secret": encrypted_enable_secret,
                 "created_by": current_user.id,
             })
+            device_data.update(_encrypted_snmp_secrets(device_in))
             pending_rows.append(device_data)
 
         if pending_rows:

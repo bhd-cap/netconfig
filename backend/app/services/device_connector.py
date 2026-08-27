@@ -24,6 +24,32 @@ from app.utils.encryption import encryption_service
 logger = logging.getLogger(__name__)
 
 
+def snmp_params(device) -> Dict[str, Any]:
+    """
+    Collect a device's SNMP columns into the shape DeviceConnector expects
+
+    Lives here rather than beside any one caller because the backup path, the
+    connectivity test and discovery all need the same mapping, and the keys
+    are this class's contract.
+
+    Args:
+        device: A Device row
+
+    Returns:
+        dict of SNMP parameters, secrets still encrypted
+    """
+    return {
+        "version": device.snmp_version,
+        "community": device.snmp_community,
+        "port": device.snmp_port,
+        "v3_user": device.snmp_v3_user,
+        "v3_auth_key": device.snmp_v3_auth_key,
+        "v3_priv_key": device.snmp_v3_priv_key,
+        "v3_auth_protocol": device.snmp_v3_auth_protocol,
+        "v3_priv_protocol": device.snmp_v3_priv_protocol,
+    }
+
+
 class DeviceConnectionError(Exception):
     """Exception raised for device connection errors"""
     pass
