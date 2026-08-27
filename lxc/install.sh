@@ -320,9 +320,22 @@ obtain_source() {
         return
     fi
 
+    # An install directory with content but no .git cannot be cloned into and
+    # cannot be updated either. Saying that is more use than "failed to clone",
+    # which reads like a network problem.
+    if [ -d "$APP_DIR" ] && [ -n "$(ls -A "$APP_DIR" 2>/dev/null)" ]; then
+        die \
+"$APP_DIR already has content but is not a git checkout, so it cannot be
+       updated. Either move it aside and re-run to get a fresh clone:
+
+         mv $APP_DIR ${APP_DIR}.old && <this command again>
+
+       or run the installer from a checkout of the version you want."
+    fi
+
     info "Cloning $REPO_URL ($BRANCH)..."
     git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR" >/dev/null 2>&1 \
-        || die "Failed to clone $REPO_URL"
+        || die "Failed to clone $REPO_URL (branch $BRANCH)"
     ok "Cloned into $APP_DIR"
     drop_stray_env
     record_revision
