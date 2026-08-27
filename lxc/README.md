@@ -68,9 +68,38 @@ sudo ./lxc/install.sh
 | `WEB_CONCURRENCY` | `2` | uvicorn worker processes |
 | `CELERY_CONCURRENCY` | `2` | Celery worker processes |
 | `SKIP_FRONTEND` | `false` | Install the API only, no web UI |
+| `BRANCH` | the installed branch, else `main` | Branch to install or update to |
 
-Re-running is safe: it keeps the existing configuration and secrets, updates
-the code, rebuilds, and resets the admin password to `ADMIN_PASSWORD`.
+## Updating
+
+```bash
+cd /opt/netconfig && sudo ./lxc/install.sh
+```
+
+It fetches the branch the container was installed from, fast-forwards
+`/opt/netconfig` to it, rebuilds the UI, applies any new migrations and
+restarts the services. Existing configuration and secrets are kept; the admin
+password is reset to `ADMIN_PASSWORD` (`changeme` by default).
+
+To move a container onto a different branch, name it:
+
+```bash
+cd /opt/netconfig && sudo BRANCH=some-branch ./lxc/install.sh
+```
+
+Two things to know:
+
+- **The last line of the output names the revision that was installed**
+  (`Source   main @ a1b2c3d`). If a change you expected is missing, check that
+  first - it is the difference between "the update did not run" and "the update
+  ran but that work is on another branch".
+- **A modified tracked file under `/opt/netconfig` blocks the update**, with a
+  warning rather than silently discarding the edit. `git -C /opt/netconfig
+  status` shows what, and committing or discarding it lets the update proceed.
+
+If `/opt/netconfig` is not a git checkout there is nothing to update from, and
+the installer says so and rebuilds what is there. Re-clone it, or run the curl
+one-liner, to pick up new code.
 
 ## After installing
 
