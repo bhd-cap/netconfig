@@ -503,6 +503,8 @@ export interface OuiStatus {
   prefixes: number;
   system_file?: string | null;
   ieee_url: string;
+  // Every URL a "download registry" import will try, in order.
+  ieee_sources?: string[];
   sources: string[];
   note: string;
 }

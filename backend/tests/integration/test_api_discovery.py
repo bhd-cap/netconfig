@@ -794,6 +794,137 @@ def test_a_short_prefix_is_dropped_rather_than_stored(db):
     assert db.scalar(select(func.count(OuiVendor.oui))) == 1
 
 
+def test_oui_upload_imports_a_manuf_file(client, db, org, roles):
+    """
+    The escape hatch for an install with no outbound internet access
+
+    A browser cannot hand the server a local path, which made the 'file'
+    source unusable from the UI - so "Import IEEE" was the only button, and it
+    fails on any network that cannot reach IEEE.
+    """
+    admin = user_admin.create_user(
+        db, org.id, "uploadadmin", "uploadadmin@example.com",
+        password="uploadpass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    clear_oui(db)
+
+    content = b"F0D5BF Intel Corporate\n001B2C Atron electronic GmbH\n"
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("nmap-mac-prefixes", content, "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["imported"] == 2
+
+    stored = dict(db.execute(select(OuiVendor.oui, OuiVendor.vendor_name)).all())
+    # The whole vendor name, not just its last word.
+    assert stored["f0d5bf"] == "Intel Corporate"
+
+
+def test_oui_upload_rejects_an_empty_file(client, db, org, roles):
+    admin = user_admin.create_user(
+        db, org.id, "emptyadmin", "emptyadmin@example.com",
+        password="emptypass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("empty.csv", b"", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower()
+
+
+def test_oui_upload_rejects_a_file_it_cannot_parse(client, db, org, roles):
+    """
+    An HTML error page must not become 39,000 rows of nonsense
+    """
+    admin = user_admin.create_user(
+        db, org.id, "junkadmin", "junkadmin@example.com",
+        password="junkpass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("403.html", b"<html><body>Forbidden</body></html>", "text/html")},
+    )
+
+    assert response.status_code == 400
+    assert "No usable OUI entries" in response.json()["detail"]
+
+
+def test_oui_upload_needs_settings_write(client, operator):
+    response = as_user(client, operator).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("x.csv", b"001122 Acme\n", "text/plain")},
+    )
+
+    assert response.status_code == 403
+
+
+def test_a_failed_ieee_import_says_what_it_tried(client, db, org, roles):
+    """
+    The old handler let anything that was not a RuntimeError become a bare 500
+
+    An operator got "500 Internal Server Error" with nothing to act on. Now
+    the response names each source and suggests the upload route.
+    """
+    from unittest import mock
+
+    admin = user_admin.create_user(
+        db, org.id, "ieeeadmin", "ieeeadmin@example.com",
+        password="ieeepass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    with mock.patch(
+        "app.services.oui.import_from_ieee",
+        side_effect=RuntimeError(
+            "Could not fetch the OUI registry from any source. Tried:\n  "
+            "https://standards-oui.ieee.org/oui/oui.csv: 403 Forbidden"
+        ),
+    ):
+        response = as_user(client, admin).post(
+            "/api/v1/inventory/oui/import", json={"source": "ieee"}
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "403 Forbidden" in detail
+    assert "standards-oui.ieee.org" in detail
+
+
+def test_a_write_failure_is_reported_not_swallowed(client, db, org, roles):
+    """
+    A database error mid-import used to surface as an opaque 500
+
+    It still returns 500 - it is a server fault - but names the exception and
+    points at the log, which is the difference between diagnosable and not.
+    """
+    from unittest import mock
+
+    admin = user_admin.create_user(
+        db, org.id, "writeadmin", "writeadmin@example.com",
+        password="writepass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    with mock.patch(
+        "app.services.oui.import_bundled",
+        side_effect=ValueError("column overflowed"),
+    ):
+        response = as_user(client, admin).post(
+            "/api/v1/inventory/oui/import", json={"source": "bundled"}
+        )
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "ValueError" in detail
+    assert "column overflowed" in detail
+    assert "journalctl" in detail
+
+
 def test_backfill_resolves_vendors_for_existing_rows(
     client, db, org, operator, switches
 ):

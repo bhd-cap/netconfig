@@ -34,6 +34,21 @@ logger = logging.getLogger(__name__)
 # The IEEE MA-L registry. Only fetched when an administrator asks.
 IEEE_OUI_CSV_URL = "https://standards-oui.ieee.org/oui/oui.csv"
 
+# Tried in order. standards-oui.ieee.org sits behind a WAF that rejects
+# unattended clients often enough that a single-source import is unreliable in
+# the field, so well-known mirrors of the same registry are attempted after it.
+# Each is a full MA-L list in a format parse_any() recognises.
+IEEE_OUI_SOURCES = (
+    IEEE_OUI_CSV_URL,
+    # nmap's prefix list is regenerated from the registry and served from
+    # GitHub, which is reachable from far more networks than IEEE's own host.
+    "https://raw.githubusercontent.com/nmap/nmap/master/nmap-mac-prefixes",
+    "https://www.wireshark.org/download/automated/data/manuf",
+)
+
+# The longest vendor name the column can hold.
+VENDOR_NAME_LIMIT = 255
+
 # Shipped with the application so a brand new install is useful offline.
 BUNDLED_OUI_PATH = Path(__file__).resolve().parent.parent / "data" / "oui_common.csv"
 
@@ -254,14 +269,26 @@ def import_entries(db: Session, entries: List[Tuple[str, str]]) -> int:
     # other form is a row that can never match. The IEEE registry writes its
     # prefixes in uppercase, so normalise here rather than trusting every
     # caller to remember.
-    entries = [
-        (
-            "".join(c for c in (prefix or "").lower() if c in "0123456789abcdef")[:6],
-            vendor,
-        )
-        for prefix, vendor in entries
-    ]
-    entries = [(prefix, vendor) for prefix, vendor in entries if len(prefix) == 6]
+    #
+    # The vendor name is clamped to the column width here as well as in the
+    # parsers: a name one character too long would otherwise abort a
+    # 35,000-row import with a database error, losing the whole registry over
+    # one bad row.
+    normalised = []
+    for prefix, vendor in entries:
+        cleaned = "".join(
+            c for c in (prefix or "").lower() if c in "0123456789abcdef"
+        )[:6]
+        if len(cleaned) != 6:
+            continue
+
+        name = (str(vendor) if vendor is not None else "").strip()
+        if not name:
+            continue
+
+        normalised.append((cleaned, name[:VENDOR_NAME_LIMIT]))
+
+    entries = normalised
 
     if not entries:
         return 0
@@ -374,19 +401,32 @@ def parse_manuf(content: str) -> List[Tuple[str, str]]:
         if not line:
             continue
 
-        parts = re.split(r"[\t ]+", line, maxsplit=2)
-        if len(parts) < 2:
-            continue
+        # The two formats have to be told apart before splitting. manuf is tab
+        # separated with a short name and a long name; nmap puts the whole
+        # vendor name after a single space. Splitting on "tab or space" treats
+        # 'F0D5BF Intel Corporate' as three fields and, preferring the "long
+        # name", stores 'Corporate' - dropping the manufacturer.
+        if "\t" in line:
+            parts = line.split("\t", 2)
+            if len(parts) < 2:
+                continue
+            prefix_raw = parts[0]
+            # Prefer the long name where manuf provides one.
+            vendor = (parts[2] if len(parts) > 2 and parts[2].strip() else parts[1])
+        else:
+            parts = re.split(r"\s+", line, maxsplit=1)
+            if len(parts) < 2:
+                continue
+            prefix_raw, vendor = parts[0], parts[1]
 
-        prefix = parts[0].replace(":", "").replace("-", "").lower()
+        prefix = prefix_raw.strip().replace(":", "").replace("-", "").lower()
         # manuf also lists longer prefixes (28/36 bit); only MA-L fits here.
         if len(prefix) != 6 or not re.fullmatch(r"[0-9a-f]{6}", prefix):
             continue
 
-        # Prefer the long name where the format provides one.
-        vendor = (parts[2] if len(parts) > 2 else parts[1]).strip()
+        vendor = vendor.strip()
         if vendor:
-            entries.append((prefix, vendor[:255]))
+            entries.append((prefix, vendor[:VENDOR_NAME_LIMIT]))
 
     return entries
 
@@ -517,35 +557,88 @@ def import_from_url(db: Session, url: str, timeout: int = 120) -> int:
 
 def import_from_ieee(db: Session, timeout: int = 120) -> int:
     """
-    Download and import the full IEEE registry
+    Download and import the full public OUI registry
+
+    Each source in IEEE_OUI_SOURCES is tried in turn. IEEE's own host sits
+    behind a WAF that rejects unattended clients often enough that a
+    single-source import fails in the field, so mirrors of the same registry
+    follow it.
 
     Args:
         db: Database session
-        timeout: HTTP timeout in seconds
+        timeout: HTTP timeout in seconds per source
 
     Returns:
         Number of rows written
 
     Raises:
-        RuntimeError: If the registry cannot be fetched
+        RuntimeError: If no source could be fetched and parsed, naming what
+            each one did
     """
     import urllib.request
 
-    logger.info(f"Downloading the IEEE OUI registry from {IEEE_OUI_CSV_URL}")
+    attempts = []
 
-    try:
-        request = urllib.request.Request(
-            IEEE_OUI_CSV_URL, headers={"User-Agent": "netconfig-backup/1.0"}
-        )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            content = response.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        raise RuntimeError(f"Could not download the IEEE OUI registry: {e}")
+    for url in IEEE_OUI_SOURCES:
+        logger.info(f"Downloading the OUI registry from {url}")
 
-    entries = parse_ieee_csv(content)
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "netconfig-backup/1.0"}
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                content = response.read().decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001 - try the next source
+            logger.warning(f"OUI source {url} failed: {e}")
+            attempts.append(f"{url}: {e}")
+            continue
+
+        entries = parse_any(content)
+        if not entries:
+            logger.warning(f"OUI source {url} returned nothing usable")
+            attempts.append(f"{url}: downloaded but contained no usable entries")
+            continue
+
+        logger.info(f"Parsed {len(entries)} OUI prefixes from {url}")
+        return import_entries(db, entries)
+
+    raise RuntimeError(
+        "Could not fetch the OUI registry from any source. "
+        "If this host has no outbound internet access, download oui.csv or "
+        "Wireshark's manuf file elsewhere and upload it instead. Tried:\n  "
+        + "\n  ".join(attempts)
+    )
+
+
+def import_from_bytes(db: Session, content: bytes, filename: str = "upload") -> int:
+    """
+    Import an uploaded OUI list
+
+    The escape hatch for an install with no outbound internet access: a
+    browser cannot hand the server a local path, so the file arrives as bytes.
+
+    Args:
+        db: Database session
+        content: Raw file contents
+        filename: Original name, for the error message only
+
+    Returns:
+        Number of rows written
+
+    Raises:
+        RuntimeError: If nothing usable could be parsed out of it
+    """
+    text = content.decode("utf-8", errors="replace")
+    entries = parse_any(text)
+
     if not entries:
-        raise RuntimeError("The IEEE registry download contained no usable entries")
+        raise RuntimeError(
+            f"No usable OUI entries found in '{filename}'. Expected the IEEE "
+            f"oui.csv or oui.txt, Wireshark's manuf, or nmap's "
+            f"nmap-mac-prefixes."
+        )
 
+    logger.info(f"Parsed {len(entries)} OUI prefixes from uploaded '{filename}'")
     return import_entries(db, entries)
 
 
