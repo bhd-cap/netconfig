@@ -122,6 +122,13 @@ class DeviceRepository(BaseRepository[Device]):
         query string would otherwise be interpolated into SQL. Hostname is
         appended as a tiebreak so paging through equal values - every device
         with the same type, say - does not repeat or skip rows between pages.
+
+        The tiebreak follows the sort direction. That is not cosmetic: after a
+        discovery crawl a whole estate can share one value for the column being
+        sorted - every device cisco_ios, over ssh, never authenticated, never
+        backed up - and with a fixed ascending tiebreak the ascending and
+        descending orders came back identical. Clicking the header did nothing
+        anyone could see, which is indistinguishable from sorting being broken.
         """
         column = SORTABLE_COLUMNS.get(sort_by, Device.hostname)
         descending = str(sort_dir).lower() == "desc"
@@ -134,7 +141,9 @@ class DeviceRepository(BaseRepository[Device]):
 
         if column is Device.hostname:
             return (primary,)
-        return (primary, Device.hostname.asc())
+
+        tiebreak = Device.hostname.desc() if descending else Device.hostname.asc()
+        return (primary, tiebreak)
 
     def get_by_id_and_organization(
         self, id: int, organization_id: int

@@ -625,3 +625,75 @@ def test_device_detail_is_scoped_to_the_organization(client, db, admin, fleet):
         as_user(client, admin).get(f"/api/v1/devices/{foreign.id}/detail").status_code
         == 404
     )
+
+
+@pytest.fixture
+def uniform_fleet(db, org):
+    """
+    A fleet with nothing to tell its devices apart
+
+    This is what a discovery crawl actually produces before anything has been
+    logged into: one device type, one transport, never authenticated, never
+    backed up. Sorting on any of those columns ties on every row.
+    """
+    for hostname in ("sw-a", "sw-b", "sw-c", "sw-d"):
+        db.add(
+            Device(
+                organization_id=org.id,
+                hostname=hostname,
+                ip_address=f"10.9.0.{ord(hostname[-1])}",
+                device_type="cisco_ios",
+                username="admin",
+                encrypted_password=encryption_service.encrypt("secret"),
+                transport="ssh",
+                last_auth_status="never",
+                is_active=True,
+            )
+        )
+    db.commit()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["device_type", "transport", "last_auth_status", "is_active", "last_backup_at"],
+)
+def test_reversing_a_tied_column_still_reverses_the_page(
+    client, admin, uniform_fleet, column
+):
+    """
+    Flipping the direction has to change something the user can see
+
+    With a fixed ascending tiebreak, a column where every row holds the same
+    value came back in an identical order both ways - so clicking the header
+    did nothing visible, which is indistinguishable from sorting being broken.
+    Reported from a real install, where every discovered device was cisco_ios
+    over ssh and none had been authenticated.
+    """
+    ascending = _hostnames(client, admin, f"&sort_by={column}&sort_dir=asc")
+    descending = _hostnames(client, admin, f"&sort_by={column}&sort_dir=desc")
+
+    assert ascending == ["sw-a", "sw-b", "sw-c", "sw-d"]
+    assert descending == ascending[::-1]
+
+
+def test_a_tied_column_still_pages_without_repeating(client, admin, uniform_fleet):
+    """
+    The tiebreak's original job, which the reversal must not break
+
+    Every row ties on device_type, so without a tiebreak at all the database
+    is free to return them in any order and paging would repeat and skip rows.
+    """
+    for direction in ("asc", "desc"):
+        seen = []
+        for skip in (0, 2):
+            body = (
+                as_user(client, admin)
+                .get(
+                    f"/api/v1/devices?limit=2&skip={skip}"
+                    f"&sort_by=device_type&sort_dir={direction}"
+                )
+                .json()
+            )
+            seen.extend(item["hostname"] for item in body["items"])
+
+        assert len(set(seen)) == 4, f"{direction}: paging repeated a row: {seen}"

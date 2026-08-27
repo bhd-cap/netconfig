@@ -37,6 +37,50 @@ router = APIRouter()
 # leaves plenty of headroom without letting an upload exhaust memory.
 MAX_OUI_UPLOAD_BYTES = 32 * 1024 * 1024
 
+# Columns the host list can be ordered by, same contract as the device list: a
+# name from a query string is looked up here or refused, never interpolated
+# into SQL. "switch" sorts on the joined device hostname, falling back to the
+# name recorded on the row so a host whose switch has been deleted still sorts
+# somewhere sensible rather than to one end.
+HOST_SORTABLE_COLUMNS = {
+    "mac_address": HostInventory.mac_address,
+    "ip_address": HostInventory.ip_address,
+    "vendor": HostInventory.vendor,
+    "interface": HostInventory.interface,
+    "vlan": HostInventory.vlan,
+    "hostname": HostInventory.hostname,
+    "discovered_hostname": HostInventory.discovered_hostname,
+    "entry_type": HostInventory.entry_type,
+    "first_seen": HostInventory.first_seen,
+    "last_seen": HostInventory.last_seen,
+    "is_active": HostInventory.is_active,
+    "switch": func.coalesce(Device.hostname, HostInventory.device_hostname),
+}
+
+
+def _host_ordering(sort_by: str, sort_dir: str):
+    """
+    The ORDER BY for the host list, with a tiebreak that follows the direction
+
+    Inventory ties constantly - a hundred hosts on one VLAN, or every row
+    inactive - so a fixed tiebreak would make ascending and descending come
+    back in the same order and the header look dead. MAC address is the
+    tiebreak because it is the one column that is never null and never
+    duplicated within a switch port.
+    """
+    column = HOST_SORTABLE_COLUMNS.get(sort_by, HostInventory.last_seen)
+    descending = str(sort_dir).lower() == "desc"
+
+    primary = column.desc().nullslast() if descending else column.asc().nullslast()
+
+    if column is HostInventory.mac_address:
+        return (primary,)
+
+    tiebreak = (
+        HostInventory.mac_address.desc() if descending else HostInventory.mac_address.asc()
+    )
+    return (primary, tiebreak)
+
 
 # --------------------------------------------------------------------------
 # Schemas
@@ -115,11 +159,22 @@ def list_hosts(
     search: Optional[str] = Query(None, description="MAC, IP or hostname"),
     active_only: bool = Query(True),
     seen_within_hours: Optional[int] = Query(None, ge=1),
+    sort_by: str = Query("last_seen", description="Column to sort on"),
+    sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
     current_user: User = Depends(require_permission("inventory:read")),
     organization_id: int = Depends(get_organization_id),
     db: Session = Depends(get_db),
 ):
     """List hosts seen on switch ports"""
+    if sort_by not in HOST_SORTABLE_COLUMNS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot sort on '{sort_by}'. Sortable columns are: "
+                f"{', '.join(sorted(HOST_SORTABLE_COLUMNS))}"
+            ),
+        )
+
     filters = [HostInventory.organization_id == organization_id]
 
     if device_id is not None:
@@ -155,7 +210,7 @@ def list_hosts(
         select(HostInventory, Device.hostname)
         .outerjoin(Device, HostInventory.device_id == Device.id)
         .where(*filters)
-        .order_by(HostInventory.last_seen.desc())
+        .order_by(*_host_ordering(sort_by, sort_dir))
         .offset(skip)
         .limit(limit)
     ).all()

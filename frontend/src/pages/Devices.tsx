@@ -18,9 +18,6 @@ import {
   Activity,
   CheckCircle,
   XCircle,
-  ArrowUp,
-  ArrowDown,
-  ArrowUpDown,
   Search,
   ShieldCheck,
   ShieldX,
@@ -31,6 +28,15 @@ import { toast } from 'react-hot-toast';
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
 import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
+import {
+  PageSizeSelect,
+  SortDir,
+  SortHeader,
+  SortableColumn,
+  nextSort,
+  pageWindow,
+  usePageSize,
+} from '../components/table/TableControls';
 import {
   AuthStatus,
   BulkDeviceUpdate,
@@ -43,15 +49,13 @@ import {
   Transport,
 } from '../types';
 
-type SortDir = 'asc' | 'desc';
-
 /**
  * The columns with a header the user can click
  *
  * Every key here is in the API's own SORTABLE_COLUMNS catalogue; sorting on
  * anything else is refused with a 400 rather than silently ignored.
  */
-const SORTABLE: Array<{ key: string; label: string }> = [
+const SORTABLE: SortableColumn[] = [
   { key: 'hostname', label: 'Device' },
   { key: 'ip_address', label: 'IP Address' },
   { key: 'device_type', label: 'Type' },
@@ -109,7 +113,7 @@ export const Devices: React.FC = () => {
   const [sortBy, setSortBy] = useState('hostname');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
   const [page, setPage] = useState(1);
-  const [limit] = useState(20);
+  const [limit, setLimit] = usePageSize('devices-page-size', 20);
   const queryClient = useQueryClient();
   const { can } = usePermissions();
   const canWrite = can('devices:write');
@@ -162,13 +166,16 @@ export const Devices: React.FC = () => {
   };
 
   const sort = (key: string) => {
-    if (key === sortBy) {
-      setSortDir((dir) => (dir === 'asc' ? 'desc' : 'asc'));
-    } else {
-      setSortBy(key);
-      setSortDir('asc');
-    }
+    const [nextBy, nextDir] = nextSort(key, sortBy, sortDir);
+    setSortBy(nextBy);
+    setSortDir(nextDir);
     setPage(1);
+  };
+
+  const changePageSize = (size: number) => {
+    setLimit(size);
+    setPage(1);
+    clearSelection();
   };
 
   // Delete device mutation
@@ -311,28 +318,6 @@ export const Devices: React.FC = () => {
     );
   };
 
-  const SortHeader: React.FC<{ column: { key: string; label: string } }> = ({ column }) => {
-    const active = sortBy === column.key;
-    const Icon = !active ? ArrowUpDown : sortDir === 'asc' ? ArrowUp : ArrowDown;
-
-    return (
-      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-        <button
-          type="button"
-          onClick={() => sort(column.key)}
-          data-testid={`sort-${column.key}`}
-          aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
-          className={`inline-flex items-center gap-1 hover:text-gray-900 transition ${
-            active ? 'text-gray-900' : ''
-          }`}
-          title={`Sort by ${column.label}`}
-        >
-          {column.label}
-          <Icon className={`h-3 w-3 ${active ? 'text-blue-600' : 'text-gray-400'}`} />
-        </button>
-      </th>
-    );
-  };
 
   return (
     <div className="space-y-6">
@@ -351,19 +336,22 @@ export const Devices: React.FC = () => {
         </button>
       </div>
 
-      {/* Search */}
-      <div className="relative max-w-md">
-        <Search className="h-4 w-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(1);
-          }}
-          placeholder="Search hostname or IP"
-          className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-        />
+      {/* Search and page size */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="relative w-full max-w-md">
+          <Search className="h-4 w-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder="Search hostname or IP"
+            className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          />
+        </div>
+        <PageSizeSelect value={limit} onChange={changePageSize} noun="devices" />
       </div>
 
       {/* Bulk action bar */}
@@ -448,7 +436,13 @@ export const Devices: React.FC = () => {
                     />
                   </th>
                   {SORTABLE.map((column) => (
-                    <SortHeader key={column.key} column={column} />
+                    <SortHeader
+                      key={column.key}
+                      column={column}
+                      sortBy={sortBy}
+                      sortDir={sortDir}
+                      onSort={sort}
+                    />
                   ))}
                   <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Actions
@@ -586,19 +580,28 @@ export const Devices: React.FC = () => {
                     >
                       Previous
                     </button>
-                    {Array.from({ length: devicesData.total_pages }, (_, i) => i + 1).map((p) => (
-                      <button
-                        key={p}
-                        onClick={() => setPage(p)}
-                        className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
-                          p === page
-                            ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
-                            : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'
-                        }`}
-                      >
-                        {p}
-                      </button>
-                    ))}
+                    {pageWindow(page, devicesData.total_pages).map((entry, index) =>
+                      entry === 'gap' ? (
+                        <span
+                          key={`gap-${index}`}
+                          className="relative inline-flex items-center px-3 py-2 border border-gray-300 bg-white text-sm text-gray-400"
+                        >
+                          &hellip;
+                        </span>
+                      ) : (
+                        <button
+                          key={entry}
+                          onClick={() => setPage(entry)}
+                          className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
+                            entry === page
+                              ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
+                              : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'
+                          }`}
+                        >
+                          {entry}
+                        </button>
+                      )
+                    )}
                     <button
                       onClick={() => setPage(page + 1)}
                       disabled={page === devicesData.total_pages}
