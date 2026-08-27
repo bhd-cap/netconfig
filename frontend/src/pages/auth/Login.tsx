@@ -98,7 +98,7 @@ export const Login: React.FC = () => {
             <button
               type="submit"
               disabled={isLoading}
-              className="w-full bg-blue-600 text-white py-2.5 rounded-lg font-medium hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+              className="w-full bg-blue-600 text-white py-2.5 rounded-lg font-medium hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {isLoading ? (
                 <>
@@ -122,17 +122,6 @@ export const Login: React.FC = () => {
               </Link>
             </p>
           </div>
-        </div>
-
-        {/* Demo credentials */}
-        <div className="mt-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
-          <p className="text-sm text-blue-800 font-medium mb-2">Demo Credentials:</p>
-          <p className="text-sm text-blue-700">
-            Username: <code className="bg-white px-2 py-0.5 rounded">admin</code>
-          </p>
-          <p className="text-sm text-blue-700">
-            Password: <code className="bg-white px-2 py-0.5 rounded">changeme</code>
-          </p>
         </div>
       </div>
     </div>
