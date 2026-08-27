@@ -625,7 +625,7 @@ Things to know before changing it:
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (396 tests) and browser smoke tests
+- Backend test suite (407 tests) and browser smoke tests
 - One-line installer
 
 **Incomplete**:
