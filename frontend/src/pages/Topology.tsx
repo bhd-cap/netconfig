@@ -502,6 +502,7 @@ export const Topology: React.FC = () => {
           ) : (
             <svg
               ref={svgRef}
+              data-testid="topology-canvas"
               viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
               className="w-full h-[520px] select-none"
               onMouseMove={handleMouseMove}
@@ -517,7 +518,7 @@ export const Topology: React.FC = () => {
                   selected === link.source || selected === link.target;
 
                 return (
-                  <g key={link.key}>
+                  <g key={link.key} data-link-key={link.key}>
                     <line
                       x1={source.x}
                       y1={source.y}
@@ -555,6 +556,7 @@ export const Topology: React.FC = () => {
               {visibleNodes.map((node) => (
                 <g
                   key={node.key}
+                  data-node-key={node.key}
                   transform={`translate(${node.x}, ${node.y})`}
                   onMouseDown={() => canEdit && setDragging(node.key)}
                   onClick={() => handleNodeClick(node.key)}

@@ -142,6 +142,38 @@ def test_viewer_cannot_list_users(client, viewer):
     assert "users:read" in response.json()["detail"]
 
 
+def test_logging_in_records_the_time(client, db, admin):
+    """
+    The user administration screen shows a last-login column
+
+    The column has always existed; nothing was writing to it, so every account
+    read 'never' however often it was used.
+    """
+    assert admin.last_login_at is None
+
+    response = client.post(
+        "/api/v1/auth/login",
+        data={"username": "apiadmin", "password": "adminpass1"},
+    )
+
+    assert response.status_code == 200
+
+    db.refresh(admin)
+    assert admin.last_login_at is not None
+
+
+def test_a_failed_login_does_not_record_a_time(client, db, admin):
+    response = client.post(
+        "/api/v1/auth/login",
+        data={"username": "apiadmin", "password": "wrong"},
+    )
+
+    assert response.status_code == 401
+
+    db.refresh(admin)
+    assert admin.last_login_at is None
+
+
 def test_change_own_password_requires_the_current_one(client, db, admin):
     wrong = as_user(client, admin).post(
         "/api/v1/users/me/password",

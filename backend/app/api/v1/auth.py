@@ -1,7 +1,7 @@
 """
 Authentication API endpoints
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
@@ -75,7 +75,11 @@ def login(
         expires_delta=access_token_expires,
     )
 
-    # Log successful login
+    # Record the sign-in. The column has always existed and the user
+    # administration screen shows it, so it has to actually be written.
+    user.last_login_at = datetime.now(timezone.utc)
+
+    # Log successful login. The audit entry commits the timestamp with it.
     audit_repo.log_action(
         user_id=user.id,
         action="login_success",
