@@ -40,7 +40,10 @@ class Neighbor(Base):
 
     local_interface = Column(String(100), nullable=False)
     remote_hostname = Column(String(255), nullable=False)
-    remote_interface = Column(String(100), nullable=True)
+    # Part of the upsert key, so it cannot be NULL: NULLs never compare
+    # equal and ON CONFLICT would never match, re-inserting the same link
+    # on every run. '' means the neighbour did not report a port.
+    remote_interface = Column(String(100), nullable=False, default="", server_default="")
     remote_platform = Column(Text, nullable=True)
     remote_mgmt_ip = Column(String(45), nullable=True)
     remote_chassis_id = Column(String(64), nullable=True)
@@ -103,7 +106,9 @@ class HostInventory(Base):
 
     interface = Column(String(100), nullable=False)
     mac_address = Column(String(17), nullable=False)
-    vlan = Column(Integer, nullable=True)
+    # Not nullable for the same reason as Neighbor.remote_interface.
+    # 0 means the device did not report a VLAN.
+    vlan = Column(Integer, nullable=False, default=0, server_default="0")
     entry_type = Column(String(20), nullable=True)
 
     # Filled in from ARP when the switch or a router knows the address.

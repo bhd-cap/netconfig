@@ -91,7 +91,11 @@ def upgrade() -> None:
         sa.Column('device_id', sa.Integer(), nullable=False),
         sa.Column('local_interface', sa.String(length=100), nullable=False),
         sa.Column('remote_hostname', sa.String(length=255), nullable=False),
-        sa.Column('remote_interface', sa.String(length=100), nullable=True),
+        # Not nullable: this is part of the upsert key, and NULLs never
+        # compare equal, so a nullable column would defeat ON CONFLICT and
+        # let the same link insert over and over. '' means not reported.
+        sa.Column('remote_interface', sa.String(length=100), nullable=False,
+                  server_default=''),
         sa.Column('remote_platform', sa.Text(), nullable=True),
         sa.Column('remote_mgmt_ip', sa.String(length=45), nullable=True),
         sa.Column('remote_chassis_id', sa.String(length=64), nullable=True),
@@ -107,8 +111,6 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(['device_id'], ['devices.id'], ondelete='CASCADE'),
         sa.ForeignKeyConstraint(['remote_device_id'], ['devices.id'], ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('id'),
-        # NULLS NOT DISTINCT would be ideal for remote_interface but needs
-        # PG15; the writer coalesces it to '' instead so the constraint bites.
         sa.UniqueConstraint('device_id', 'local_interface', 'remote_hostname',
                             'remote_interface', name='uq_neighbor_link'),
     )
@@ -125,7 +127,9 @@ def upgrade() -> None:
         sa.Column('device_id', sa.Integer(), nullable=False),
         sa.Column('interface', sa.String(length=100), nullable=False),
         sa.Column('mac_address', sa.String(length=17), nullable=False),
-        sa.Column('vlan', sa.Integer(), nullable=True),
+        # Not nullable for the same reason as neighbors.remote_interface.
+        # 0 means the device did not report a VLAN.
+        sa.Column('vlan', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('entry_type', sa.String(length=20), nullable=True),
         sa.Column('ip_address', sa.String(length=45), nullable=True),
         sa.Column('hostname', sa.String(length=255), nullable=True),
