@@ -341,6 +341,34 @@ writes them uppercase and a lookup normalises the MAC to lowercase. The bundled
 `app/data/oui_common.csv` is a 12-prefix starter set, not the registry; the
 real thing is imported from the system, a URL or IEEE.
 
+## Scheduled Job Device Filters
+
+`BackupJob.device_filter` is a JSONB document resolved by
+`app/services/device_filter.py`. Every criterion present is ANDed; a list
+within one criterion is ORed. `{}` or `None` means "every device that can be
+backed up", so a job created before filtering existed keeps its old behaviour.
+
+Keys: `device_ids`, `exclude_device_ids`, `device_types`, `locations`,
+`hostname_pattern` (a glob, not SQL), `tags` (all pairs must match, via JSONB
+`@>`), `transports`, `include_inactive`, `include_snmp`.
+
+- **Unknown keys are rejected**, not ignored. A filter that silently matches
+  everything or nothing is the worst failure mode here, so `validate()` runs
+  on create and update rather than only at run time.
+- **SNMP devices are excluded by default.** SNMP cannot retrieve a
+  configuration, so including one guarantees a failure on every run. Naming
+  `snmp` in `transports`, or setting `include_snmp`, opts back in.
+- **A stored filter that no longer validates fails the run**, rather than
+  falling back to everything - falling back would silently widen the job's
+  scope.
+- **Every early return must advance `next_run_at`.**
+  `check_scheduled_jobs_task` picks up anything whose next run has passed, so
+  a path that returns without advancing it re-fires every 60 seconds. That
+  applies to the no-match, invalid-filter and maintenance-window paths alike.
+
+`resolve()` selects only `Device.id`, so a candidate's encrypted credentials
+are never materialised just to pick a set.
+
 ## Permissions
 
 Permissions are `resource:action` strings from `app/core/permissions.py`.
@@ -519,11 +547,11 @@ Things to know before changing it:
 ## Current Status
 
 **Complete**:
-- Backend API (83 endpoints)
+- Backend API (86 endpoints)
 - Authentication, roles and per-permission authorization
 - Device management over SSH, telnet and SNMP
 - Backup system (manual + scheduled, concurrent), held during maintenance
-  windows
+  windows, with per-job device filtering
 - Configuration comparison
 - Dashboard statistics API
 - Neighbour discovery, seed crawl and the derived topology graph
@@ -533,13 +561,11 @@ Things to know before changing it:
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (285 tests) and a browser smoke test
+- Backend test suite (339 tests) and a browser smoke test
 - One-line installer
 
 **Incomplete**:
 - Frontend unit tests and an ESLint configuration
-- Per-job device filtering: `BackupJob.device_filter` is stored but ignored;
-  a scheduled job always backs up every active device in the organization
 - User documentation
 
 ## Key Files to Reference

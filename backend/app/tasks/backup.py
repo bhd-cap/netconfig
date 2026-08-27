@@ -145,7 +145,6 @@ def scheduled_backup_task(job_id: int):
     db = SessionLocal()
     try:
         job_repo = BackupJobRepository(db)
-        device_repo = DeviceRepository(db)
         retriever = ConfigurationRetriever(db)
 
         # Get the job
@@ -195,19 +194,59 @@ def scheduled_backup_task(job_id: int):
                 "next_run": next_run.isoformat() if next_run else None,
             }
 
-        # Get devices to backup based on job filter.
-        #
-        # Complex per-job filtering is still unimplemented (both branches were
-        # already identical), but only IDs are needed here, so this no longer
-        # loads every device row - credentials and all - to read an id off each.
-        device_ids = device_repo.get_active_ids_by_organization(job.organization_id)
+        # Which devices this job covers. An empty filter means every device
+        # that can be backed up, so a job created before filtering existed
+        # behaves exactly as it always did. Only IDs are selected, so the
+        # encrypted credentials on every candidate are not materialised just
+        # to pick a set.
+        from app.services import device_filter as device_filter_service
+
+        try:
+            device_ids = device_filter_service.resolve(
+                db, job.organization_id, job.device_filter
+            )
+        except device_filter_service.FilterError as e:
+            # A stored filter that no longer validates - a device type removed
+            # from the catalogue, say. Backing up everything instead would
+            # silently widen the job, so fail loudly and leave it to be fixed.
+            logger.error(f"Backup job {job_id} has an invalid device filter: {e}")
+
+            current_time = datetime.utcnow()
+            try:
+                next_run = croniter(job.schedule_cron, current_time).get_next(datetime)
+            except Exception:
+                next_run = None
+            job_repo.update_last_run(job_id, current_time, next_run)
+
+            return {
+                "success": False,
+                "job_id": job_id,
+                "error": f"Invalid device filter: {e}",
+            }
 
         if not device_ids:
-            logger.warning(f"No devices found for job {job_id}")
+            # A filter that matches nothing today may match something
+            # tomorrow, so the job stays enabled - but its next run has to be
+            # advanced, or it comes due again on the very next check and
+            # re-fires every minute.
+            logger.warning(
+                f"Job {job_id} matched no devices "
+                f"({device_filter_service.describe(job.device_filter)})"
+            )
+
+            current_time = datetime.utcnow()
+            try:
+                next_run = croniter(job.schedule_cron, current_time).get_next(datetime)
+            except Exception:
+                next_run = None
+            job_repo.update_last_run(job_id, current_time, next_run)
+
             return {
                 "success": True,
-                "message": "No devices to backup",
+                "job_id": job_id,
+                "message": "No devices matched this job's filter",
                 "devices_backed_up": 0,
+                "next_run": next_run.isoformat() if next_run else None,
             }
 
         logger.info(f"Job {job_id}: backing up {len(device_ids)} devices")

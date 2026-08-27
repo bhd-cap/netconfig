@@ -129,13 +129,55 @@ export interface TaskStatus {
 }
 
 // Backup Job
+// Which devices a scheduled job covers. Every criterion is ANDed; a list
+// within one criterion is ORed. An empty filter means every device that can be
+// backed up, which is what a job created before filtering existed does.
+export interface DeviceFilter {
+  device_ids?: number[];
+  exclude_device_ids?: number[];
+  device_types?: string[];
+  locations?: string[];
+  hostname_pattern?: string;
+  tags?: Record<string, string | number | boolean>;
+  transports?: string[];
+  include_inactive?: boolean;
+  // SNMP cannot retrieve a configuration, so those devices are excluded
+  // unless this is set.
+  include_snmp?: boolean;
+}
+
+export interface FilterOptions {
+  device_types: string[];
+  locations: string[];
+  tag_keys: string[];
+  transports: string[];
+  filter_keys: string[];
+}
+
+export interface DeviceFilterPreview {
+  total: number;
+  summary: string;
+  truncated: boolean;
+  devices: Array<{
+    id: number;
+    hostname: string;
+    ip_address: string;
+    device_type: string;
+    location?: string | null;
+    transport: string;
+    is_active: boolean;
+  }>;
+  job_id?: number;
+  job_name?: string;
+}
+
 export interface BackupJob {
   id: number;
   name: string;
   description?: string;
   schedule_cron: string;
   is_enabled: boolean;
-  device_filter?: Record<string, any>;
+  device_filter?: DeviceFilter;
   organization_id: number;
   created_by?: number;
   last_run_at?: string;
@@ -149,7 +191,7 @@ export interface BackupJobCreate {
   description?: string;
   schedule_cron: string;
   is_enabled?: boolean;
-  device_filter?: Record<string, any>;
+  device_filter?: DeviceFilter;
 }
 
 export interface BackupJobUpdate {
@@ -157,7 +199,8 @@ export interface BackupJobUpdate {
   description?: string;
   schedule_cron?: string;
   is_enabled?: boolean;
-  device_filter?: Record<string, any>;
+  // null clears the filter back to "every device".
+  device_filter?: DeviceFilter | null;
 }
 
 // Configuration Comparison

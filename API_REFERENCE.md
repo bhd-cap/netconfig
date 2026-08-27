@@ -274,7 +274,8 @@ Content-Type: application/json
   "schedule_cron": "0 2 * * *",
   "is_enabled": true,
   "device_filter": {
-    "tags.location": "datacenter-1"
+    "locations": ["datacenter-1"],
+    "tags": { "role": "core" }
   }
 }
 ```
@@ -286,6 +287,82 @@ Examples:
 - `0 */4 * * *` - Every 4 hours
 - `0 0 * * 0` - Weekly on Sunday at midnight
 - `0 0 1 * *` - Monthly on the 1st at midnight
+
+### Device Filter
+
+Which devices the job covers. Every criterion present is ANDed; a list within
+one criterion is ORed. Omit it, or send `{}` or `null`, to cover every device
+that can be backed up.
+
+```json
+{
+  "device_ids": [1, 2, 3],
+  "exclude_device_ids": [9],
+  "device_types": ["cisco_ios", "arista_eos"],
+  "locations": ["NYC", "LON"],
+  "hostname_pattern": "core-*",
+  "tags": { "role": "core", "env": "prod" },
+  "transports": ["ssh", "telnet"],
+  "include_inactive": false,
+  "include_snmp": false
+}
+```
+
+- `hostname_pattern` is a glob: `*` matches any run of characters, `?` exactly
+  one. A literal `%` or `_` in the pattern is matched literally.
+- `tags` requires every pair to be present on the device.
+- SNMP devices are excluded unless `transports` names `snmp` or
+  `include_snmp` is set — SNMP cannot retrieve a configuration, so including
+  one guarantees a failure on every run.
+- An unknown key is rejected with 400 rather than ignored.
+
+### Preview a Filter
+```http
+POST /backup-jobs/preview-filter
+Authorization: Bearer {token}
+
+{
+  "device_filter": { "locations": ["NYC"], "tags": { "role": "core" } },
+  "limit": 25
+}
+```
+
+**Response:**
+```json
+{
+  "total": 1,
+  "summary": "Devices where location in NYC; tagged role=core",
+  "truncated": false,
+  "devices": [
+    {
+      "id": 1,
+      "hostname": "core-nyc-01",
+      "ip_address": "10.0.0.1",
+      "device_type": "cisco_ios",
+      "location": "NYC",
+      "transport": "ssh",
+      "is_active": true
+    }
+  ]
+}
+```
+
+### Filter Options
+```http
+GET /backup-jobs/filter-options
+```
+
+The device types, locations and tag keys actually present in this
+organization, so an editor cannot offer a criterion that would match nothing.
+
+### A Job's Current Devices
+```http
+GET /backup-jobs/{id}/devices?limit=200
+```
+
+Same shape as the preview, plus `job_id` and `job_name`. Resolved live, so a
+device added or retagged after the job was saved is included without editing
+the job. Returns 409 if the stored filter no longer validates.
 
 ### List Jobs
 ```http

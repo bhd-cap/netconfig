@@ -16,6 +16,11 @@ import {
 import { toast } from 'react-hot-toast';
 import api from '../lib/api';
 import { BackupJob, BackupJobCreate, BackupJobUpdate, PaginatedResponse } from '../types';
+import {
+  DeviceFilterEditor,
+  describeFilter,
+  pruneFilter,
+} from '../components/jobs/DeviceFilterEditor';
 
 export const Jobs: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -51,7 +56,9 @@ export const Jobs: React.FC = () => {
   // Toggle job mutation
   const toggleMutation = useMutation({
     mutationFn: async ({ jobId, isEnabled }: { jobId: number; isEnabled: boolean }) => {
-      await api.patch(`/backup-jobs/${jobId}`, { is_enabled: isEnabled });
+      // Dedicated endpoints, not a PATCH: the API has no PATCH route here, so
+      // toggling silently 405'd.
+      await api.post(`/backup-jobs/${jobId}/${isEnabled ? 'enable' : 'disable'}`);
     },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['backup-jobs'] });
@@ -65,7 +72,7 @@ export const Jobs: React.FC = () => {
   // Trigger job mutation
   const triggerMutation = useMutation({
     mutationFn: async (jobId: number) => {
-      const response = await api.post(`/backup-jobs/${jobId}/run`);
+      const response = await api.post(`/backup-jobs/${jobId}/run-now`);
       return response.data;
     },
     onSuccess: () => {
@@ -184,6 +191,9 @@ export const Jobs: React.FC = () => {
                         {job.description && (
                           <div className="text-sm text-gray-500">{job.description}</div>
                         )}
+                        <div className="text-xs text-gray-500 mt-0.5">
+                          {describeFilter(job.device_filter)}
+                        </div>
                       </div>
                     </div>
                   </td>
@@ -362,13 +372,18 @@ const JobModal: React.FC<JobModalProps> = ({ job, onClose, onSuccess }) => {
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      // Send only the criteria actually set, so a bag of blanks does not
+      // reach the API as a filter.
+      const payload = {
+        ...formData,
+        device_filter: pruneFilter(formData.device_filter ?? {}),
+      };
+
       if (job) {
-        // Update existing job
-        const updateData: BackupJobUpdate = { ...formData };
+        const updateData: BackupJobUpdate = payload;
         await api.put(`/backup-jobs/${job.id}`, updateData);
       } else {
-        // Create new job
-        await api.post('/backup-jobs', formData);
+        await api.post('/backup-jobs', payload);
       }
     },
     onSuccess: () => {
@@ -476,6 +491,13 @@ const JobModal: React.FC<JobModalProps> = ({ job, onClose, onSuccess }) => {
                 ))}
               </div>
             </div>
+
+            <DeviceFilterEditor
+              value={formData.device_filter ?? {}}
+              onChange={(device_filter) =>
+                setFormData((prev) => ({ ...prev, device_filter }))
+              }
+            />
 
             <div>
               <label className="flex items-center">
