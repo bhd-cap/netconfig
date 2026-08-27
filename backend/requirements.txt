@@ -15,6 +15,10 @@ psycopg2-binary==2.9.9
 # Network Automation
 netmiko==4.3.0
 paramiko==3.4.0
+# SNMP transport for discovery and inventory on devices without CLI access.
+# pysnmp 7 is asyncio-only; app/services/snmp_client.py drives it from
+# synchronous code.
+pysnmp>=7.1,<8
 
 # Task Queue
 celery==5.3.6

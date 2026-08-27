@@ -15,8 +15,13 @@ import {
   X,
   User,
   Settings,
+  Radar,
+  Network,
+  Boxes,
+  BarChart3,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { usePermissions } from '../../hooks/usePermissions';
 import { cn } from '../../lib/utils';
 
 interface NavItem {
@@ -24,6 +29,7 @@ interface NavItem {
   path: string;
   icon: React.ElementType;
   adminOnly?: boolean;
+  permission?: string;
 }
 
 const navigation: NavItem[] = [
@@ -32,17 +38,28 @@ const navigation: NavItem[] = [
   { name: 'Backups', path: '/backups', icon: Database },
   { name: 'Scheduled Jobs', path: '/jobs', icon: Calendar, adminOnly: true },
   { name: 'Compare', path: '/compare', icon: GitCompare },
+  { name: 'Discovery', path: '/discovery', icon: Radar, permission: 'discovery:read' },
+  { name: 'Topology', path: '/topology', icon: Network, permission: 'discovery:read' },
+  { name: 'Inventory', path: '/inventory', icon: Boxes, permission: 'inventory:read' },
+  { name: 'Reports', path: '/reports', icon: BarChart3, permission: 'reports:read' },
   { name: 'Settings', path: '/settings', icon: Settings },
 ];
 
 export const MainLayout: React.FC = () => {
   const { user, logout } = useAuth();
+  const { can, isLoading: permissionsLoading } = usePermissions();
   const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
-  const filteredNavigation = navigation.filter(
-    (item) => !item.adminOnly || user?.is_admin
-  );
+  const filteredNavigation = navigation.filter((item) => {
+    if (item.adminOnly && !user?.is_admin) return false;
+    // While the permission list is still in flight, fall back to the legacy
+    // admin flag rather than flashing an empty sidebar.
+    if (item.permission) {
+      return permissionsLoading ? Boolean(user?.is_admin) : can(item.permission);
+    }
+    return true;
+  });
 
   return (
     <div className="min-h-screen bg-gray-50">

@@ -1,0 +1,29 @@
+# Starter OUI set shipped with the application.
+#
+# This is deliberately small: it covers prefixes common enough to be worth
+# labelling out of the box, and nothing else. It is NOT the IEEE registry.
+#
+# For full coverage (over 30,000 prefixes), import the registry once:
+#
+#   POST /api/v1/inventory/oui/import        {"source": "ieee"}
+#   POST /api/v1/inventory/oui/import        {"source": "url", "url": "..."}
+#   POST /api/v1/inventory/oui/import        {"source": "file", "path": "..."}
+#
+# The file form also reads the formats already present on many Linux hosts:
+#   /usr/share/ieee-data/oui.txt        (ieee-data package)
+#   /usr/share/wireshark/manuf          (wireshark-common package)
+#   /usr/share/nmap/nmap-mac-prefixes   (nmap)
+#
+# Format here: <6 hex digits>,<vendor name>
+00000c,Cisco Systems
+000c29,VMware
+005056,VMware
+000569,VMware
+001c14,VMware
+001560,Hewlett Packard
+000d9d,Hewlett Packard
+00155d,Microsoft (Hyper-V)
+080027,Oracle VirtualBox
+b827eb,Raspberry Pi Foundation
+dca632,Raspberry Pi Trading
+e45f01,Raspberry Pi Trading

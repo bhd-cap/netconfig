@@ -17,7 +17,15 @@ import {
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import api from '../lib/api';
-import { Device, DeviceCreate, DeviceUpdate, PaginatedResponse, DEVICE_TYPES } from '../types';
+import {
+  Device,
+  DeviceCreate,
+  DeviceUpdate,
+  PaginatedResponse,
+  DEVICE_TYPES,
+  TRANSPORTS,
+  Transport,
+} from '../types';
 
 export const Devices: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
@@ -360,20 +368,36 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
     port: device?.port || 22,
     enable_secret: device?.enable_secret || '',
     is_active: device?.is_active ?? true,
+    transport: device?.transport || 'ssh',
+    snmp_version: device?.snmp_version || null,
+    snmp_port: device?.snmp_port || 161,
+    snmp_v3_user: device?.snmp_v3_user || '',
+    snmp_v3_auth_protocol: device?.snmp_v3_auth_protocol || 'SHA',
+    snmp_v3_priv_protocol: device?.snmp_v3_priv_protocol || 'AES',
+    // Write-only: the API never returns these, so blank means "keep".
+    snmp_community: '',
+    snmp_v3_auth_key: '',
+    snmp_v3_priv_key: '',
   });
 
   const saveMutation = useMutation({
     mutationFn: async () => {
+      // Secrets left blank must not be sent, or an edit would overwrite the
+      // stored value with an empty one.
+      const payload: Record<string, any> = { ...formData };
+      for (const secret of [
+        'password',
+        'snmp_community',
+        'snmp_v3_auth_key',
+        'snmp_v3_priv_key',
+      ]) {
+        if (!payload[secret]) delete payload[secret];
+      }
+
       if (device) {
-        // Update existing device
-        const updateData: DeviceUpdate = { ...formData };
-        if (!formData.password) {
-          delete (updateData as any).password; // Don't update password if not provided
-        }
-        await api.put(`/devices/${device.id}`, updateData);
+        await api.put(`/devices/${device.id}`, payload as DeviceUpdate);
       } else {
-        // Create new device
-        await api.post('/devices', formData);
+        await api.post('/devices', payload as DeviceCreate);
       }
     },
     onSuccess: () => {
@@ -459,7 +483,47 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">
-                  SSH Port
+                  Transport
+                </label>
+                <select
+                  name="transport"
+                  value={formData.transport}
+                  onChange={(e) => {
+                    const transport = e.target.value as Transport;
+                    setFormData((prev) => ({
+                      ...prev,
+                      transport,
+                      // Follow the conventional port for the transport unless
+                      // the user has already moved it somewhere else.
+                      port:
+                        transport === 'telnet' && prev.port === 22
+                          ? 23
+                          : transport === 'ssh' && prev.port === 23
+                          ? 22
+                          : prev.port,
+                      snmp_version:
+                        transport === 'snmp' ? prev.snmp_version || '2c' : prev.snmp_version,
+                    }));
+                  }}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  {Object.entries(TRANSPORTS).map(([key, label]) => (
+                    <option key={key} value={key}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+                {formData.transport === 'snmp' && (
+                  <p className="text-xs text-amber-700 mt-1">
+                    SNMP is read-only: this device can be discovered and
+                    inventoried, but not backed up.
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  {formData.transport === 'telnet' ? 'Telnet' : 'SSH'} Port
                 </label>
                 <input
                   type="number"
@@ -467,7 +531,7 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                   value={formData.port}
                   onChange={handleChange}
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="22"
+                  placeholder={formData.transport === 'telnet' ? '23' : '22'}
                 />
               </div>
 
@@ -513,6 +577,146 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                   className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                   placeholder="For Cisco devices requiring enable mode"
                 />
+              </div>
+
+              {/* SNMP is also useful alongside the CLI for discovery, so these
+                  are offered whenever a version is picked, not only when the
+                  transport itself is SNMP. */}
+              <div className="md:col-span-2 border-t pt-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      SNMP Version
+                    </label>
+                    <select
+                      name="snmp_version"
+                      value={formData.snmp_version ?? ''}
+                      onChange={(e) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          snmp_version: (e.target.value || null) as
+                            | '1'
+                            | '2c'
+                            | '3'
+                            | null,
+                        }))
+                      }
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Not configured</option>
+                      <option value="1">v1</option>
+                      <option value="2c">v2c</option>
+                      <option value="3">v3</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">
+                      SNMP Port
+                    </label>
+                    <input
+                      type="number"
+                      name="snmp_port"
+                      value={formData.snmp_port}
+                      onChange={handleChange}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="161"
+                    />
+                  </div>
+
+                  {(formData.snmp_version === '1' ||
+                    formData.snmp_version === '2c') && (
+                    <div className="md:col-span-2">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Community
+                      </label>
+                      <input
+                        type="password"
+                        name="snmp_community"
+                        value={formData.snmp_community}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder={device ? 'Leave blank to keep current' : 'public'}
+                      />
+                    </div>
+                  )}
+
+                  {formData.snmp_version === '3' && (
+                    <>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          v3 Username
+                        </label>
+                        <input
+                          type="text"
+                          name="snmp_v3_user"
+                          value={formData.snmp_v3_user ?? ''}
+                          onChange={handleChange}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Auth
+                          </label>
+                          <select
+                            name="snmp_v3_auth_protocol"
+                            value={formData.snmp_v3_auth_protocol ?? 'SHA'}
+                            onChange={handleChange}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                          >
+                            <option value="SHA">SHA</option>
+                            <option value="MD5">MD5</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">
+                            Privacy
+                          </label>
+                          <select
+                            name="snmp_v3_priv_protocol"
+                            value={formData.snmp_v3_priv_protocol ?? 'AES'}
+                            onChange={handleChange}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                          >
+                            <option value="AES">AES</option>
+                            <option value="DES">DES</option>
+                          </select>
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          Auth key
+                        </label>
+                        <input
+                          type="password"
+                          name="snmp_v3_auth_key"
+                          value={formData.snmp_v3_auth_key}
+                          onChange={handleChange}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                          placeholder={device ? 'Leave blank to keep current' : ''}
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          Privacy key
+                        </label>
+                        <input
+                          type="password"
+                          name="snmp_v3_priv_key"
+                          value={formData.snmp_v3_priv_key}
+                          onChange={handleChange}
+                          className="w-full px-3 py-2 border border-gray-300 rounded-lg"
+                          placeholder={device ? 'Leave blank to keep current' : ''}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
               </div>
 
               <div className="md:col-span-2">

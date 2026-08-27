@@ -40,6 +40,7 @@ class DeviceSnapshot:
     port: int
     enable_secret: Optional[str]
     ssh_key_path: Optional[str]
+    transport: str = "ssh"
 
     @classmethod
     def from_device(cls, device: Device) -> "DeviceSnapshot":
@@ -54,6 +55,7 @@ class DeviceSnapshot:
             port=device.port,
             enable_secret=device.enable_secret,
             ssh_key_path=device.ssh_key_path,
+            transport=device.transport or "ssh",
         )
 
 
@@ -102,6 +104,15 @@ class ConfigurationRetriever:
         Raises:
             DeviceConnectionError, DeviceCommandError, ValueError
         """
+        # SNMP is read-only: there is no OID that returns a running config, so
+        # say that plainly rather than failing later inside the transport.
+        if snapshot.transport == "snmp":
+            raise ValueError(
+                f"{snapshot.hostname} is configured for SNMP, which cannot "
+                f"retrieve a configuration. Set its transport to ssh or telnet "
+                f"to back it up."
+            )
+
         connector = DeviceConnector(
             hostname=snapshot.hostname,
             ip_address=snapshot.ip_address,
@@ -111,6 +122,7 @@ class ConfigurationRetriever:
             port=snapshot.port,
             enable_secret=snapshot.enable_secret,
             ssh_key_path=snapshot.ssh_key_path,
+            transport=snapshot.transport,
         )
 
         with connector:  # Uses context manager for auto-cleanup
@@ -509,6 +521,7 @@ class ConfigurationRetriever:
                     "success": device_result["success"],
                     "message": device_result["message"],
                     "duration": device_result["duration"],
+                    "configuration_id": device_result.get("configuration_id"),
                 }
             )
 

@@ -93,12 +93,35 @@ Content-Type: application/json
   "password": "password123",
   "port": 22,
   "enable_secret": "enable_pass",
+  "transport": "ssh",
   "tags": {
     "location": "datacenter-1",
     "role": "core"
   }
 }
 ```
+
+`transport` is `ssh` (default), `telnet` or `snmp`. SNMP is read-only: such a
+device can be discovered and inventoried but not backed up.
+
+SNMP parameters, when the device uses or also answers SNMP:
+
+```json
+{
+  "snmp_version": "2c",
+  "snmp_port": 161,
+  "snmp_community": "public",
+
+  "snmp_v3_user": "monitor",
+  "snmp_v3_auth_key": "…",
+  "snmp_v3_priv_key": "…",
+  "snmp_v3_auth_protocol": "SHA",
+  "snmp_v3_priv_protocol": "AES"
+}
+```
+
+The community and the v3 keys are write-only: they are encrypted on the way
+in, never returned, and left alone when an update omits them.
 
 ### Get Device
 ```http
@@ -251,7 +274,8 @@ Content-Type: application/json
   "schedule_cron": "0 2 * * *",
   "is_enabled": true,
   "device_filter": {
-    "tags.location": "datacenter-1"
+    "locations": ["datacenter-1"],
+    "tags": { "role": "core" }
   }
 }
 ```
@@ -263,6 +287,82 @@ Examples:
 - `0 */4 * * *` - Every 4 hours
 - `0 0 * * 0` - Weekly on Sunday at midnight
 - `0 0 1 * *` - Monthly on the 1st at midnight
+
+### Device Filter
+
+Which devices the job covers. Every criterion present is ANDed; a list within
+one criterion is ORed. Omit it, or send `{}` or `null`, to cover every device
+that can be backed up.
+
+```json
+{
+  "device_ids": [1, 2, 3],
+  "exclude_device_ids": [9],
+  "device_types": ["cisco_ios", "arista_eos"],
+  "locations": ["NYC", "LON"],
+  "hostname_pattern": "core-*",
+  "tags": { "role": "core", "env": "prod" },
+  "transports": ["ssh", "telnet"],
+  "include_inactive": false,
+  "include_snmp": false
+}
+```
+
+- `hostname_pattern` is a glob: `*` matches any run of characters, `?` exactly
+  one. A literal `%` or `_` in the pattern is matched literally.
+- `tags` requires every pair to be present on the device.
+- SNMP devices are excluded unless `transports` names `snmp` or
+  `include_snmp` is set — SNMP cannot retrieve a configuration, so including
+  one guarantees a failure on every run.
+- An unknown key is rejected with 400 rather than ignored.
+
+### Preview a Filter
+```http
+POST /backup-jobs/preview-filter
+Authorization: Bearer {token}
+
+{
+  "device_filter": { "locations": ["NYC"], "tags": { "role": "core" } },
+  "limit": 25
+}
+```
+
+**Response:**
+```json
+{
+  "total": 1,
+  "summary": "Devices where location in NYC; tagged role=core",
+  "truncated": false,
+  "devices": [
+    {
+      "id": 1,
+      "hostname": "core-nyc-01",
+      "ip_address": "10.0.0.1",
+      "device_type": "cisco_ios",
+      "location": "NYC",
+      "transport": "ssh",
+      "is_active": true
+    }
+  ]
+}
+```
+
+### Filter Options
+```http
+GET /backup-jobs/filter-options
+```
+
+The device types, locations and tag keys actually present in this
+organization, so an editor cannot offer a criterion that would match nothing.
+
+### A Job's Current Devices
+```http
+GET /backup-jobs/{id}/devices?limit=200
+```
+
+Same shape as the preview, plus `job_id` and `job_name`. Resolved live, so a
+device added or retagged after the job was saved is included without editing
+the job. Returns 409 if the stored filter no longer validates.
 
 ### List Jobs
 ```http
@@ -522,6 +622,330 @@ Authorization: Bearer {token}
 
 ---
 
+## Discovery and Topology
+
+### Start a Crawl
+```http
+POST /discovery/run
+Authorization: Bearer {token}
+Content-Type: application/json
+
+{
+  "seed_device_id": 1,
+  "max_hops": 2,
+  "auto_add": false,
+  "collect_inventory": true,
+  "run_async": true
+}
+```
+
+Walks outwards from the seed device, following LLDP and CDP neighbours.
+`auto_add` registers discovered neighbours as devices, inheriting the seed's
+credentials and transport. Queued to a worker unless `run_async` is false.
+
+**Response (queued):**
+```json
+{
+  "queued": true,
+  "task_id": "…",
+  "seed": "core-01",
+  "message": "Discovery started from core-01"
+}
+```
+
+### List Crawls
+```http
+GET /discovery/runs?limit=20
+GET /discovery/runs/{id}
+```
+
+### List Adjacencies
+```http
+GET /discovery/neighbors?device_id=1&protocol=lldp&active_only=true
+DELETE /discovery/neighbors/{id}
+```
+
+`protocol` is `lldp` or `cdp`. Adjacencies that stop being seen are marked
+inactive rather than deleted, so `active_only=false` shows links that have
+gone away and when they were last seen.
+
+### Topology Graph
+```http
+GET /discovery/topology?diagram_id=3&active_only=true&include_unmanaged=true
+```
+
+The graph is always rebuilt from the current adjacencies. Passing a
+`diagram_id` applies that diagram's saved edits on top, so a device
+discovered since it was saved still appears.
+
+**Response:**
+```json
+{
+  "nodes": [
+    {
+      "key": "device:1",
+      "id": 1,
+      "label": "core-01",
+      "type": "device",
+      "managed": true,
+      "link_count": 2,
+      "x": 120,
+      "y": 40
+    }
+  ],
+  "links": [
+    {
+      "key": "device:1|Te1/1/1::device:2|Et49",
+      "source": "device:1",
+      "target": "device:2",
+      "source_interface": "Te1/1/1",
+      "target_interface": "Et49",
+      "protocol": "lldp",
+      "confirmed_both_ends": true,
+      "manual": false
+    }
+  ],
+  "stats": { "nodes": 6, "managed_nodes": 5, "unmanaged_nodes": 1, "links": 5 }
+}
+```
+
+A cable both ends report is one link, not two.
+
+### Saved Diagrams
+```http
+GET    /discovery/diagrams
+POST   /discovery/diagrams
+GET    /discovery/diagrams/{id}
+PUT    /discovery/diagrams/{id}
+DELETE /discovery/diagrams/{id}
+```
+
+A diagram stores only the edits - node positions, renamed labels, hidden
+nodes, hand-drawn links:
+
+```json
+{
+  "name": "Ground floor",
+  "is_default": true,
+  "layout": {
+    "nodes": { "device:1": { "x": 120, "y": 40, "label": "Core" } },
+    "links": [
+      { "source": "device:1", "target": "device:2", "label": "dark fibre" }
+    ],
+    "hidden_links": []
+  }
+}
+```
+
+---
+
+## Host Inventory
+
+### List Hosts
+```http
+GET /inventory?device_id=3&vlan=10&vendor=cisco&search=aa:bb&active_only=true&seen_within_hours=24
+```
+
+Returns a paginated list of every host seen on a switch port, with its
+first-seen and last-seen times and the vendor resolved from its MAC.
+
+### Annotate a Host
+```http
+PATCH /inventory/{id}
+{ "hostname": "reception-printer", "notes": "rack 3" }
+```
+
+### Refresh from Devices
+```http
+POST /inventory/refresh
+{ "device_ids": [1, 2] }
+```
+
+Re-reads MAC tables and ARP without walking the topology. Omit `device_ids`
+to sweep every active device.
+
+### OUI Vendor Data
+```http
+GET  /inventory/oui/status
+POST /inventory/oui/import   { "source": "ieee" }
+POST /inventory/oui/backfill
+```
+
+`source` is `system` (an OUI database already on the host), `bundled` (the
+small starter set shipped with the app), `ieee`, `url` (with `url`) or `file`
+(with `path`). `backfill` re-resolves inventory rows that have no vendor, so
+existing rows benefit from a fresh import without waiting to be seen again.
+
+---
+
+## Reports
+
+```http
+GET /inventory/reports/summary
+GET /inventory/reports/by-vendor?limit=25
+GET /inventory/reports/by-port?device_id=3&min_hosts=5
+GET /inventory/reports/changes?days=7
+GET /inventory/reports/export        # text/csv
+```
+
+`by-port` flags a port carrying more than five MACs as `likely_uplink`.
+`changes` splits hosts that appeared from hosts that stopped being seen.
+
+---
+
+## Users and Roles
+
+### The Caller
+```http
+GET  /users/me                 # user, role and effective permissions
+POST /users/me/password        { "current_password": "…", "new_password": "…" }
+```
+
+### Users
+```http
+GET    /users?search=&role_id=&is_active=
+POST   /users
+GET    /users/{id}
+GET    /users/{id}/permissions
+PUT    /users/{id}
+POST   /users/{id}/activation      { "is_active": false }
+POST   /users/{id}/reset-password  { "must_change": true }
+DELETE /users/{id}
+```
+
+Creating a user without a `password`, or resetting one without a
+`new_password`, generates one and returns it in that response only:
+
+```json
+{
+  "user": { "id": 7, "username": "newbie", "must_change_password": true },
+  "generated_password": "Xk4!pQ2m…"
+}
+```
+
+The last active administrator cannot be demoted, deactivated or deleted.
+
+### Roles
+```http
+GET    /users/permissions      # the permission catalogue
+GET    /users/roles
+POST   /users/roles            { "name": "Operator", "permissions": ["devices:*"] }
+GET    /users/roles/{id}
+PUT    /users/roles/{id}
+DELETE /users/roles/{id}
+```
+
+Permissions are `resource:action` strings; `*` and `resource:*` wildcards are
+accepted. The built-in Administrator, Operator and Viewer roles can have their
+permissions changed but cannot be renamed or deleted.
+
+---
+
+## Application Settings
+
+```http
+GET /settings
+PUT /settings
+GET /settings/maintenance/status
+POST /settings/test-email      { "recipient": "ops@example.com" }
+```
+
+Every field on `PUT` is optional; only what is supplied is written. Values are
+validated before anything is stored, so a bad cron expression or a malformed
+window leaves the settings untouched.
+
+```json
+{
+  "retention_days": 30,
+  "retention_max_per_device": 10,
+  "clear_retention_max": false,
+  "retention_enabled": true,
+
+  "default_schedule_cron": "0 2 * * *",
+  "default_schedule_enabled": false,
+  "max_concurrent_backups": 10,
+
+  "smtp_host": "smtp.example.com",
+  "smtp_port": 587,
+  "smtp_username": "mailer",
+  "smtp_password": "…",
+  "clear_smtp_password": false,
+  "smtp_use_tls": true,
+  "smtp_from_address": "backups@example.com",
+  "notifications_enabled": true,
+  "notify_recipients": ["ops@example.com"],
+  "notify_on_backup_failure": true,
+  "notify_on_backup_success": false,
+  "notify_on_config_change": true,
+  "notify_on_new_host": false,
+
+  "maintenance_timezone": "Europe/London",
+  "maintenance_windows": [
+    {
+      "name": "Sunday night",
+      "days": [6],
+      "start": "22:00",
+      "end": "02:00",
+      "suppress_backups": true,
+      "suppress_notifications": true
+    }
+  ]
+}
+```
+
+`days` is Monday=0 to Sunday=6, and a window may wrap midnight - 22:00-02:00
+on Sunday runs into Monday morning. A scheduled job that comes due inside an
+open window is held, and its next run time still advanced so held runs cannot
+stack up.
+
+The SMTP password is write-only: a read returns `smtp_password_set` only.
+
+---
+
+## Remote Backup Targets
+
+```http
+GET    /settings/targets?enabled_only=true
+POST   /settings/targets
+GET    /settings/targets/{id}
+PUT    /settings/targets/{id}
+DELETE /settings/targets/{id}
+POST   /settings/targets/{id}/test
+POST   /settings/targets/{id}/upload
+```
+
+```json
+{
+  "name": "Archive",
+  "protocol": "sftp",
+  "host": "archive.example.com",
+  "port": 22,
+  "username": "backup",
+  "password": "…",
+  "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----…",
+  "remote_path": "/srv/configs",
+  "use_device_subdirectories": true,
+  "is_enabled": true,
+  "upload_on_backup": true
+}
+```
+
+`protocol` is `sftp`, `ftp` or `ftps`; a private key is SFTP only. With
+`upload_on_backup`, each configuration is copied as soon as it is stored - as
+a separate task, so an archive server being down never fails the backup.
+
+`/upload` sends the latest backup of every device, or the specific
+`configuration_ids` or `device_ids` given.
+
+`/test` connects and checks the remote directory is writable, returning the
+outcome rather than raising:
+
+```json
+{ "success": false, "message": "Connection refused" }
+```
+
+---
+
 ## Common Response Patterns
 
 ### Success Response
@@ -585,6 +1009,38 @@ All list endpoints support:
 
 ---
 
+## Permissions
+
+Endpoints are guarded by a `resource:action` permission rather than an admin
+flag. A 403 names the permission that was missing.
+
+| Resource | Actions |
+|---|---|
+| `devices` | `read`, `write`, `delete`, `test` |
+| `backups` | `read`, `trigger`, `delete` |
+| `jobs` | `read`, `write`, `delete` |
+| `discovery` | `read`, `run`, `write` |
+| `inventory` | `read`, `write` |
+| `reports` | `read` |
+| `users` | `read`, `write`, `delete`, `reset_password` |
+| `settings` | `read`, `write` |
+| `targets` | `read`, `write`, `delete` |
+| `audit` | `read` |
+
+`GET /users/permissions` returns the catalogue with descriptions, and
+`GET /users/me` returns what the caller actually holds.
+
+---
+
+## Transports
+
+Supported values for `transport`:
+- `ssh` (default)
+- `telnet`
+- `snmp` - read-only, so discovery and inventory only, never a backup
+
+---
+
 ## Device Types
 
 Supported values for `device_type`:
@@ -613,5 +1069,5 @@ Supported values for `device_type`:
 
 ---
 
-**Version:** 1.0.0
-**Last Updated:** 2025-01-31
+**Version:** 1.1.0
+**Last Updated:** 2026-08-27

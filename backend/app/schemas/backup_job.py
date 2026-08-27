@@ -7,13 +7,26 @@ from pydantic import BaseModel, Field, field_validator
 from croniter import croniter
 
 
+DEVICE_FILTER_DESCRIPTION = """\
+Which devices the job backs up. Every criterion present is ANDed; a list \
+within one criterion is ORed. Omit or send {} to cover every device that can \
+be backed up.
+
+Keys: device_ids, exclude_device_ids, device_types, locations, \
+hostname_pattern (glob, e.g. 'core-*'), tags (all pairs must match), \
+transports, include_inactive, include_snmp.
+
+SNMP devices are excluded by default, because SNMP cannot retrieve a \
+configuration and including one guarantees a failure on every run.\
+"""
+
+
 class BackupJobBase(BaseModel):
     """Base backup job schema"""
     name: str = Field(..., min_length=1, max_length=100, description="Job name")
     schedule_cron: str = Field(..., description="Cron expression (e.g., '0 2 * * *')")
     device_filter: Dict[str, Any] | None = Field(
-        default=None,
-        description="Filter criteria for selecting devices (e.g., {'tags.location': 'NYC'})"
+        default=None, description=DEVICE_FILTER_DESCRIPTION
     )
 
     @field_validator("schedule_cron")
@@ -35,7 +48,9 @@ class BackupJobUpdate(BaseModel):
     """Schema for updating a backup job"""
     name: str | None = Field(None, min_length=1, max_length=100)
     schedule_cron: str | None = None
-    device_filter: Dict[str, Any] | None = None
+    device_filter: Dict[str, Any] | None = Field(
+        None, description=DEVICE_FILTER_DESCRIPTION
+    )
     is_enabled: bool | None = None
 
     @field_validator("schedule_cron")

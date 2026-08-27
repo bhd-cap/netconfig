@@ -20,11 +20,26 @@ class User(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
     is_superuser = Column(Boolean, default=False, nullable=False)  # Can manage all orgs
+
+    # Permissions come from the role when one is assigned. The booleans above
+    # are kept so existing accounts and any code reading them keep working,
+    # and are derived from the role whenever it changes.
+    role_id = Column(Integer, ForeignKey("roles.id", ondelete="SET NULL"), nullable=True)
+
+    full_name = Column(String(255), nullable=True)
+    # Set when an administrator resets a password, so the UI can require a
+    # change at next login.
+    must_change_password = Column(
+        Boolean, default=False, nullable=False, server_default="false"
+    )
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+    deactivated_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     # Relationships
     organization = relationship("Organization", back_populates="users")
+    role = relationship("Role", back_populates="users")
     created_devices = relationship("Device", back_populates="created_by_user", foreign_keys="Device.created_by")
     audit_logs = relationship("AuditLog", back_populates="user")
 

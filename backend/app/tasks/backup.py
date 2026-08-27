@@ -10,8 +10,32 @@ from app.core.database import SessionLocal
 from app.services.config_retriever import ConfigurationRetriever
 from app.repositories.backup_job import BackupJobRepository
 from app.repositories.device import DeviceRepository
+from app.tasks.remote_backup import queue_export
 
 logger = logging.getLogger(__name__)
+
+
+def _export_new_configurations(db, organization_id, result):
+    """
+    Hand freshly written configurations to the remote-export task
+
+    Split out so every backup entry point copies to the configured SFTP/FTP
+    archives the same way. Failures here are logged and swallowed: the backup
+    itself already succeeded.
+    """
+    if not organization_id:
+        return
+
+    if "devices" in result:
+        ids = [
+            entry.get("configuration_id")
+            for entry in result.get("devices", [])
+            if entry.get("configuration_id")
+        ]
+    else:
+        ids = [result["configuration_id"]] if result.get("configuration_id") else []
+
+    queue_export(organization_id, ids)
 
 
 @celery_app.task(bind=True, name="app.tasks.backup.backup_device_task", max_retries=3)
@@ -40,6 +64,12 @@ def backup_device_task(self, device_id: int, user_id: int = None):
             if "connection" in result["message"].lower() or "timeout" in result["message"].lower():
                 logger.info(f"Retrying backup for device {device_id} (attempt {self.request.retries + 1}/3)")
                 raise self.retry(exc=Exception(result["message"]), countdown=60)
+
+        elif result.get("configuration_id"):
+            device = DeviceRepository(db).get(device_id)
+            _export_new_configurations(
+                db, device.organization_id if device else None, result
+            )
 
         return result
 
@@ -79,6 +109,11 @@ def bulk_backup_task(device_ids: list, user_id: int = None):
             f"Bulk backup completed: {result['successful']}/{result['total']} successful"
         )
 
+        first = DeviceRepository(db).get(device_ids[0]) if device_ids else None
+        _export_new_configurations(
+            db, first.organization_id if first else None, result
+        )
+
         return result
 
     except Exception as e:
@@ -110,7 +145,6 @@ def scheduled_backup_task(job_id: int):
     db = SessionLocal()
     try:
         job_repo = BackupJobRepository(db)
-        device_repo = DeviceRepository(db)
         retriever = ConfigurationRetriever(db)
 
         # Get the job
@@ -129,19 +163,90 @@ def scheduled_backup_task(job_id: int):
                 "message": "Job is disabled",
             }
 
-        # Get devices to backup based on job filter.
-        #
-        # Complex per-job filtering is still unimplemented (both branches were
-        # already identical), but only IDs are needed here, so this no longer
-        # loads every device row - credentials and all - to read an id off each.
-        device_ids = device_repo.get_active_ids_by_organization(job.organization_id)
+        # A maintenance window means "leave the network alone", so a job that
+        # comes due inside one is held rather than run. The next run time is
+        # still advanced, otherwise the job would fire the moment the window
+        # closes and every held run would stack up.
+        from app.services import app_settings
 
-        if not device_ids:
-            logger.warning(f"No devices found for job {job_id}")
+        org_settings = app_settings.get_or_create(db, job.organization_id)
+        suppressed, window_name = app_settings.backups_suppressed(org_settings)
+
+        if suppressed:
+            logger.info(
+                f"Backup job {job_id} held by maintenance window '{window_name}'"
+            )
+
+            current_time = datetime.utcnow()
+            try:
+                next_run = croniter(job.schedule_cron, current_time).get_next(datetime)
+            except Exception:
+                next_run = None
+
+            job_repo.update_last_run(job_id, current_time, next_run)
+
             return {
                 "success": True,
-                "message": "No devices to backup",
+                "job_id": job_id,
+                "skipped": True,
+                "message": f"Held by maintenance window '{window_name}'",
                 "devices_backed_up": 0,
+                "next_run": next_run.isoformat() if next_run else None,
+            }
+
+        # Which devices this job covers. An empty filter means every device
+        # that can be backed up, so a job created before filtering existed
+        # behaves exactly as it always did. Only IDs are selected, so the
+        # encrypted credentials on every candidate are not materialised just
+        # to pick a set.
+        from app.services import device_filter as device_filter_service
+
+        try:
+            device_ids = device_filter_service.resolve(
+                db, job.organization_id, job.device_filter
+            )
+        except device_filter_service.FilterError as e:
+            # A stored filter that no longer validates - a device type removed
+            # from the catalogue, say. Backing up everything instead would
+            # silently widen the job, so fail loudly and leave it to be fixed.
+            logger.error(f"Backup job {job_id} has an invalid device filter: {e}")
+
+            current_time = datetime.utcnow()
+            try:
+                next_run = croniter(job.schedule_cron, current_time).get_next(datetime)
+            except Exception:
+                next_run = None
+            job_repo.update_last_run(job_id, current_time, next_run)
+
+            return {
+                "success": False,
+                "job_id": job_id,
+                "error": f"Invalid device filter: {e}",
+            }
+
+        if not device_ids:
+            # A filter that matches nothing today may match something
+            # tomorrow, so the job stays enabled - but its next run has to be
+            # advanced, or it comes due again on the very next check and
+            # re-fires every minute.
+            logger.warning(
+                f"Job {job_id} matched no devices "
+                f"({device_filter_service.describe(job.device_filter)})"
+            )
+
+            current_time = datetime.utcnow()
+            try:
+                next_run = croniter(job.schedule_cron, current_time).get_next(datetime)
+            except Exception:
+                next_run = None
+            job_repo.update_last_run(job_id, current_time, next_run)
+
+            return {
+                "success": True,
+                "job_id": job_id,
+                "message": "No devices matched this job's filter",
+                "devices_backed_up": 0,
+                "next_run": next_run.isoformat() if next_run else None,
             }
 
         logger.info(f"Job {job_id}: backing up {len(device_ids)} devices")
@@ -158,6 +263,37 @@ def scheduled_backup_task(job_id: int):
             next_run = None
 
         job_repo.update_last_run(job_id, current_time, next_run)
+
+        _export_new_configurations(db, job.organization_id, result)
+
+        if result["failed"]:
+            failed = [
+                entry["hostname"] or f"device {entry['device_id']}"
+                for entry in result["devices"]
+                if not entry["success"]
+            ]
+            app_settings.notify(
+                db,
+                job.organization_id,
+                "backup_failure",
+                subject=f"NetConfig Backup: {result['failed']} device(s) failed",
+                body=(
+                    f"Scheduled job '{job.name}' backed up "
+                    f"{result['successful']} of {result['total']} devices.\n\n"
+                    "Failed:\n" + "\n".join(f"  - {name}" for name in failed[:50])
+                ),
+            )
+        elif result["successful"]:
+            app_settings.notify(
+                db,
+                job.organization_id,
+                "backup_success",
+                subject=f"NetConfig Backup: job '{job.name}' completed",
+                body=(
+                    f"Scheduled job '{job.name}' backed up all "
+                    f"{result['successful']} device(s) successfully."
+                ),
+            )
 
         logger.info(
             f"Scheduled job {job_id} completed: "
