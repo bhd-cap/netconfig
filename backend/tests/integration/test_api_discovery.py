@@ -685,6 +685,105 @@ def test_inventory_lists_hosts_with_their_switch(client, db, org, operator, swit
     assert entry["ip_address"] == "10.0.5.20"
 
 
+def test_inventory_sorts_on_a_catalogued_column(client, db, org, operator, switches):
+    add_host(db, org, switches[0], "cc:cc:cc:00:00:03", vendor="Zenith", vlan=30,
+             interface="Gi1/0/3")
+    add_host(db, org, switches[0], "aa:aa:aa:00:00:01", vendor="Acme", vlan=10,
+             interface="Gi1/0/1")
+    add_host(db, org, switches[1], "bb:bb:bb:00:00:02", vendor="Globex", vlan=20,
+             interface="Gi1/0/2")
+
+    session = as_user(client, operator)
+
+    def macs(**params):
+        params.setdefault("limit", 50)
+        return [
+            item["mac_address"]
+            for item in session.get("/api/v1/inventory", params=params).json()["items"]
+        ]
+
+    assert macs(sort_by="vendor", sort_dir="asc") == [
+        "aa:aa:aa:00:00:01",
+        "bb:bb:bb:00:00:02",
+        "cc:cc:cc:00:00:03",
+    ]
+    assert macs(sort_by="vendor", sort_dir="desc") == [
+        "cc:cc:cc:00:00:03",
+        "bb:bb:bb:00:00:02",
+        "aa:aa:aa:00:00:01",
+    ]
+    assert macs(sort_by="vlan", sort_dir="asc")[0] == "aa:aa:aa:00:00:01"
+    assert macs(sort_by="vlan", sort_dir="desc")[0] == "cc:cc:cc:00:00:03"
+
+
+def test_inventory_sorts_on_the_joined_switch_name(client, db, org, operator, switches):
+    """
+    'switch' is not a column on the table
+
+    It is the joined device hostname, falling back to the name recorded on the
+    row so a host whose switch has been deleted still sorts somewhere sensible
+    instead of to one end.
+    """
+    add_host(db, org, switches[1], "bb:bb:bb:00:00:02")
+    add_host(db, org, switches[0], "aa:aa:aa:00:00:01")
+
+    # Read the names from the fixture rather than assuming them, so the test
+    # says something about the ordering and nothing about the fixture.
+    expected = sorted([switches[0].hostname, switches[1].hostname])
+
+    session = as_user(client, operator)
+
+    def switch_names(direction):
+        return [
+            item["device_hostname"]
+            for item in session.get(
+                "/api/v1/inventory",
+                params={"sort_by": "switch", "sort_dir": direction, "limit": 50},
+            ).json()["items"]
+        ]
+
+    assert switch_names("asc") == expected
+    assert switch_names("desc") == expected[::-1]
+
+
+def test_inventory_reversing_a_tied_column_reverses_the_page(
+    client, db, org, operator, switches
+):
+    """
+    The same defect the device list had
+
+    Inventory ties constantly - a whole VLAN of hosts on one switch - so a
+    fixed tiebreak would return an identical order both ways and the header
+    would look dead.
+    """
+    for suffix in ("01", "02", "03"):
+        add_host(db, org, switches[0], f"aa:aa:aa:00:00:{suffix}", vlan=10,
+                 interface="Gi1/0/9")
+
+    session = as_user(client, operator)
+
+    def macs(direction):
+        return [
+            item["mac_address"]
+            for item in session.get(
+                "/api/v1/inventory",
+                params={"sort_by": "vlan", "sort_dir": direction, "limit": 50},
+            ).json()["items"]
+        ]
+
+    assert macs("asc") == macs("desc")[::-1]
+
+
+def test_inventory_refuses_an_uncatalogued_sort_column(client, operator):
+    """A column name from a query string must never reach the SQL"""
+    response = as_user(client, operator).get(
+        "/api/v1/inventory", params={"sort_by": "organization_id"}
+    )
+
+    assert response.status_code == 400
+    assert "organization_id" in response.json()["detail"]
+
+
 def test_inventory_filters(client, db, org, operator, switches):
     add_host(db, org, switches[0], "aa:aa:aa:00:00:01", vendor="Acme", vlan=10,
              interface="Gi1/0/1", ip_address="10.0.5.1")

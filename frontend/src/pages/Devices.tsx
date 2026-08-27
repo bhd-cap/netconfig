@@ -18,9 +18,7 @@ import {
   Activity,
   CheckCircle,
   XCircle,
-  ArrowUp,
-  ArrowDown,
-  ArrowUpDown,
+  Radar,
   Search,
   ShieldCheck,
   ShieldX,
@@ -32,18 +30,27 @@ import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
 import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
 import {
+  PageSizeSelect,
+  SortDir,
+  SortHeader,
+  SortableColumn,
+  nextSort,
+  pageWindow,
+  usePageSize,
+} from '../components/table/TableControls';
+import {
   AuthStatus,
   BulkDeviceUpdate,
+  Credential,
   Device,
   DeviceCreate,
   DeviceUpdate,
   PaginatedResponse,
+  RediscoverOutcome,
   DEVICE_TYPES,
   TRANSPORTS,
   Transport,
 } from '../types';
-
-type SortDir = 'asc' | 'desc';
 
 /**
  * The columns with a header the user can click
@@ -51,7 +58,7 @@ type SortDir = 'asc' | 'desc';
  * Every key here is in the API's own SORTABLE_COLUMNS catalogue; sorting on
  * anything else is refused with a 400 rather than silently ignored.
  */
-const SORTABLE: Array<{ key: string; label: string }> = [
+const SORTABLE: SortableColumn[] = [
   { key: 'hostname', label: 'Device' },
   { key: 'ip_address', label: 'IP Address' },
   { key: 'device_type', label: 'Type' },
@@ -109,7 +116,7 @@ export const Devices: React.FC = () => {
   const [sortBy, setSortBy] = useState('hostname');
   const [sortDir, setSortDir] = useState<SortDir>('asc');
   const [page, setPage] = useState(1);
-  const [limit] = useState(20);
+  const [limit, setLimit] = usePageSize('devices-page-size', 20);
   const queryClient = useQueryClient();
   const { can } = usePermissions();
   const canWrite = can('devices:write');
@@ -162,13 +169,16 @@ export const Devices: React.FC = () => {
   };
 
   const sort = (key: string) => {
-    if (key === sortBy) {
-      setSortDir((dir) => (dir === 'asc' ? 'desc' : 'asc'));
-    } else {
-      setSortBy(key);
-      setSortDir('asc');
-    }
+    const [nextBy, nextDir] = nextSort(key, sortBy, sortDir);
+    setSortBy(nextBy);
+    setSortDir(nextDir);
     setPage(1);
+  };
+
+  const changePageSize = (size: number) => {
+    setLimit(size);
+    setPage(1);
+    clearSelection();
   };
 
   // Delete device mutation
@@ -215,6 +225,56 @@ export const Devices: React.FC = () => {
     },
     onError: (error: any) => {
       toast.error(error.response?.data?.detail || 'Failed to remove devices');
+    },
+  });
+
+  // Re-probe one device: SSH, telnet and SNMP, every vault credential, and
+  // the platform worked out from whatever answered. Inline, because the answer
+  // is the point.
+  const rediscoverMutation = useMutation({
+    mutationFn: async (deviceId: number) => {
+      const response = await api.post<RediscoverOutcome>(
+        `/devices/${deviceId}/rediscover`
+      );
+      return response.data;
+    },
+    onSuccess: (outcome) => {
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
+      queryClient.invalidateQueries({ queryKey: ['device-detail'] });
+
+      const moved = Object.keys(outcome.changes ?? {});
+      toast.success(
+        moved.length
+          ? `${outcome.hostname}: ${outcome.message} (${moved.join(', ')} updated)`
+          : `${outcome.hostname}: ${outcome.message}`,
+        { duration: 8000 }
+      );
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Re-probe failed');
+    },
+  });
+
+  // The same for a selection, queued: a probe walks every credential over SSH
+  // and then telnet, so a page of devices outlasts any HTTP request.
+  const bulkRediscoverMutation = useMutation({
+    mutationFn: async (deviceIds: number[]) => {
+      const response = await api.post('/devices/rediscover', {
+        device_ids: deviceIds,
+      });
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data.message || 'Re-probe queued', { duration: 6000 });
+      clearSelection();
+      // Results arrive as devices answer, so refresh shortly after.
+      setTimeout(
+        () => queryClient.invalidateQueries({ queryKey: ['devices'] }),
+        4000
+      );
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Failed to queue the re-probe');
     },
   });
 
@@ -311,28 +371,6 @@ export const Devices: React.FC = () => {
     );
   };
 
-  const SortHeader: React.FC<{ column: { key: string; label: string } }> = ({ column }) => {
-    const active = sortBy === column.key;
-    const Icon = !active ? ArrowUpDown : sortDir === 'asc' ? ArrowUp : ArrowDown;
-
-    return (
-      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-        <button
-          type="button"
-          onClick={() => sort(column.key)}
-          data-testid={`sort-${column.key}`}
-          aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
-          className={`inline-flex items-center gap-1 hover:text-gray-900 transition ${
-            active ? 'text-gray-900' : ''
-          }`}
-          title={`Sort by ${column.label}`}
-        >
-          {column.label}
-          <Icon className={`h-3 w-3 ${active ? 'text-blue-600' : 'text-gray-400'}`} />
-        </button>
-      </th>
-    );
-  };
 
   return (
     <div className="space-y-6">
@@ -351,19 +389,22 @@ export const Devices: React.FC = () => {
         </button>
       </div>
 
-      {/* Search */}
-      <div className="relative max-w-md">
-        <Search className="h-4 w-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-        <input
-          type="search"
-          value={search}
-          onChange={(e) => {
-            setSearch(e.target.value);
-            setPage(1);
-          }}
-          placeholder="Search hostname or IP"
-          className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-        />
+      {/* Search and page size */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="relative w-full max-w-md">
+          <Search className="h-4 w-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => {
+              setSearch(e.target.value);
+              setPage(1);
+            }}
+            placeholder="Search hostname or IP"
+            className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+          />
+        </div>
+        <PageSizeSelect value={limit} onChange={changePageSize} noun="devices" />
       </div>
 
       {/* Bulk action bar */}
@@ -402,6 +443,21 @@ export const Devices: React.FC = () => {
                 Remove from backup list
               </button>
             </>
+          )}
+
+          {canWrite && (
+            <button
+              onClick={() =>
+                bulkRediscoverMutation.mutate(selectedOnPage.map((d) => d.id))
+              }
+              disabled={bulkRediscoverMutation.isPending}
+              data-testid="bulk-rediscover"
+              className="inline-flex items-center px-3 py-1.5 bg-white border border-blue-300 text-blue-700 rounded text-sm hover:bg-blue-100 disabled:opacity-50"
+              title="Re-probe SSH, telnet and SNMP, and correct the platform"
+            >
+              <Radar className="h-4 w-4 mr-1.5" />
+              Rediscover
+            </button>
           )}
 
           {canDelete && (
@@ -448,7 +504,13 @@ export const Devices: React.FC = () => {
                     />
                   </th>
                   {SORTABLE.map((column) => (
-                    <SortHeader key={column.key} column={column} />
+                    <SortHeader
+                      key={column.key}
+                      column={column}
+                      sortBy={sortBy}
+                      sortDir={sortDir}
+                      onSort={sort}
+                    />
                   ))}
                   <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Actions
@@ -485,7 +547,12 @@ export const Devices: React.FC = () => {
                             {device.hostname}
                           </button>
                           <div className="text-sm text-gray-500">
-                            {device.model ? device.model : `User: ${device.username}`}
+                            {device.model ||
+                              (device.credential_name
+                                ? `Vault: ${device.credential_name}`
+                                : device.username
+                                ? `User: ${device.username}`
+                                : 'No login set')}
                           </div>
                         </div>
                       </div>
@@ -519,6 +586,24 @@ export const Devices: React.FC = () => {
                         >
                           <Activity className="h-5 w-5" />
                         </button>
+                        {canWrite && (
+                          <button
+                            onClick={() => rediscoverMutation.mutate(device.id)}
+                            disabled={rediscoverMutation.isPending}
+                            data-testid={`rediscover-${device.id}`}
+                            className="text-blue-600 hover:text-blue-900 disabled:opacity-40"
+                            title="Rediscover: re-probe SSH, telnet and SNMP, and correct the platform and backup eligibility"
+                          >
+                            <Radar
+                              className={`h-5 w-5 ${
+                                rediscoverMutation.isPending &&
+                                rediscoverMutation.variables === device.id
+                                  ? 'animate-pulse'
+                                  : ''
+                              }`}
+                            />
+                          </button>
+                        )}
                         <button
                           onClick={() => backupMutation.mutate([device.id])}
                           className="text-green-600 hover:text-green-900"
@@ -586,19 +671,28 @@ export const Devices: React.FC = () => {
                     >
                       Previous
                     </button>
-                    {Array.from({ length: devicesData.total_pages }, (_, i) => i + 1).map((p) => (
-                      <button
-                        key={p}
-                        onClick={() => setPage(p)}
-                        className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
-                          p === page
-                            ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
-                            : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'
-                        }`}
-                      >
-                        {p}
-                      </button>
-                    ))}
+                    {pageWindow(page, devicesData.total_pages).map((entry, index) =>
+                      entry === 'gap' ? (
+                        <span
+                          key={`gap-${index}`}
+                          className="relative inline-flex items-center px-3 py-2 border border-gray-300 bg-white text-sm text-gray-400"
+                        >
+                          &hellip;
+                        </span>
+                      ) : (
+                        <button
+                          key={entry}
+                          onClick={() => setPage(entry)}
+                          className={`relative inline-flex items-center px-4 py-2 border text-sm font-medium ${
+                            entry === page
+                              ? 'z-10 bg-blue-50 border-blue-500 text-blue-600'
+                              : 'bg-white border-gray-300 text-gray-500 hover:bg-gray-50'
+                          }`}
+                        >
+                          {entry}
+                        </button>
+                      )
+                    )}
                     <button
                       onClick={() => setPage(page + 1)}
                       disabled={page === devicesData.total_pages}
@@ -834,6 +928,72 @@ const BulkEditModal: React.FC<BulkEditModalProps> = ({
 };
 
 // Device Add/Edit Modal Component
+type CredentialSource = 'device' | 'vault';
+
+/**
+ * Choose between a vault credential and one typed in here
+ *
+ * Radio buttons rather than a checkbox: the two are alternatives, and which
+ * one is in force decides what the rest of the section asks for. A device that
+ * appeared to have both would raise the obvious question of which one wins.
+ */
+const SourceToggle: React.FC<{
+  legend: string;
+  value: CredentialSource;
+  onChange: (value: CredentialSource) => void;
+  testId: string;
+  vaultLabel: string;
+  deviceLabel: string;
+  vaultDisabled?: boolean;
+  vaultDisabledHint?: string;
+}> = ({
+  legend,
+  value,
+  onChange,
+  testId,
+  vaultLabel,
+  deviceLabel,
+  vaultDisabled,
+  vaultDisabledHint,
+}) => (
+  <fieldset data-testid={testId}>
+    <legend className="text-sm font-medium text-gray-700 mb-2">{legend}</legend>
+    <div className="flex flex-wrap gap-4 text-sm">
+      <label
+        className={`inline-flex items-center gap-2 ${
+          vaultDisabled ? 'text-gray-400' : 'cursor-pointer'
+        }`}
+        title={vaultDisabled ? vaultDisabledHint : undefined}
+      >
+        <input
+          type="radio"
+          name={testId}
+          checked={value === 'vault'}
+          disabled={vaultDisabled}
+          onChange={() => onChange('vault')}
+          data-testid={`${testId}-vault`}
+        />
+        {vaultLabel}
+      </label>
+      <label className="inline-flex items-center gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name={testId}
+          checked={value === 'device'}
+          onChange={() => onChange('device')}
+          data-testid={`${testId}-device`}
+        />
+        {deviceLabel}
+      </label>
+    </div>
+    {vaultDisabled && vaultDisabledHint && (
+      <p className="text-xs text-gray-500 mt-1">
+        {vaultDisabledHint} — add one under Settings → Credentials.
+      </p>
+    )}
+  </fieldset>
+);
+
 interface DeviceModalProps {
   device?: Device | null;
   onClose: () => void;
@@ -841,6 +1001,25 @@ interface DeviceModalProps {
 }
 
 const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess }) => {
+  // Where the login comes from. A device either holds its own or points at a
+  // vault entry, and the two are mutually exclusive: keeping a stale local
+  // password behind a vault reference is how a device carries on working with
+  // credentials nobody remembers setting.
+  const [cliSource, setCliSource] = useState<CredentialSource>(
+    device?.credential_id ? 'vault' : 'device'
+  );
+  const [snmpSource, setSnmpSource] = useState<CredentialSource>(
+    device?.snmp_credential_id ? 'vault' : 'device'
+  );
+
+  const { data: vault } = useQuery<Credential[]>({
+    queryKey: ['credentials', 'for-device-form'],
+    queryFn: async () => (await api.get('/credentials')).data,
+  });
+
+  const cliCredentials = (vault ?? []).filter((entry) => entry.kind === 'cli');
+  const snmpCredentials = (vault ?? []).filter((entry) => entry.kind === 'snmp');
+
   const [formData, setFormData] = useState<DeviceCreate>({
     hostname: device?.hostname || '',
     ip_address: device?.ip_address || '',
@@ -860,6 +1039,8 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
     snmp_community: '',
     snmp_v3_auth_key: '',
     snmp_v3_priv_key: '',
+    credential_id: device?.credential_id ?? null,
+    snmp_credential_id: device?.snmp_credential_id ?? null,
   });
 
   const saveMutation = useMutation({
@@ -874,6 +1055,24 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
         'snmp_v3_priv_key',
       ]) {
         if (!payload[secret]) delete payload[secret];
+      }
+
+      // One source per protocol. An explicit null clears a reference the
+      // device used to have; omitting the key would leave it in place.
+      if (cliSource === 'vault') {
+        delete payload.username;
+        delete payload.password;
+        delete payload.enable_secret;
+      } else {
+        payload.credential_id = null;
+      }
+
+      if (snmpSource === 'vault') {
+        delete payload.snmp_community;
+        delete payload.snmp_v3_auth_key;
+        delete payload.snmp_v3_priv_key;
+      } else {
+        payload.snmp_credential_id = null;
       }
 
       if (device) {
@@ -1017,55 +1216,150 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                 />
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Username *
-                </label>
-                <input
-                  type="text"
-                  name="username"
-                  required
-                  value={formData.username}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="admin"
+              <div className="md:col-span-2 border-t pt-4">
+                <SourceToggle
+                  legend="Login credentials"
+                  value={cliSource}
+                  onChange={setCliSource}
+                  testId="cli-source"
+                  vaultLabel="Use a credential from the vault"
+                  deviceLabel="Enter credentials for this device"
+                  vaultDisabled={!cliCredentials.length}
+                  vaultDisabledHint="No CLI credentials in the vault yet"
                 />
-              </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Password {device ? '' : '*'}
-                </label>
-                <input
-                  type="password"
-                  name="password"
-                  required={!device}
-                  value={formData.password}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder={device ? 'Leave blank to keep current' : '••••••••'}
-                />
-              </div>
+                {cliSource === 'vault' ? (
+                  <div className="mt-3">
+                    <select
+                      value={formData.credential_id ?? ''}
+                      onChange={(event) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          credential_id: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        }))
+                      }
+                      data-testid="cli-credential"
+                      required
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Choose a credential…</option>
+                      {cliCredentials.map((entry) => (
+                        <option key={entry.id} value={entry.id}>
+                          {entry.name}
+                          {entry.username ? ` — ${entry.username}` : ''}
+                          {entry.is_enabled ? '' : ' (disabled)'}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      The password is held once in the vault, so rotating it
+                      there covers every device using it. This device stores no
+                      login of its own.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Username *
+                      </label>
+                      <input
+                        type="text"
+                        name="username"
+                        required
+                        value={formData.username ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="admin"
+                      />
+                    </div>
 
-              <div className="md:col-span-2">
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Enable Secret (optional)
-                </label>
-                <input
-                  type="password"
-                  name="enable_secret"
-                  value={formData.enable_secret}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="For Cisco devices requiring enable mode"
-                />
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Password {device && !device.credential_id ? '' : '*'}
+                      </label>
+                      <input
+                        type="password"
+                        name="password"
+                        required={!device || !!device.credential_id}
+                        value={formData.password ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder={
+                          device && !device.credential_id
+                            ? 'Leave blank to keep current'
+                            : '••••••••'
+                        }
+                      />
+                    </div>
+
+                    <div className="md:col-span-2">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Enable Secret (optional)
+                      </label>
+                      <input
+                        type="password"
+                        name="enable_secret"
+                        value={formData.enable_secret ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="For Cisco devices requiring enable mode"
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* SNMP is also useful alongside the CLI for discovery, so these
                   are offered whenever a version is picked, not only when the
                   transport itself is SNMP. */}
               <div className="md:col-span-2 border-t pt-4">
+                <SourceToggle
+                  legend="SNMP credentials"
+                  value={snmpSource}
+                  onChange={setSnmpSource}
+                  testId="snmp-source"
+                  vaultLabel="Use a community from the vault"
+                  deviceLabel="Enter SNMP details for this device"
+                  vaultDisabled={!snmpCredentials.length}
+                  vaultDisabledHint="No SNMP credentials in the vault yet"
+                />
+
+                {snmpSource === 'vault' && (
+                  <div className="mt-3 mb-4">
+                    <select
+                      value={formData.snmp_credential_id ?? ''}
+                      onChange={(event) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          snmp_credential_id: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        }))
+                      }
+                      data-testid="snmp-credential"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Choose a community…</option>
+                      {snmpCredentials.map((entry) => (
+                        <option key={entry.id} value={entry.id}>
+                          {entry.name}
+                          {entry.snmp_version ? ` — v${entry.snmp_version}` : ''}
+                          {entry.is_enabled ? '' : ' (disabled)'}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      The version comes from the vault entry. The port below
+                      stays with the device.
+                    </p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {snmpSource === 'device' && (
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
                       SNMP Version
@@ -1091,6 +1385,7 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                       <option value="3">v3</option>
                     </select>
                   </div>
+                  )}
 
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -1106,8 +1401,9 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                     />
                   </div>
 
-                  {(formData.snmp_version === '1' ||
-                    formData.snmp_version === '2c') && (
+                  {snmpSource === 'device' &&
+                    (formData.snmp_version === '1' ||
+                      formData.snmp_version === '2c') && (
                     <div className="md:col-span-2">
                       <label className="block text-sm font-medium text-gray-700 mb-1">
                         Community
@@ -1123,7 +1419,7 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                     </div>
                   )}
 
-                  {formData.snmp_version === '3' && (
+                  {snmpSource === 'device' && formData.snmp_version === '3' && (
                     <>
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">

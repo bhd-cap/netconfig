@@ -166,16 +166,28 @@ class BaseRepository(Generic[ModelType]):
         """
         Update an existing record
 
+        Every field in obj_in is written, None included. Callers decide what
+        "leave this alone" means by leaving the key out - which is what
+        `exclude_unset=True` on a Pydantic model produces.
+
+        Skipping None here instead made it impossible to clear a column
+        through any endpoint, silently: sending `device_filter: null` to a
+        backup job, which its own endpoint documents as "clears it back to
+        every device", kept the old filter and quietly held the job's narrower
+        scope. Explicit nulls are the only way to unset a field over JSON, so
+        discarding them makes a documented API do nothing.
+
         Args:
             db_obj: Existing model instance
-            obj_in: Dictionary of field values to update
+            obj_in: Dictionary of field values to update; a None value clears
+                the field rather than being ignored
             commit: Commit immediately
 
         Returns:
             Updated model instance
         """
         for field, value in obj_in.items():
-            if value is not None and hasattr(db_obj, field):
+            if hasattr(db_obj, field):
                 setattr(db_obj, field, value)
 
         if commit:

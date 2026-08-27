@@ -27,13 +27,37 @@ import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
 import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
 import {
+  PageSizeSelect,
+  SortDir,
+  SortHeader,
+  SortableColumn,
+  nextSort,
+  usePageSize,
+} from '../components/table/TableControls';
+import {
   Device,
   HostInventoryEntry,
   OuiStatus,
   PaginatedResponse,
 } from '../types';
 
-const PAGE_SIZE = 50;
+/**
+ * The inventory columns, in the order the table renders them
+ *
+ * Every key is in the API's own HOST_SORTABLE_COLUMNS catalogue; anything else
+ * is refused with a 400 rather than quietly ignored.
+ */
+const SORTABLE: SortableColumn[] = [
+  { key: 'mac_address', label: 'MAC' },
+  { key: 'vendor', label: 'Vendor' },
+  { key: 'ip_address', label: 'Address' },
+  { key: 'discovered_hostname', label: 'Discovered name' },
+  { key: 'switch', label: 'Switch' },
+  { key: 'interface', label: 'Port' },
+  { key: 'vlan', label: 'VLAN' },
+  { key: 'first_seen', label: 'First seen' },
+  { key: 'last_seen', label: 'Last seen' },
+];
 
 function relative(value?: string | null): string {
   if (!value) return '—';
@@ -51,6 +75,9 @@ export const Inventory: React.FC = () => {
   const canImportOui = can('settings:write');
 
   const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = usePageSize('inventory-page-size', 50);
+  const [sortBy, setSortBy] = useState('last_seen');
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
   const [deviceId, setDeviceId] = useState<number | ''>('');
@@ -77,6 +104,9 @@ export const Inventory: React.FC = () => {
     queryKey: [
       'inventory',
       page,
+      pageSize,
+      sortBy,
+      sortDir,
       search,
       deviceId,
       vlan,
@@ -86,9 +116,11 @@ export const Inventory: React.FC = () => {
     ],
     queryFn: async () => {
       const params: Record<string, any> = {
-        skip: (page - 1) * PAGE_SIZE,
-        limit: PAGE_SIZE,
+        skip: (page - 1) * pageSize,
+        limit: pageSize,
         active_only: activeOnly,
+        sort_by: sortBy,
+        sort_dir: sortDir,
       };
       if (search) params.search = search;
       if (deviceId) params.device_id = deviceId;
@@ -99,6 +131,18 @@ export const Inventory: React.FC = () => {
       return (await api.get('/inventory', { params })).data;
     },
   });
+
+  const sort = (key: string) => {
+    const [nextBy, nextDir] = nextSort(key, sortBy, sortDir);
+    setSortBy(nextBy);
+    setSortDir(nextDir);
+    setPage(1);
+  };
+
+  const changePageSize = (size: number) => {
+    setPageSize(size);
+    setPage(1);
+  };
 
   const refreshMutation = useMutation({
     mutationFn: async () => (await api.post('/inventory/refresh', {})).data,
@@ -395,7 +439,7 @@ export const Inventory: React.FC = () => {
           </select>
         </div>
 
-        <div className="flex items-center gap-4 mt-3 text-sm">
+        <div className="flex flex-wrap items-center gap-4 mt-3 text-sm">
           <label className="flex items-center gap-2 cursor-pointer">
             <input
               type="checkbox"
@@ -407,6 +451,8 @@ export const Inventory: React.FC = () => {
             />
             Only hosts still being seen
           </label>
+
+          <PageSizeSelect value={pageSize} onChange={changePageSize} noun="hosts" />
 
           <span className="ml-auto text-gray-500">
             {data ? `${data.total.toLocaleString()} entries` : ''}
@@ -435,33 +481,15 @@ export const Inventory: React.FC = () => {
               <table className="min-w-full divide-y divide-gray-200 text-sm">
                 <thead className="bg-gray-50">
                   <tr>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      MAC
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Vendor
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Address
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Discovered name
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Switch
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Port
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      VLAN
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      First seen
-                    </th>
-                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
-                      Last seen
-                    </th>
+                    {SORTABLE.map((column) => (
+                      <SortHeader
+                        key={column.key}
+                        column={column}
+                        sortBy={sortBy}
+                        sortDir={sortDir}
+                        onSort={sort}
+                      />
+                    ))}
                     {canWrite && <th className="px-4 py-3" />}
                   </tr>
                 </thead>
@@ -552,10 +580,13 @@ export const Inventory: React.FC = () => {
               </table>
             </div>
 
-            <div className="px-4 py-3 border-t border-gray-200 flex items-center justify-between text-sm">
-              <span className="text-gray-600">
-                Page {data.page} of {data.total_pages}
-              </span>
+            <div className="px-4 py-3 border-t border-gray-200 flex flex-wrap items-center justify-between gap-3 text-sm">
+              <div className="flex flex-wrap items-center gap-4">
+                <span className="text-gray-600">
+                  Page {data.page} of {data.total_pages}
+                  <span className="text-gray-400"> · {data.total} hosts</span>
+                </span>
+              </div>
               <div className="flex gap-2">
                 <button
                   onClick={() => setPage((current) => Math.max(1, current - 1))}

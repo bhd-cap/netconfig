@@ -241,6 +241,13 @@ base sets `eager_defaults`. A `create()` is therefore one
 `INSERT ... RETURNING` - do not add a `refresh()` after it, and do not rely on
 attributes being reloaded from the database after a commit.
 
+**Clearing a field**: `BaseRepository.update()` writes every key it is given,
+None included, because an explicit null is the only way to unset a field over
+JSON. It used to skip Nones, which made every nullable column unsettable
+through every endpoint - `device_filter: null` on a backup job reported success
+and kept the old filter. Callers pass `exclude_unset=True` dicts, where an
+omitted key already means "leave alone".
+
 **Batched writes**: repository `create`/`create_many`/`update` and
 `audit_repo.log_action` all take `commit=False`. When a request or task writes
 several rows, pass `commit=False` and commit once at the end rather than
@@ -373,6 +380,40 @@ wrong community), and each transport's outcome is upserted into `device_probes`
 on `(device_id, transport)` so the detail view can say "SSH refused, telnet
 timed out, 4 credentials tried".
 
+**Rediscovery** (`app/services/rediscovery.py`) asks the same questions again
+for a device that already exists, because the first answer goes stale:
+credentials get rotated, SSH gets enabled on a switch that only spoke SNMP, a
+box is swapped behind the same address. It may change `transport`,
+`device_type`, `is_active`, `credential_id` and the discovered facts. It must
+never change anything a person entered - the hostname, the address, the
+location, the tags - and there is a test asserting exactly that.
+
+`POST /devices/{id}/rediscover` runs inline (one device, one answer);
+`POST /devices/rediscover` queues, because a probe walks every vault credential
+over SSH and then telnet.
+
+**Platform identification has six sources**, cheapest first, in
+`_identify_over_cli()`: the SSH server version string and pre-auth banner
+(free - they were exchanged during login, and "SSH-2.0-Cisco-1.25" settles it
+outright), a version command, the prompt, and finally each vendor's own
+configuration command until one answers. That last one is worth the round
+trips: a device whose configuration command works is a device that can be
+backed up, which is the question `backup_eligible` is asking. The MAC's OUI
+vendor is a seventh source, resolved from the inventory by rediscovery and
+passed in as `platform_hint` - a vendor name feeds `identify_platform()` the
+same way sysDescr does, but it only orders the collection probes, because a
+vendor sells more than one CLI.
+
+**SNMP reads the system group in one request.** `system_info()` used four
+separate GETs, and since every request builds a fresh event loop and
+`SnmpEngine`, ruling out a dead address cost four full timeouts - 41 seconds
+per community, which on a sparse subnet is most of a crawl's runtime. One PDU
+carries all four bindings. `get_many()` returns **None** for "nothing
+answered" and a dict for "answered", which `probe_snmp` needs to tell
+`unreachable` from `auth_failed`: reporting silence as an authentication
+failure sends an operator hunting for the right community on a host that is
+not listening.
+
 **OUI**: prefixes are stored as six lowercase hex characters.
 `import_entries()` normalises whatever it is given, because the IEEE registry
 writes them uppercase and a lookup normalises the MAC to lowercase. The bundled
@@ -444,6 +485,28 @@ thread would use the session from two threads at once.
 `vault.list_for_kind()` returns the enabled credentials for a kind; the seed
 device's own credentials are appended as a last resort so a crawl still works
 before anyone has filled the vault in.
+
+**A device can log in with a vault credential instead of holding its own.**
+`devices.credential_id` (CLI) and `devices.snmp_credential_id` are set either
+by discovery, recording what worked, or by a person editing the device. When
+one is set the device stores no login of its own - `username` and
+`encrypted_password` are nullable for exactly this - so the vault is the single
+place to rotate a password a hundred switches share.
+
+`credentials.resolve_for_device()` is what makes that real rather than
+cosmetic, and every path that opens a connection goes through it: both backup
+paths, the connectivity test, the discovery probe and rediscovery.
+`DeviceSnapshot.from_device()` takes the resolved login as a **required**
+argument so no call site can quietly use the row's own credentials while
+ignoring the vault entry it was told to use. Secrets stay encrypted throughout -
+the vault holds ciphertext under the same key - so a connector needs no telling
+where they came from.
+
+A credential of the wrong kind is refused on write and ignored on read: an SNMP
+community used as a login fails as an authentication error and looks like a
+typo'd password. Deleting a credential a device logs in with is refused with a
+409 naming the devices, since the foreign key would otherwise null the
+reference and leave them with nothing.
 
 ## Secrets
 
@@ -607,11 +670,12 @@ Things to know before changing it:
 **Complete**:
 - Backend API (98 endpoints)
 - Authentication, roles and per-permission authorization
-- Device management over SSH, telnet and SNMP, with column sorting, bulk edit
-  and delete, and a detail view of everything discovery learned
+- Device management over SSH, telnet and SNMP, with column sorting, a chosen
+  page size, bulk edit and delete, a detail view of everything discovery
+  learned, and rediscovery to re-probe transports, credentials and platform
 - Credential vault: an ordered list of CLI and SNMP credentials discovery
   tries, with per-credential success counts and a test-against-one-device
-  endpoint
+  endpoint; a device can draw its own login from it rather than storing one
 - Backup system (manual + scheduled, concurrent), held during maintenance
   windows, with per-job device filtering
 - Configuration comparison
@@ -625,7 +689,8 @@ Things to know before changing it:
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (407 tests) and browser smoke tests
+- Backend test suite (479 tests), installer update checks, and browser
+  smoke tests
 - One-line installer
 
 **Incomplete**:

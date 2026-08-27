@@ -407,3 +407,35 @@ def test_another_organizations_job_is_not_reachable(client, db, admin):
 
     response = as_user(client, admin).get(f"/api/v1/backup-jobs/{job.id}/devices")
     assert response.status_code == 403
+
+
+def test_clearing_a_device_filter_actually_clears_it(client, admin, org, db):
+    """
+    Sending null must widen the job back to every device
+
+    The endpoint documents this, and it silently did nothing: the repository
+    skipped None values, so the job kept its old filter while the API reported
+    success. A job that quietly holds a narrower scope than the operator
+    believes is the failure mode the filter validation exists to prevent.
+    """
+    created = as_user(client, admin).post(
+        "/api/v1/backup-jobs",
+        json={
+            "name": "clear-me",
+            "schedule_cron": "0 2 * * *",
+            "device_filter": {"locations": ["NYC"]},
+        },
+    )
+    assert created.status_code == 201, created.text
+    job_id = created.json()["id"]
+
+    updated = as_user(client, admin).put(
+        f"/api/v1/backup-jobs/{job_id}", json={"device_filter": None}
+    )
+
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["device_filter"] in (None, {})
+
+    db.expire_all()
+    stored = db.get(BackupJob, job_id)
+    assert stored.device_filter in (None, {})

@@ -745,12 +745,19 @@ class DiscoveryService:
         for device in devices:
             if not supports_discovery(device.device_type):
                 continue
+            # A device may log in with a vault credential rather than its
+            # own, and a crawl that ignored that would report every such
+            # device as unreachable.
+            login = vault.resolve_for_device(self.db, device)
+
             jobs.append(
                 (
-                    DeviceSnapshot.from_device(device),
+                    DeviceSnapshot.from_device(device, login),
                     device.device_type,
                     device.transport or "ssh",
-                    _snapshot_snmp(device) if device.transport == "snmp" else None,
+                    (login.snmp or _snapshot_snmp(device))
+                    if device.transport == "snmp"
+                    else None,
                 )
             )
 

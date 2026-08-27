@@ -337,3 +337,149 @@ def summarise(db: Session, organization_id: int) -> Dict[str, Any]:
         "disabled": sum(1 for _, enabled in rows if not enabled),
         "total": len(rows),
     }
+
+
+# --------------------------------------------------------------------------
+# What a device actually connects with
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class ResolvedLogin:
+    """
+    The credentials a device connects with, and where they came from
+
+    A device either holds its own username and password or points at a vault
+    entry. Everything that opens a connection has to go through this, or
+    choosing a vault credential in the UI would look like it worked and change
+    nothing about how the device is reached.
+
+    Every secret here is left encrypted, matching the form the device's own
+    columns are in - so a caller substitutes this for the device fields and
+    changes nothing else, and nothing is decrypted unless it is used.
+    """
+
+    username: Optional[str] = None
+    encrypted_password: Optional[str] = None
+    enable_secret: Optional[str] = None
+    ssh_key_path: Optional[str] = None
+
+    # Same keys and same encrypted form as device_connector.snmp_params().
+    snmp: Optional[Dict[str, Any]] = None
+
+    # For the UI and the audit trail: 'device', or the vault entry's name.
+    cli_source: str = "device"
+    snmp_source: str = "device"
+
+
+def resolve_for_device(db: Session, device) -> ResolvedLogin:
+    """
+    Work out which credentials a device logs in with
+
+    Args:
+        db: Database session
+        device: The Device row
+
+    Returns:
+        ResolvedLogin, falling back to the device's own fields whenever it
+        names no vault credential, or names one that has since been deleted.
+    """
+    resolved = ResolvedLogin(
+        username=device.username,
+        encrypted_password=device.encrypted_password,
+        enable_secret=device.enable_secret,
+        ssh_key_path=device.ssh_key_path,
+    )
+
+    cli = _vault_entry(db, device, getattr(device, "credential_id", None), CLI)
+    if cli:
+        resolved.username = cli.username
+        resolved.encrypted_password = cli.encrypted_password
+        resolved.enable_secret = cli.encrypted_enable_secret
+        # An SSH key on the device is kept when the vault entry has none: the
+        # key is a property of this host, the login is not.
+        resolved.ssh_key_path = cli.ssh_key_path or device.ssh_key_path
+        resolved.cli_source = cli.name
+
+    snmp = _vault_entry(db, device, getattr(device, "snmp_credential_id", None), SNMP)
+    if snmp:
+        # The port stays the device's: which community to use and which port it
+        # answers on are separate facts.
+        resolved.snmp = {
+            "version": snmp.snmp_version,
+            "community": snmp.encrypted_community,
+            "port": device.snmp_port,
+            "v3_user": snmp.snmp_v3_user,
+            "v3_auth_key": snmp.encrypted_v3_auth_key,
+            "v3_priv_key": snmp.encrypted_v3_priv_key,
+            "v3_auth_protocol": snmp.snmp_v3_auth_protocol,
+            "v3_priv_protocol": snmp.snmp_v3_priv_protocol,
+        }
+        resolved.snmp_source = snmp.name
+
+    return resolved
+
+
+def _vault_entry(db: Session, device, credential_id: Optional[int], kind: str):
+    """
+    Load a device's vault credential, or None
+
+    A credential of the wrong kind is ignored rather than used: an SNMP
+    community is not a login, and silently trying it as one would produce an
+    authentication failure that looks like a wrong password.
+    """
+    if not credential_id:
+        return None
+
+    credential = db.scalars(
+        select(Credential).where(
+            Credential.id == credential_id,
+            Credential.organization_id == device.organization_id,
+        )
+    ).first()
+
+    if not credential:
+        logger.warning(
+            f"Device {device.hostname} points at credential {credential_id}, "
+            f"which no longer exists; using the device's own credentials"
+        )
+        return None
+
+    if credential.kind != kind:
+        logger.warning(
+            f"Device {device.hostname} points at credential "
+            f"'{credential.name}' as its {kind} credential, but it is a "
+            f"{credential.kind} entry; ignoring it"
+        )
+        return None
+
+    return credential
+
+
+def devices_using(db: Session, credential_id: int) -> List[str]:
+    """
+    The hostnames of devices that depend on a credential
+
+    Deleting a credential a device logs in with would break that device's
+    backups at the next run, with nothing on screen to explain why, so the
+    endpoints check this first.
+
+    Args:
+        db: Database session
+        credential_id: The credential about to be deleted or disabled
+
+    Returns:
+        Hostnames, alphabetically
+    """
+    from app.models.device import Device
+
+    return list(
+        db.scalars(
+            select(Device.hostname)
+            .where(
+                (Device.credential_id == credential_id)
+                | (Device.snmp_credential_id == credential_id)
+            )
+            .order_by(Device.hostname)
+        ).all()
+    )

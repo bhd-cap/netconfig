@@ -304,21 +304,75 @@ def test_snmp_with_no_credentials_reports_that():
     assert "No SNMP credentials" in outcome.message
 
 
-def test_snmp_reports_when_every_community_is_refused():
+def test_snmp_that_never_answers_is_unreachable_not_refused():
+    """
+    Two different facts about a device, and only one is about credentials
+
+    Nothing answering means the address is dead or filtered; reporting that as
+    an authentication failure sends an operator hunting for the right community
+    on a host that is not listening. Both communities still get tried, because
+    for v1 and v2c a wrong community and silence look identical from here.
+    """
+
+    class SilentClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def system_info(self):
+            return None
+
+    with mock.patch("app.services.snmp_client.SnmpClient", SilentClient):
+        outcome = probe.probe_snmp("10.0.0.1", [snmp_cred("a"), snmp_cred("b")])
+
+    assert outcome.result == probe.UNREACHABLE
+    assert outcome.attempts == 2
+    assert "No response" in outcome.message
+
+
+def test_snmp_that_raises_is_also_unreachable():
+    """A transport error is not the community's fault either"""
     from app.services.snmp_client import SnmpError
 
-    class FakeClient:
+    class FailingClient:
         def __init__(self, **kwargs):
             pass
 
         def system_info(self):
             raise SnmpError("timeout")
 
-    with mock.patch("app.services.snmp_client.SnmpClient", FakeClient):
+    with mock.patch("app.services.snmp_client.SnmpClient", FailingClient):
         outcome = probe.probe_snmp("10.0.0.1", [snmp_cred("a"), snmp_cred("b")])
 
-    assert outcome.result == probe.AUTH_FAILED
+    assert outcome.result == probe.UNREACHABLE
     assert outcome.attempts == 2
+
+
+def test_an_agent_that_answers_with_nothing_useful_is_a_failed_attempt():
+    """
+    It is there, and it told us nothing
+
+    Worth distinguishing: the host exists, so another community or a look at
+    the agent's view-based access control is a sensible next step.
+    """
+
+    class BareClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def system_info(self):
+            return {
+                "sysName": None,
+                "sysDescr": None,
+                "sysLocation": None,
+                "sysContact": None,
+            }
+
+    with mock.patch("app.services.snmp_client.SnmpClient", BareClient):
+        outcome = probe.probe_snmp("10.0.0.1", [snmp_cred("a")])
+
+    assert outcome.result == probe.AUTH_FAILED
+    assert "no system information" in outcome.message
+    assert outcome.attempts == 1
 
 
 # --------------------------------------------------------------------------
@@ -444,3 +498,251 @@ def test_a_neighbour_hint_is_used_when_nothing_else_identifies():
 
     assert assessment.device_type == "juniper_junos"
     assert assessment.backup_eligible is False
+
+
+# --------------------------------------------------------------------------
+# Identifying a platform from the SSH layer, the prompt, and by trying each
+# vendor's collection command
+#
+# The device type decides which Netmiko driver is used and which command a
+# backup runs, so getting it from more than one angle is what stops a device
+# being registered as the wrong vendor - which is how every discovered device
+# ended up as cisco_ios.
+# --------------------------------------------------------------------------
+
+
+class FakeTransport:
+    def __init__(self, remote_version=None, banner=None):
+        self.remote_version = remote_version
+        self._banner = banner
+
+    def get_banner(self):
+        return self._banner
+
+
+class FakeClient:
+    def __init__(self, transport):
+        self._transport = transport
+
+    def get_transport(self):
+        return self._transport
+
+
+class FakeConnection:
+    """
+    A Netmiko session, as far as identification is concerned
+
+    Commands it does not know about answer the way a real device does: with a
+    rejection, not silence.
+    """
+
+    def __init__(self, responses=None, prompt="switch#", remote_version=None,
+                 banner=None, raise_on=()):
+        self.responses = responses or {}
+        self.prompt = prompt
+        self.raise_on = set(raise_on)
+        self.sent = []
+        self.remote_conn_pre = FakeClient(FakeTransport(remote_version, banner))
+
+    def find_prompt(self):
+        return self.prompt
+
+    def _answer(self, command):
+        self.sent.append(command)
+        if command in self.raise_on:
+            raise OSError("read timed out")
+        return self.responses.get(command, "% Invalid input detected")
+
+    def send_command(self, command, **kwargs):
+        return self._answer(command)
+
+    def send_command_timing(self, command, **kwargs):
+        return self._answer(command)
+
+
+def test_the_ssh_server_version_identifies_a_platform():
+    """
+    Exchanged before authentication, so it costs nothing
+
+    Cisco's SSH daemon announces itself, which settles the platform without a
+    single command being sent.
+    """
+    connection = FakeConnection(remote_version="SSH-2.0-Cisco-1.25")
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "cisco_ios"
+    assert facts["identified_by"] == "ssh"
+    assert facts["ssh_version"] == "SSH-2.0-Cisco-1.25"
+
+
+def test_a_pre_auth_banner_identifies_a_platform():
+    connection = FakeConnection(
+        remote_version="SSH-2.0-OpenSSH_8.4",
+        banner="FortiGate-60E\nlogin banner\n",
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "fortinet"
+    assert facts["identified_by"] == "ssh"
+
+
+def test_version_output_beats_the_ssh_layer():
+    """
+    The device describing itself outranks its SSH daemon
+
+    An Arista running an OpenSSH-derived daemon must not be typed from the
+    daemon when 'show version' says Arista.
+    """
+    connection = FakeConnection(
+        remote_version="SSH-2.0-OpenSSH_7.5",
+        responses={
+            "show version": (
+                "Arista DCS-7050SX-64-R\nHardware version: 02.00\n"
+                "Software image version: 4.28.3M\nSerial number: JPE12345678\n"
+            )
+        },
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "arista_eos"
+    assert facts["identified_by"] == "version"
+    assert facts["serial_number"] == "JPE12345678"
+
+
+def test_the_prompt_is_used_when_nothing_else_names_the_platform():
+    connection = FakeConnection(prompt="FortiGate-60E #")
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "fortinet"
+    assert facts["identified_by"] == "prompt"
+
+
+CISCO_CONFIG = """Building configuration...
+
+Current configuration : 4021 bytes
+!
+version 15.2
+hostname access-01
+!
+interface GigabitEthernet0/1
+ switchport mode access
+!
+end
+"""
+
+
+def test_trying_each_collection_command_identifies_the_platform():
+    """
+    The last resort, and the most useful kind of answer
+
+    A device whose configuration command works is a device this application
+    can back up, which is the question backup eligibility is asking.
+    """
+    connection = FakeConnection(
+        prompt="\nfoo>", responses={"show running-config": CISCO_CONFIG}
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "cisco_ios"
+    assert facts["identified_by"] == "collection"
+    assert facts["collection_command"] == "show running-config"
+
+
+COMWARE_CONFIG = """#
+ version 7.1.070, Release 3506P05
+#
+ sysname comware-access-01
+#
+ clock timezone UTC add 00:00:00
+#
+ telnet server enable
+#
+ lldp global enable
+#
+vlan 1
+#
+vlan 10
+ name users
+#
+interface Vlan-interface10
+ ip address 10.20.10.2 255.255.255.0
+#
+interface GigabitEthernet1/0/1
+ port link-mode bridge
+ port access vlan 10
+ lldp tlv-enable basic-tlv all
+#
+interface GigabitEthernet1/0/2
+ port link-mode bridge
+ port link-type trunk
+#
+ return
+"""
+
+def test_a_rejected_collection_command_is_not_treated_as_success():
+    """A device that says 'Invalid input' has not identified itself"""
+    connection = FakeConnection(
+        prompt="\nfoo>",
+        responses={
+            "show running-config": "% Invalid input detected at '^' marker.",
+            "display current-configuration": COMWARE_CONFIG,
+        },
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts["device_type"] == "hp_comware"
+
+
+def test_a_short_answer_is_not_a_configuration():
+    """A prompt echo or an unfamiliar one-line complaint must not count"""
+    connection = FakeConnection(
+        prompt="\nfoo>", responses={"show running-config": "not supported here"}
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts.get("device_type") is None
+    # And it says what it tried, so an unidentified device is diagnosable.
+    assert facts["collection_probes"]
+
+
+def test_the_hint_is_tried_first_among_the_collection_probes():
+    """
+    Ordering matters: each probe costs a command against a live device
+
+    A hint from SNMP, a neighbour's LLDP platform string or the MAC's OUI is
+    not trusted enough to use on its own, but it is worth trying first.
+    """
+    connection = FakeConnection(
+        prompt="\nfoo>",
+        responses={
+            "display current-configuration": COMWARE_CONFIG,
+        },
+    )
+
+    facts = probe._identify_over_cli(connection, hint="hp_comware")
+
+    assert facts["device_type"] == "hp_comware"
+    # The hinted vendor's command went first, so nothing else was sent.
+    assert connection.sent[-1] == "display current-configuration"
+    assert connection.sent.count("show running-config") == 0
+
+
+def test_identification_survives_a_connection_that_answers_nothing():
+    """Every source is best effort; none of it may raise"""
+    connection = FakeConnection(
+        prompt=None,
+        raise_on=("show version", "display version", "get system status",
+                  "show running-config", "display current-configuration",
+                  "show configuration | display set", "show full-configuration"),
+    )
+
+    facts = probe._identify_over_cli(connection)
+
+    assert facts.get("device_type") is None

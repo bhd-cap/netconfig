@@ -110,7 +110,7 @@ PLATFORM_PATTERNS = (
     (r"ios[\s-]?xe", "cisco_ios_xe"),
     (r"adaptive security|cisco asa", "cisco_ios"),
     (r"arista|veos", "arista_eos"),
-    (r"fortigate|fortios|fortinet", "fortinet"),
+    (r"fortigate|fortios|fortinet|fortissh", "fortinet"),
     (r"junos|juniper", "juniper_junos"),
     (r"arubaos|aruba", "aruba_os"),
     (r"procurve|provision", "hp_procurve"),
@@ -258,6 +258,7 @@ def probe_snmp(
 
     started = time.perf_counter()
     tried = 0
+    answered = False
     last_message = "No SNMP credentials configured"
 
     for attempt in attempts:
@@ -294,6 +295,18 @@ def probe_snmp(
             logger.debug(f"SNMP probe of {host} with '{attempt.name}' failed: {e}")
             continue
 
+        if info is None:
+            # Nothing came back. For v1 and v2c a wrong community and a dead
+            # address look identical from here, so the next community still
+            # gets a turn - but the message has to say which of the two this
+            # was, because "answered but said nothing" sends an operator
+            # looking at the agent's configuration for a host that is not
+            # there at all.
+            answered = False
+            last_message = f"No response on UDP {port}"
+            continue
+
+        answered = True
         sysdescr = info.get("sysDescr")
         if not (sysdescr or info.get("sysName")):
             # An agent that answers but tells us nothing is no better than
@@ -326,7 +339,11 @@ def probe_snmp(
 
     return ProbeOutcome(
         transport="snmp",
-        result=AUTH_FAILED if tried else UNREACHABLE,
+        # A credential was rejected only if something was there to reject it.
+        # Nothing answering at all is unreachable, and reporting that as an
+        # authentication failure sends an operator after communities for a
+        # host that is not listening.
+        result=AUTH_FAILED if (tried and answered) else UNREACHABLE,
         attempts=tried,
         message=last_message,
         duration_ms=int((time.perf_counter() - started) * 1000),
@@ -409,16 +426,39 @@ def _login(
     return ConnectHandler(**params)
 
 
-def _identify_over_cli(connection) -> Dict[str, Any]:
+def _identify_over_cli(connection, hint: Optional[str] = None) -> Dict[str, Any]:
     """
     Ask an authenticated device what it is
 
+    Four sources, cheapest and most reliable first:
+
+    1. the SSH layer - the server version string and pre-auth banner, which
+       cost nothing because they were exchanged during login
+    2. a version command, which names the platform outright on most devices
+    3. the prompt, a weak hint but occasionally the only one
+    4. each vendor's configuration command in turn, which both identifies the
+       platform and proves the device can be backed up
+
     Args:
         connection: An open Netmiko session
+        hint: A device type suspected from elsewhere - SNMP, a neighbour's
+            LLDP platform string, or the MAC's OUI vendor - tried first among
+            the collection probes
 
     Returns:
         dict of facts, including device_type when it could be recognised
     """
+    facts: Dict[str, Any] = {}
+
+    identity = ssh_identity(connection)
+    facts.update(identity)
+
+    # The SSH server string and banner are free and often decisive.
+    from_ssh = identify_platform(identity.get("ssh_version"), identity.get("banner"))
+    if from_ssh:
+        facts["device_type"] = from_ssh
+        facts["identified_by"] = "ssh"
+
     for command in _VERSION_COMMANDS:
         try:
             output = connection.send_command(
@@ -432,12 +472,15 @@ def _identify_over_cli(connection) -> Dict[str, Any]:
         if re.search(r"invalid|unknown command|syntax error|%\s*bad", output, re.I):
             continue
 
-        facts: Dict[str, Any] = {"version_output": output[:2000]}
+        facts["version_output"] = output[:2000]
         facts.update(parse_facts(output))
 
+        # Version output beats the SSH layer: it is the device describing
+        # itself rather than its SSH daemon.
         device_type = identify_platform(output)
         if device_type:
             facts["device_type"] = device_type
+            facts["identified_by"] = "version"
 
         serial = re.search(
             r"(?:serial number|system serial|serial)[:\s]+([A-Z0-9\-]{5,})",
@@ -447,9 +490,162 @@ def _identify_over_cli(connection) -> Dict[str, Any]:
         if serial:
             facts["serial_number"] = serial.group(1)
 
-        return facts
+        break
 
-    return {}
+    if not facts.get("device_type"):
+        from_prompt = identify_platform(identity.get("prompt"))
+        if from_prompt:
+            facts["device_type"] = from_prompt
+            facts["identified_by"] = "prompt"
+
+    if not facts.get("device_type"):
+        # Nothing has named the platform. Try each vendor's configuration
+        # command: whichever answers is both the platform and proof that a
+        # backup can be taken.
+        collected = identify_by_collection(connection, prefer=hint)
+        facts.update(collected)
+        if collected.get("device_type"):
+            facts["identified_by"] = "collection"
+
+    return facts
+
+
+# Commands that ask a device for its configuration, tried in this order when
+# nothing else has identified the platform. Ordered by how many devices in a
+# typical estate answer them, so the common case costs one command.
+#
+# The point of trying these rather than more version commands is that they are
+# what a backup actually runs: a device whose configuration command works is
+# one that can be backed up, which is the question being asked.
+_COLLECTION_PROBES = (
+    ("cisco_ios", "show running-config", r"building configuration|^!|current configuration"),
+    ("arista_eos", "show running-config", r"^!|management api|^interface "),
+    ("hp_comware", "display current-configuration", r"^#|sysname|^ *interface "),
+    ("juniper_junos", "show configuration | display set", r"^set |system host-name"),
+    ("fortinet", "show full-configuration", r"config system|^config |edit \""),
+    ("hp_procurve", "show running-config", r"running configuration|^hostname"),
+)
+
+# Output that means the device rejected the command rather than answered it.
+_REJECTION = re.compile(
+    r"invalid input|invalid command|unknown command|syntax error|"
+    r"%\s*bad|permission denied|command not found|not authorized|"
+    r"ambiguous|incomplete command",
+    re.IGNORECASE,
+)
+
+
+def ssh_identity(connection) -> Dict[str, str]:
+    """
+    What the SSH layer and the login itself give away
+
+    Three sources, none of which needs a command to be sent:
+
+    - the SSH server version string, which is often decisive on its own
+      ("SSH-2.0-Cisco-1.25", "SSH-2.0-fortissh") and is exchanged before
+      authentication even happens
+    - the pre-authentication banner, where plenty of devices print their model
+    - the prompt, which sometimes carries a platform name
+
+    Every one is best effort: this runs against arbitrary vendors and
+    firmware, and none of it is worth an exception.
+
+    Args:
+        connection: An open Netmiko session
+
+    Returns:
+        dict with whichever of ssh_version, banner and prompt were available
+    """
+    identity: Dict[str, str] = {}
+
+    client = getattr(connection, "remote_conn_pre", None)
+    transport = None
+    if client is not None:
+        try:
+            transport = client.get_transport()
+        except Exception:  # noqa: BLE001
+            transport = None
+
+    if transport is not None:
+        remote_version = getattr(transport, "remote_version", None)
+        if remote_version:
+            identity["ssh_version"] = str(remote_version)[:200]
+
+        try:
+            banner = transport.get_banner()
+        except Exception:  # noqa: BLE001
+            banner = None
+        if banner:
+            identity["banner"] = str(banner)[:1000]
+
+    try:
+        prompt = connection.find_prompt()
+    except Exception:  # noqa: BLE001
+        prompt = None
+    if prompt:
+        identity["prompt"] = str(prompt).strip()[:100]
+
+    return identity
+
+
+def identify_by_collection(connection, prefer: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Ask each vendor's configuration command in turn and see which answers
+
+    The last resort, when neither SNMP, the SSH layer, the banner nor a version
+    command recognised the platform. A device that answers one vendor's
+    configuration command is running that vendor's CLI, and - more to the point
+    - is a device this application can actually back up.
+
+    send_command_timing rather than send_command: it returns whatever arrived
+    within the window instead of waiting for a prompt, so a probe against a
+    device with a very large configuration costs a few seconds rather than
+    minutes. Only the head of the output is kept; this is identification, not
+    a backup.
+
+    Args:
+        connection: An open Netmiko session
+        prefer: A device type to try first, if there is a weak hint
+
+    Returns:
+        dict with device_type and collection_command when one answered, empty
+        otherwise
+    """
+    probes = list(_COLLECTION_PROBES)
+    if prefer:
+        probes.sort(key=lambda probe: probe[0] != prefer)
+
+    tried = []
+    for device_type, command, marker in probes:
+        try:
+            output = connection.send_command_timing(
+                command, read_timeout=8, strip_prompt=False, strip_command=False
+            )
+        except Exception as e:  # noqa: BLE001 - the next vendor may be right
+            tried.append(f"{command}: {type(e).__name__}")
+            continue
+
+        text = (output or "").strip()
+        tried.append(f"{command}: {len(text)} bytes")
+
+        if not text or _REJECTION.search(text):
+            continue
+
+        # A configuration is many lines. A short answer is a prompt echo or a
+        # one-line complaint this pattern list has not seen before.
+        if len(text) < 120 or text.count("\n") < 4:
+            continue
+
+        if not re.search(marker, text, re.IGNORECASE | re.MULTILINE):
+            continue
+
+        return {
+            "device_type": device_type,
+            "collection_command": command,
+            "collection_probes": tried,
+        }
+
+    return {"collection_probes": tried}
 
 
 def probe_cli(
@@ -523,7 +719,14 @@ def probe_cli(
             try:
                 connection = _login(host, port, transport, attempt, device_type)
 
-                facts = _identify_over_cli(connection) if identify else {}
+                # device_type here is whatever was believed going in -
+                # from SNMP, a neighbour, or the MAC's OUI - which orders
+                # the collection probes if it comes to those.
+                facts = (
+                    _identify_over_cli(connection, hint=device_type)
+                    if identify
+                    else {}
+                )
 
                 outcomes.append(
                     ProbeOutcome(

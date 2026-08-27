@@ -6,11 +6,14 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.api.deps import get_current_user, get_organization_id
+from app.api.deps import get_current_user, get_organization_id, require_permission
+from app.models.credential import Credential
+from app.models.device import Device
 from app.models.user import User
 from app.repositories.device import DeviceRepository, SORTABLE_COLUMNS
 from app.repositories.audit_log import AuditLogRepository
@@ -22,6 +25,9 @@ from app.schemas.device import (
     DeviceTestConnection,
 )
 from app.schemas.common import PaginatedResponse, SuccessResponse
+from app.services import credentials as vault
+from app.services.credentials import resolve_for_device
+from app.services.rediscovery import RediscoveryService
 from app.services.device_connector import DeviceConnector, snmp_params
 from app.utils.encryption import encryption_service
 from app.utils.csv_parser import parse_device_csv, generate_csv_template, CSVParseError
@@ -35,6 +41,31 @@ class BulkDeviceIds(BaseModel):
     """A selection of devices to act on"""
 
     device_ids: List[int] = Field(..., min_length=1, max_length=1000)
+
+
+class RediscoverRequest(BaseModel):
+    """Which devices to re-probe, and whether to wait for the answer"""
+
+    device_ids: Optional[List[int]] = Field(
+        None,
+        max_length=1000,
+        description="Devices to re-probe; every device when omitted",
+    )
+    include_inactive: bool = Field(
+        True,
+        description=(
+            "Probe devices that are off the backup list too. On by default: a "
+            "device nothing could log into last time is the reason to re-probe."
+        ),
+    )
+    run_async: bool = Field(
+        True,
+        description=(
+            "Queue to the worker. A probe walks every vault credential over "
+            "SSH then telnet, so even one device can outlast an HTTP request, "
+            "and a whole estate certainly does."
+        ),
+    )
 
 
 class BulkDeviceUpdate(BulkDeviceIds):
@@ -135,6 +166,10 @@ def list_devices(
         is_active=is_active,
     )
 
+    # One extra query for the whole page, so a row can say which vault
+    # credential it uses without a query per row.
+    _with_credential_names(db, devices)
+
     return {
         "total": total,
         "page": (skip // limit) + 1,
@@ -154,6 +189,80 @@ def sortable_columns(
     Declared before /{device_id} so the literal path is matched first.
     """
     return {"columns": sorted(SORTABLE_COLUMNS)}
+
+
+@router.post("/rediscover", status_code=status.HTTP_202_ACCEPTED)
+def rediscover_devices(
+    payload: RediscoverRequest,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-probe existing devices over SSH, telnet and SNMP
+
+    Asks the questions discovery asked when the device was first found, and
+    updates what has changed since: which transports answer, which credential
+    works, what platform it is, and whether it can be backed up at all.
+
+    Declared before /{device_id} so the literal path is matched first.
+    """
+    if payload.device_ids:
+        found = set(
+            db.scalars(
+                select(Device.id).where(
+                    Device.id.in_(payload.device_ids),
+                    Device.organization_id == organization_id,
+                )
+            ).all()
+        )
+        missing = sorted(set(payload.device_ids) - found)
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No such device(s): {', '.join(str(i) for i in missing)}",
+            )
+
+    AuditLogRepository(db).log_action(
+        user_id=current_user.id,
+        action="devices_rediscover",
+        resource_type="device",
+        resource_id=None,
+        details={
+            "device_ids": payload.device_ids,
+            "include_inactive": payload.include_inactive,
+        },
+    )
+
+    if payload.run_async:
+        from app.tasks.discovery import rediscover_devices_task
+
+        task = rediscover_devices_task.delay(
+            organization_id=organization_id,
+            device_ids=list(payload.device_ids) if payload.device_ids else None,
+            include_inactive=payload.include_inactive,
+            user_id=current_user.id,
+        )
+
+        counted = len(payload.device_ids) if payload.device_ids else None
+        return {
+            "queued": True,
+            "task_id": task.id,
+            "devices": counted,
+            "message": (
+                f"Re-probing {counted} device(s); the list updates as they answer"
+                if counted
+                else "Re-probing every device; the list updates as they answer"
+            ),
+        }
+
+    summary = RediscoveryService(db).rediscover(
+        organization_id=organization_id,
+        device_ids=payload.device_ids,
+        include_inactive=payload.include_inactive,
+    )
+
+    return {"queued": False, **summary.as_dict()}
 
 
 @router.patch("/bulk", response_model=dict)
@@ -336,11 +445,26 @@ def get_device_detail(
         ).where(HostInventory.device_id == device_id)
     ).one()
 
-    credential_name = None
-    if device.credential_id:
-        credential_name = db.scalar(
-            sa_select(Credential.name).where(Credential.id == device.credential_id)
+    # Both vault references in one query, so the detail view can say what the
+    # device logs in with and what it polls with.
+    wanted = [
+        credential_id
+        for credential_id in (device.credential_id, device.snmp_credential_id)
+        if credential_id
+    ]
+    names = (
+        dict(
+            db.execute(
+                sa_select(Credential.id, Credential.name).where(
+                    Credential.id.in_(wanted)
+                )
+            ).all()
         )
+        if wanted
+        else {}
+    )
+    credential_name = names.get(device.credential_id)
+    snmp_credential_name = names.get(device.snmp_credential_id)
 
     return {
         "device": {
@@ -368,6 +492,8 @@ def get_device_detail(
             "error": device.auth_error,
             "credential_id": device.credential_id,
             "credential_name": credential_name,
+            "snmp_credential_id": device.snmp_credential_id,
+            "snmp_credential_name": snmp_credential_name,
             "backup_eligible": device.is_active
             and device.last_auth_status == "success",
         },
@@ -451,6 +577,78 @@ def get_device(
     return device
 
 
+def _check_vault_references(
+    db: Session, organization_id: int, credential_id, snmp_credential_id
+) -> None:
+    """
+    Refuse a vault reference that does not exist or is the wrong kind
+
+    Checked here rather than left to the foreign key, because the interesting
+    failures are not integrity errors: a credential belonging to another
+    organization, or an SNMP community pointed at as a login. Both would
+    otherwise surface as an authentication failure against a real device.
+    """
+    for credential_id_value, kind, field in (
+        (credential_id, vault.CLI, "credential_id"),
+        (snmp_credential_id, vault.SNMP, "snmp_credential_id"),
+    ):
+        if not credential_id_value:
+            continue
+
+        credential = db.scalars(
+            select(Credential).where(
+                Credential.id == credential_id_value,
+                Credential.organization_id == organization_id,
+            )
+        ).first()
+
+        if not credential:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"No vault credential with id {credential_id_value}",
+            )
+
+        if credential.kind != kind:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"'{credential.name}' is a {credential.kind} credential and "
+                    f"cannot be used as {field}"
+                ),
+            )
+
+
+def _with_credential_names(db: Session, devices) -> None:
+    """
+    Attach the names of the vault credentials a device uses
+
+    One query for the whole page rather than one per row: the device list is
+    the main consumer, and a name per row would otherwise be a query per row.
+    """
+    rows = list(devices)
+    wanted = {
+        credential_id
+        for device in rows
+        for credential_id in (device.credential_id, device.snmp_credential_id)
+        if credential_id
+    }
+
+    names = {}
+    if wanted:
+        names = dict(
+            db.execute(
+                select(Credential.id, Credential.name).where(Credential.id.in_(wanted))
+            ).all()
+        )
+
+    for device in rows:
+        # Set on the ORM instance so the response model picks them up; the
+        # attributes are not columns and are never written back.
+        device.credential_name = names.get(device.credential_id)
+        device.snmp_credential_name = names.get(device.snmp_credential_id)
+
+
+
 @router.post("", response_model=DeviceResponse, status_code=status.HTTP_201_CREATED)
 def create_device(
     device_in: DeviceCreate,
@@ -492,8 +690,15 @@ def create_device(
             detail=f"Device with IP '{device_in.ip_address}' already exists",
         )
 
-    # Encrypt credentials
-    encrypted_password = encryption_service.encrypt(device_in.password)
+    _check_vault_references(
+        db, organization_id, device_in.credential_id, device_in.snmp_credential_id
+    )
+
+    # Encrypt credentials. A device using a vault credential stores none of its
+    # own, and the schema has already refused the case where there is neither.
+    encrypted_password = (
+        encryption_service.encrypt(device_in.password) if device_in.password else None
+    )
     encrypted_enable_secret = None
     if device_in.enable_secret:
         encrypted_enable_secret = encryption_service.encrypt(device_in.enable_secret)
@@ -521,9 +726,11 @@ def create_device(
             "hostname": device.hostname,
             "ip_address": device.ip_address,
             "device_type": device.device_type,
+            "credential_id": device.credential_id,
         },
     )
 
+    _with_credential_names(db, [device])
     return device
 
 
@@ -580,14 +787,34 @@ def update_device(
                 detail=f"Device with IP '{device_in.ip_address}' already exists",
             )
 
+    fields_sent = device_in.dict(exclude_unset=True)
+
+    _check_vault_references(
+        db,
+        organization_id,
+        fields_sent.get("credential_id"),
+        fields_sent.get("snmp_credential_id"),
+    )
+
     # Prepare update data
     update_data = device_in.dict(
         exclude_unset=True, exclude={"password", "enable_secret"} | SNMP_SECRETS
     )
 
+    # Moving a device onto a vault credential drops the login it was holding.
+    # Leaving a stale username and password behind would mean a device that
+    # silently kept working after the vault entry was deleted, using
+    # credentials nobody remembers setting.
+    if fields_sent.get("credential_id"):
+        update_data["username"] = None
+        update_data["encrypted_password"] = None
+        update_data["enable_secret"] = None
+
     # Encrypt new password if provided
     if device_in.password:
         update_data["encrypted_password"] = encryption_service.encrypt(device_in.password)
+        # Typing a password means this device holds its own again.
+        update_data["credential_id"] = None
 
     # Encrypt new enable secret if provided
     if device_in.enable_secret:
@@ -608,7 +835,47 @@ def update_device(
         details={"hostname": device.hostname, "updated_fields": list(update_data.keys())},
     )
 
+    _with_credential_names(db, [device])
     return device
+
+
+@router.post("/{device_id}/rediscover")
+def rediscover_device(
+    device_id: int,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-probe one device and return what changed
+
+    Runs inline rather than queued: a single device is one round of credentials
+    and the caller wants the answer, not a task id. A whole estate goes through
+    POST /devices/rediscover instead.
+    """
+    device = DeviceRepository(db).get_by_id_and_organization(device_id, organization_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+        )
+
+    summary = RediscoveryService(db).rediscover(
+        organization_id=organization_id, device_ids=[device_id]
+    )
+
+    AuditLogRepository(db).log_action(
+        user_id=current_user.id,
+        action="device_rediscovered",
+        resource_type="device",
+        resource_id=device_id,
+        details={
+            "hostname": device.hostname,
+            "changes": summary.devices[0]["changes"] if summary.devices else {},
+        },
+    )
+
+    result = summary.devices[0] if summary.devices else {}
+    return {"device_id": device_id, **result}
 
 
 @router.delete("/{device_id}", response_model=SuccessResponse)
@@ -702,17 +969,22 @@ def test_device_connection(
     try:
         transport = device.transport or "ssh"
 
+        # Whatever the device actually logs in with: its own credentials, or
+        # the vault entry it names. Testing with the wrong one would report a
+        # failure the real backup would not hit, or the reverse.
+        login = resolve_for_device(db, device)
+
         connector = DeviceConnector(
             hostname=device.hostname,
             ip_address=device.ip_address,
             device_type=device.device_type,
-            username=device.username,
-            encrypted_password=device.encrypted_password,
+            username=login.username,
+            encrypted_password=login.encrypted_password,
             port=device.port,
-            enable_secret=device.enable_secret,
-            ssh_key_path=device.ssh_key_path,
+            enable_secret=login.enable_secret,
+            ssh_key_path=login.ssh_key_path,
             transport=transport,
-            snmp=snmp_params(device) if transport == "snmp" else None,
+            snmp=(login.snmp or snmp_params(device)) if transport == "snmp" else None,
         )
 
         result = connector.test_connection()
@@ -723,7 +995,11 @@ def test_device_connection(
             action="device_test_connection",
             resource_type="device",
             resource_id=device.id,
-            details={"hostname": device.hostname, "result": result["success"]},
+            details={
+                "hostname": device.hostname,
+                "result": result["success"],
+                "credential": login.cli_source,
+            },
             status="success" if result["success"] else "failed",
         )
 

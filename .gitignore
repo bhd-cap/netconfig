@@ -77,3 +77,6 @@ coverage/
 *.crt
 nginx/ssl/*
 !nginx/ssl/.gitkeep
+
+# Redis dumps a snapshot into the working directory when run locally.
+dump.rdb
