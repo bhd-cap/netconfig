@@ -815,6 +815,43 @@ export const INFRASTRUCTURE_TIERS: Tier[] = [
 export const ALL_TIERS: Tier[] = [...INFRASTRUCTURE_TIERS, 'host'];
 
 // ---------------------------------------------------------------------------
+// Rediscovery
+// ---------------------------------------------------------------------------
+
+/** What a re-probe decided about one device */
+export interface RediscoverOutcome {
+  device_id: number;
+  hostname: string;
+  ip_address: string;
+  reachable: boolean;
+  authenticated: boolean;
+  transport?: string | null;
+  device_type?: string | null;
+  credential_name?: string | null;
+  /**
+   * Which source named the platform: 'ssh' (server string or banner),
+   * 'version', 'prompt', or 'collection' (each vendor's configuration command
+   * tried until one answered).
+   */
+  identified_by?: string | null;
+  /** Only the fields that actually moved, as { from, to }. */
+  changes: Record<string, { from: unknown; to: unknown }>;
+  message: string;
+  error?: string | null;
+}
+
+export interface RediscoverySummary {
+  queued?: boolean;
+  task_id?: string;
+  probed?: number;
+  reachable?: number;
+  authenticated?: number;
+  changed?: number;
+  failed?: number;
+  devices?: RediscoverOutcome[];
+  message?: string;
+}
+
 // Device detail
 // ---------------------------------------------------------------------------
 

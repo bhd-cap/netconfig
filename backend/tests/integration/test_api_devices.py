@@ -1039,3 +1039,165 @@ def test_deleting_a_credential_a_device_uses_is_refused(
 
     forced = session.delete(f"/api/v1/credentials/{cli_credential.id}?force=true")
     assert forced.status_code in (200, 204), forced.text
+
+
+# --------------------------------------------------------------------------
+# Rediscovery endpoints
+# --------------------------------------------------------------------------
+
+
+def test_rediscovering_one_device_returns_what_changed(client, admin, db, org):
+    """
+    Inline, because the caller wants the answer and not a task id
+
+    One device is one round of credentials; a whole estate goes through the
+    bulk endpoint, which queues.
+    """
+    device = Device(
+        organization_id=org.id,
+        hostname="sw-reprobe",
+        ip_address="10.8.0.1",
+        device_type="cisco_ios",
+        username="admin",
+        encrypted_password=encryption_service.encrypt("secret"),
+        is_active=False,
+        last_auth_status="auth_failed",
+    )
+    db.add(device)
+    db.commit()
+
+    from app.services import discovery_probe as probe
+
+    result = probe.DeviceAssessment(
+        probes=[
+            probe.ProbeOutcome(
+                transport="telnet",
+                result=probe.SUCCESS,
+                credential_name="Legacy login",
+                attempts=2,
+                message="Logged in over telnet",
+            )
+        ],
+        device_type="hp_procurve",
+        transport="telnet",
+        facts={"identified_by": "collection", "model": "J9773A"},
+        backup_eligible=True,
+        auth_status="success",
+    )
+
+    with mock.patch.object(probe, "assess", return_value=result):
+        response = as_user(client, admin).post(
+            f"/api/v1/devices/{device.id}/rediscover"
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    assert body["authenticated"] is True
+    assert body["transport"] == "telnet"
+    assert body["device_type"] == "hp_procurve"
+    assert body["identified_by"] == "collection"
+    assert body["changes"]["is_active"] == {"from": False, "to": True}
+    # The message says how the platform was worked out, since that is the part
+    # an operator would otherwise have to guess at.
+    assert "trying each vendor's command" in body["message"]
+
+
+def test_rediscovering_a_missing_device_is_a_404(client, admin):
+    response = as_user(client, admin).post("/api/v1/devices/999999/rediscover")
+
+    assert response.status_code == 404
+
+
+def test_bulk_rediscovery_is_queued(client, admin, db, org):
+    device = Device(
+        organization_id=org.id,
+        hostname="sw-bulk-reprobe",
+        ip_address="10.8.0.2",
+        device_type="cisco_ios",
+        username="admin",
+        encrypted_password=encryption_service.encrypt("secret"),
+    )
+    db.add(device)
+    db.commit()
+
+    with mock.patch(
+        "app.tasks.discovery.rediscover_devices_task.delay"
+    ) as delay:
+        delay.return_value = mock.Mock(id="task-redisc-1")
+
+        response = as_user(client, admin).post(
+            "/api/v1/devices/rediscover",
+            json={"device_ids": [device.id]},
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["queued"] is True
+    assert body["task_id"] == "task-redisc-1"
+    assert body["devices"] == 1
+
+    assert delay.call_args.kwargs["device_ids"] == [device.id]
+    assert delay.call_args.kwargs["include_inactive"] is True
+
+
+def test_bulk_rediscovery_refuses_a_device_from_another_organization(
+    client, admin, db
+):
+    """Tenant scoping, checked before anything is queued"""
+    other = Organization(name="Not mine at all")
+    db.add(other)
+    db.commit()
+    theirs = Device(
+        organization_id=other.id,
+        hostname="their-switch",
+        ip_address="10.99.0.1",
+        device_type="cisco_ios",
+        username="admin",
+        encrypted_password=encryption_service.encrypt("secret"),
+    )
+    db.add(theirs)
+    db.commit()
+
+    response = as_user(client, admin).post(
+        "/api/v1/devices/rediscover", json={"device_ids": [theirs.id]}
+    )
+
+    assert response.status_code == 404
+    assert str(theirs.id) in response.json()["detail"]
+
+
+def test_rediscovery_can_run_inline_for_a_whole_selection(client, admin, db, org):
+    """run_async=false is for a caller that wants the results in the response"""
+    device = Device(
+        organization_id=org.id,
+        hostname="sw-inline",
+        ip_address="10.8.0.3",
+        device_type="cisco_ios",
+        username="admin",
+        encrypted_password=encryption_service.encrypt("secret"),
+    )
+    db.add(device)
+    db.commit()
+
+    from app.services import discovery_probe as probe
+
+    result = probe.DeviceAssessment(
+        probes=[],
+        backup_eligible=False,
+        auth_status="unreachable",
+        auth_error="Nothing answered on SSH, telnet or SNMP",
+    )
+
+    with mock.patch.object(probe, "assess", return_value=result):
+        response = as_user(client, admin).post(
+            "/api/v1/devices/rediscover",
+            json={"device_ids": [device.id], "run_async": False},
+        )
+
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["queued"] is False
+    assert body["probed"] == 1
+    assert body["authenticated"] == 0
+    assert body["devices"][0]["message"] == "Nothing answered on SSH, telnet or SNMP"

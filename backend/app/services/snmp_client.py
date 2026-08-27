@@ -290,6 +290,76 @@ class SnmpClient:
             logger.debug(f"SNMP get {oid} on {self.host} failed: {e}")
             return None
 
+    def get_many(self, oids: Dict[str, str]) -> Optional[Dict[str, Optional[str]]]:
+        """
+        Fetch several scalar OIDs in one request
+
+        SNMP carries many variable bindings in a single GET, so asking for the
+        whole system group costs one round trip rather than one per object.
+        That matters twice over: every request here builds a fresh event loop
+        and SnmpEngine (an engine cannot outlive the loop it was created on),
+        and against a device that is not answering each request costs the full
+        timeout. Four separate GETs of the system group took 41 seconds to
+        establish that a host was dead, which is most of a discovery crawl's
+        time when a subnet is sparsely populated.
+
+        Args:
+            oids: name -> object identifier
+
+        Returns:
+            name -> value, with None for anything the device did not return.
+            None instead of a dict means nothing answered at all, which is a
+            different fact from an agent that answered with nothing useful:
+            one says the address is dead, the other says the community was
+            wrong or the agent is bare.
+        """
+        if not oids:
+            return {}
+
+        names = list(oids)
+
+        async def _get_many():
+            engine = self.hlapi.SnmpEngine()
+            try:
+                error_indication, error_status, _, var_binds = await self.hlapi.get_cmd(
+                    engine,
+                    self._auth_data(),
+                    await self._transport(),
+                    self.hlapi.ContextData(),
+                    *[
+                        self.hlapi.ObjectType(self.hlapi.ObjectIdentity(oids[name]))
+                        for name in names
+                    ],
+                )
+
+                if error_indication:
+                    # A timeout or an unreachable host: nothing in this PDU
+                    # answered, and neither would a second attempt.
+                    logger.debug(
+                        f"SNMP get_many on {self.host}: {error_indication}"
+                    )
+                    return None
+
+                # error_status is per-PDU but a single bad OID sets it; the
+                # bindings that did resolve are still worth keeping.
+                if error_status:
+                    logger.debug(f"SNMP get_many on {self.host}: {error_status}")
+
+                values: Dict[str, Optional[str]] = {}
+                for name, (_, value) in zip(names, var_binds):
+                    text = str(value)
+                    values[name] = text if self._usable(text) else None
+
+                return values
+            finally:
+                self._close_engine(engine)
+
+        try:
+            return _run(_get_many())
+        except Exception as e:
+            logger.debug(f"SNMP get_many on {self.host} failed: {e}")
+            return None
+
     def walk(self, oid: str, max_rows: int = 10000) -> List[Tuple[str, str]]:
         """
         Walk a subtree
@@ -376,19 +446,26 @@ class SnmpClient:
             raise SnmpError(f"Unknown OID name '{name}'")
         return self.walk(oid, max_rows=max_rows)
 
-    def system_info(self) -> Dict[str, Any]:
+    def system_info(self) -> Optional[Dict[str, Any]]:
         """
         Read the standard system group
 
+        One request for all four objects. Asking for them one at a time meant
+        a device that does not answer cost four full timeouts to rule out,
+        which is the single slowest thing a discovery crawl or a re-probe does.
+
         Returns:
-            dict of sysName, sysDescr, sysLocation, sysContact
+            dict of sysName, sysDescr, sysLocation, sysContact, or None when
+            nothing answered - which the caller needs to tell apart from an
+            agent that answered with an empty system group.
         """
-        return {
-            "sysName": self.get(OID["sysName"]),
-            "sysDescr": self.get(OID["sysDescr"]),
-            "sysLocation": self.get(OID["sysLocation"]),
-            "sysContact": self.get(OID["sysContact"]),
-        }
+        wanted = ("sysName", "sysDescr", "sysLocation", "sysContact")
+        values = self.get_many({name: OID[name] for name in wanted})
+
+        if values is None:
+            return None
+
+        return {name: values.get(name) for name in wanted}
 
     def interface_names(self) -> Dict[str, str]:
         """

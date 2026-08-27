@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
-from app.api.deps import get_current_user, get_organization_id
+from app.api.deps import get_current_user, get_organization_id, require_permission
 from app.models.credential import Credential
+from app.models.device import Device
 from app.models.user import User
 from app.repositories.device import DeviceRepository, SORTABLE_COLUMNS
 from app.repositories.audit_log import AuditLogRepository
@@ -26,6 +27,7 @@ from app.schemas.device import (
 from app.schemas.common import PaginatedResponse, SuccessResponse
 from app.services import credentials as vault
 from app.services.credentials import resolve_for_device
+from app.services.rediscovery import RediscoveryService
 from app.services.device_connector import DeviceConnector, snmp_params
 from app.utils.encryption import encryption_service
 from app.utils.csv_parser import parse_device_csv, generate_csv_template, CSVParseError
@@ -39,6 +41,31 @@ class BulkDeviceIds(BaseModel):
     """A selection of devices to act on"""
 
     device_ids: List[int] = Field(..., min_length=1, max_length=1000)
+
+
+class RediscoverRequest(BaseModel):
+    """Which devices to re-probe, and whether to wait for the answer"""
+
+    device_ids: Optional[List[int]] = Field(
+        None,
+        max_length=1000,
+        description="Devices to re-probe; every device when omitted",
+    )
+    include_inactive: bool = Field(
+        True,
+        description=(
+            "Probe devices that are off the backup list too. On by default: a "
+            "device nothing could log into last time is the reason to re-probe."
+        ),
+    )
+    run_async: bool = Field(
+        True,
+        description=(
+            "Queue to the worker. A probe walks every vault credential over "
+            "SSH then telnet, so even one device can outlast an HTTP request, "
+            "and a whole estate certainly does."
+        ),
+    )
 
 
 class BulkDeviceUpdate(BulkDeviceIds):
@@ -162,6 +189,80 @@ def sortable_columns(
     Declared before /{device_id} so the literal path is matched first.
     """
     return {"columns": sorted(SORTABLE_COLUMNS)}
+
+
+@router.post("/rediscover", status_code=status.HTTP_202_ACCEPTED)
+def rediscover_devices(
+    payload: RediscoverRequest,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-probe existing devices over SSH, telnet and SNMP
+
+    Asks the questions discovery asked when the device was first found, and
+    updates what has changed since: which transports answer, which credential
+    works, what platform it is, and whether it can be backed up at all.
+
+    Declared before /{device_id} so the literal path is matched first.
+    """
+    if payload.device_ids:
+        found = set(
+            db.scalars(
+                select(Device.id).where(
+                    Device.id.in_(payload.device_ids),
+                    Device.organization_id == organization_id,
+                )
+            ).all()
+        )
+        missing = sorted(set(payload.device_ids) - found)
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No such device(s): {', '.join(str(i) for i in missing)}",
+            )
+
+    AuditLogRepository(db).log_action(
+        user_id=current_user.id,
+        action="devices_rediscover",
+        resource_type="device",
+        resource_id=None,
+        details={
+            "device_ids": payload.device_ids,
+            "include_inactive": payload.include_inactive,
+        },
+    )
+
+    if payload.run_async:
+        from app.tasks.discovery import rediscover_devices_task
+
+        task = rediscover_devices_task.delay(
+            organization_id=organization_id,
+            device_ids=list(payload.device_ids) if payload.device_ids else None,
+            include_inactive=payload.include_inactive,
+            user_id=current_user.id,
+        )
+
+        counted = len(payload.device_ids) if payload.device_ids else None
+        return {
+            "queued": True,
+            "task_id": task.id,
+            "devices": counted,
+            "message": (
+                f"Re-probing {counted} device(s); the list updates as they answer"
+                if counted
+                else "Re-probing every device; the list updates as they answer"
+            ),
+        }
+
+    summary = RediscoveryService(db).rediscover(
+        organization_id=organization_id,
+        device_ids=payload.device_ids,
+        include_inactive=payload.include_inactive,
+    )
+
+    return {"queued": False, **summary.as_dict()}
 
 
 @router.patch("/bulk", response_model=dict)
@@ -736,6 +837,45 @@ def update_device(
 
     _with_credential_names(db, [device])
     return device
+
+
+@router.post("/{device_id}/rediscover")
+def rediscover_device(
+    device_id: int,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-probe one device and return what changed
+
+    Runs inline rather than queued: a single device is one round of credentials
+    and the caller wants the answer, not a task id. A whole estate goes through
+    POST /devices/rediscover instead.
+    """
+    device = DeviceRepository(db).get_by_id_and_organization(device_id, organization_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+        )
+
+    summary = RediscoveryService(db).rediscover(
+        organization_id=organization_id, device_ids=[device_id]
+    )
+
+    AuditLogRepository(db).log_action(
+        user_id=current_user.id,
+        action="device_rediscovered",
+        resource_type="device",
+        resource_id=device_id,
+        details={
+            "hostname": device.hostname,
+            "changes": summary.devices[0]["changes"] if summary.devices else {},
+        },
+    )
+
+    result = summary.devices[0] if summary.devices else {}
+    return {"device_id": device_id, **result}
 
 
 @router.delete("/{device_id}", response_model=SuccessResponse)

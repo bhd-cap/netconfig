@@ -18,6 +18,7 @@ import {
   Activity,
   CheckCircle,
   XCircle,
+  Radar,
   Search,
   ShieldCheck,
   ShieldX,
@@ -45,6 +46,7 @@ import {
   DeviceCreate,
   DeviceUpdate,
   PaginatedResponse,
+  RediscoverOutcome,
   DEVICE_TYPES,
   TRANSPORTS,
   Transport,
@@ -226,6 +228,56 @@ export const Devices: React.FC = () => {
     },
   });
 
+  // Re-probe one device: SSH, telnet and SNMP, every vault credential, and
+  // the platform worked out from whatever answered. Inline, because the answer
+  // is the point.
+  const rediscoverMutation = useMutation({
+    mutationFn: async (deviceId: number) => {
+      const response = await api.post<RediscoverOutcome>(
+        `/devices/${deviceId}/rediscover`
+      );
+      return response.data;
+    },
+    onSuccess: (outcome) => {
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
+      queryClient.invalidateQueries({ queryKey: ['device-detail'] });
+
+      const moved = Object.keys(outcome.changes ?? {});
+      toast.success(
+        moved.length
+          ? `${outcome.hostname}: ${outcome.message} (${moved.join(', ')} updated)`
+          : `${outcome.hostname}: ${outcome.message}`,
+        { duration: 8000 }
+      );
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Re-probe failed');
+    },
+  });
+
+  // The same for a selection, queued: a probe walks every credential over SSH
+  // and then telnet, so a page of devices outlasts any HTTP request.
+  const bulkRediscoverMutation = useMutation({
+    mutationFn: async (deviceIds: number[]) => {
+      const response = await api.post('/devices/rediscover', {
+        device_ids: deviceIds,
+      });
+      return response.data;
+    },
+    onSuccess: (data) => {
+      toast.success(data.message || 'Re-probe queued', { duration: 6000 });
+      clearSelection();
+      // Results arrive as devices answer, so refresh shortly after.
+      setTimeout(
+        () => queryClient.invalidateQueries({ queryKey: ['devices'] }),
+        4000
+      );
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Failed to queue the re-probe');
+    },
+  });
+
   // Trigger backup mutation
   const backupMutation = useMutation({
     mutationFn: async (deviceIds: number[]) => {
@@ -393,6 +445,21 @@ export const Devices: React.FC = () => {
             </>
           )}
 
+          {canWrite && (
+            <button
+              onClick={() =>
+                bulkRediscoverMutation.mutate(selectedOnPage.map((d) => d.id))
+              }
+              disabled={bulkRediscoverMutation.isPending}
+              data-testid="bulk-rediscover"
+              className="inline-flex items-center px-3 py-1.5 bg-white border border-blue-300 text-blue-700 rounded text-sm hover:bg-blue-100 disabled:opacity-50"
+              title="Re-probe SSH, telnet and SNMP, and correct the platform"
+            >
+              <Radar className="h-4 w-4 mr-1.5" />
+              Rediscover
+            </button>
+          )}
+
           {canDelete && (
             <button
               onClick={handleBulkDelete}
@@ -519,6 +586,24 @@ export const Devices: React.FC = () => {
                         >
                           <Activity className="h-5 w-5" />
                         </button>
+                        {canWrite && (
+                          <button
+                            onClick={() => rediscoverMutation.mutate(device.id)}
+                            disabled={rediscoverMutation.isPending}
+                            data-testid={`rediscover-${device.id}`}
+                            className="text-blue-600 hover:text-blue-900 disabled:opacity-40"
+                            title="Rediscover: re-probe SSH, telnet and SNMP, and correct the platform and backup eligibility"
+                          >
+                            <Radar
+                              className={`h-5 w-5 ${
+                                rediscoverMutation.isPending &&
+                                rediscoverMutation.variables === device.id
+                                  ? 'animate-pulse'
+                                  : ''
+                              }`}
+                            />
+                          </button>
+                        )}
                         <button
                           onClick={() => backupMutation.mutate([device.id])}
                           className="text-green-600 hover:text-green-900"

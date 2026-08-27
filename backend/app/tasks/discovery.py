@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 from app.celery_app import celery_app
 from app.core.database import SessionLocal
+from app.repositories.audit_log import AuditLogRepository
 from app.services.discovery import DiscoveryService
+from app.services.rediscovery import RediscoveryService
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +200,79 @@ def age_inventory_task(stale_after_hours: int = 48):
 
     except Exception as e:
         logger.exception("Inventory ageing failed")
+        db.rollback()
+        return {"success": False, "error": str(e)}
+
+    finally:
+        db.close()
+
+
+@celery_app.task(
+    bind=True,
+    name="app.tasks.discovery.rediscover_devices_task",
+    max_retries=0,
+)
+def rediscover_devices_task(
+    self,
+    organization_id: int,
+    device_ids: list = None,
+    include_inactive: bool = True,
+    user_id: int = None,
+):
+    """
+    Re-probe existing devices over SSH, telnet and SNMP
+
+    Queued rather than run inline because a probe walks every vault credential
+    over SSH and then telnet: one unreachable device can take a minute, and an
+    estate takes as long as it takes.
+
+    No retries. A rediscovery that failed has already written whatever it
+    learned about the devices it reached, and running the whole pass again
+    would re-probe those too - the operator can simply ask again.
+
+    Args:
+        organization_id: Tenant scope
+        device_ids: Devices to probe; every device when omitted
+        include_inactive: Probe devices that are off the backup list too
+        user_id: Who asked, for the audit trail
+
+    Returns:
+        dict summary
+    """
+    db = SessionLocal()
+
+    try:
+        service = RediscoveryService(db)
+        summary = service.rediscover(
+            organization_id=organization_id,
+            device_ids=device_ids,
+            include_inactive=include_inactive,
+        )
+
+        AuditLogRepository(db).log_action(
+            user_id=user_id,
+            action="devices_rediscovered",
+            resource_type="device",
+            resource_id=None,
+            details={
+                "probed": summary.probed,
+                "authenticated": summary.authenticated,
+                "changed": summary.changed,
+                "failed": summary.failed,
+            },
+        )
+        db.commit()
+
+        logger.info(
+            f"Rediscovery probed {summary.probed} device(s): "
+            f"{summary.authenticated} authenticated, {summary.changed} changed, "
+            f"{summary.failed} failed"
+        )
+
+        return {"success": True, **summary.as_dict()}
+
+    except Exception as e:
+        logger.exception("Rediscovery failed")
         db.rollback()
         return {"success": False, "error": str(e)}
 
