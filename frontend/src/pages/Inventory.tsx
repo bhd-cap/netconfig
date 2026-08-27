@@ -1,11 +1,15 @@
 /**
  * Inventory Page
  *
- * Every host seen on a switch port, when it was first seen and when it was
- * last seen, with the vendor resolved from the MAC's OUI.
+ * Three answers to "what is out there", behind three tabs:
  *
- * Rows are aged rather than deleted, so "where did that laptop go" has an
- * answer: last seen on port 12, three weeks ago.
+ * - Hosts: every host seen on a switch port, when it was first seen and when
+ *   it was last seen, with the vendor resolved from the MAC's OUI. Rows are
+ *   aged rather than deleted, so "where did that laptop go" has an answer:
+ *   last seen on port 12, three weeks ago.
+ * - Hardware: what the devices themselves are made of - chassis, modules,
+ *   supplies and fans, with their serial numbers, collected over SNMP.
+ * - Environment: temperature, fans, power, CPU and memory from the same poll.
  */
 import React, { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -13,9 +17,12 @@ import { formatDistanceToNow } from 'date-fns';
 import { toast } from 'react-hot-toast';
 import {
   AlertTriangle,
+  Cpu,
   Database,
   Download,
+  Gauge,
   Loader2,
+  Network,
   Pencil,
   RefreshCw,
   Search,
@@ -26,6 +33,10 @@ import {
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
 import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
+import {
+  EnvironmentOverview,
+  HardwareInventory,
+} from '../components/telemetry/InventoryPanels';
 import {
   PageSizeSelect,
   SortDir,
@@ -40,6 +51,36 @@ import {
   OuiStatus,
   PaginatedResponse,
 } from '../types';
+
+type InventoryTab = 'hosts' | 'hardware' | 'environment';
+
+const TABS: {
+  key: InventoryTab;
+  label: string;
+  blurb: string;
+  icon: React.ComponentType<{ className?: string }>;
+}[] = [
+  {
+    key: 'hosts',
+    label: 'Hosts',
+    blurb: 'What is plugged into which switch port, and when it was last seen.',
+    icon: Network,
+  },
+  {
+    key: 'hardware',
+    label: 'Hardware',
+    blurb:
+      'Chassis, modules, supplies and fans with their serial numbers, read over SNMP.',
+    icon: Cpu,
+  },
+  {
+    key: 'environment',
+    label: 'Environment',
+    blurb:
+      'Temperature, fans, power, CPU and memory across every polled device.',
+    icon: Gauge,
+  },
+];
 
 /**
  * The inventory columns, in the order the table renders them
@@ -74,6 +115,7 @@ export const Inventory: React.FC = () => {
   const canWrite = can('inventory:write');
   const canImportOui = can('settings:write');
 
+  const [tab, setTab] = useState<InventoryTab>('hosts');
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = usePageSize('inventory-page-size', 50);
   const [sortBy, setSortBy] = useState('last_seen');
@@ -114,6 +156,9 @@ export const Inventory: React.FC = () => {
       activeOnly,
       seenWithin,
     ],
+    // The other two tabs read from different endpoints; there is no reason to
+    // page through hosts while one of them is on screen.
+    enabled: tab === 'hosts',
     queryFn: async () => {
       const params: Record<string, any> = {
         skip: (page - 1) * pageSize,
@@ -248,365 +293,398 @@ export const Inventory: React.FC = () => {
     <div className="space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">Host Inventory</h1>
+          <h1 className="text-2xl font-bold text-gray-900">Inventory</h1>
           <p className="text-gray-600">
-            What is plugged into which switch port, and when it was last seen.
+            {TABS.find((entry) => entry.key === tab)?.blurb}
           </p>
         </div>
 
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={exportCsv}
-            className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
-          >
-            <Download className="h-4 w-4 mr-2" />
-            Export CSV
-          </button>
-
-          {canWrite && (
+        {tab === 'hosts' && (
+          <div className="flex flex-wrap gap-2">
             <button
-              onClick={() => refreshMutation.mutate()}
-              disabled={refreshMutation.isPending}
-              className="inline-flex items-center px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50"
+              onClick={exportCsv}
+              className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
             >
-              <RefreshCw className="h-4 w-4 mr-2" />
-              Refresh from devices
+              <Download className="h-4 w-4 mr-2" />
+              Export CSV
             </button>
-          )}
-        </div>
+
+            {canWrite && (
+              <button
+                onClick={() => refreshMutation.mutate()}
+                disabled={refreshMutation.isPending}
+                className="inline-flex items-center px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50"
+              >
+                <RefreshCw className="h-4 w-4 mr-2" />
+                Refresh from devices
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
-      {/* OUI status */}
-      {ouiStatus && (
-        <div className="bg-white rounded-lg shadow p-4 space-y-3">
-          <div className="flex flex-wrap items-center gap-4 text-sm">
-            <Tag className="h-5 w-5 text-gray-400" />
-            <span className="text-gray-900 font-medium">
-              {ouiStatus.prefixes.toLocaleString()} OUI prefixes loaded
-            </span>
-            <span className="text-gray-500 flex-1 min-w-[16rem]">
-              {ouiStatus.prefixes < 1000
-                ? ouiStatus.note
-                : 'Vendor lookup is populated.'}
-            </span>
+      <div className="border-b border-gray-200">
+        <nav className="-mb-px flex gap-6">
+          {TABS.map((entry) => {
+            const Icon = entry.icon;
+            const active = tab === entry.key;
+            return (
+              <button
+                key={entry.key}
+                onClick={() => setTab(entry.key)}
+                data-testid={`inventory-tab-${entry.key}`}
+                className={`inline-flex items-center gap-2 border-b-2 py-2 text-sm font-medium ${
+                  active
+                    ? 'border-blue-600 text-blue-700'
+                    : 'border-transparent text-gray-500 hover:text-gray-800 hover:border-gray-300'
+                }`}
+              >
+                <Icon className="h-4 w-4" />
+                {entry.label}
+              </button>
+            );
+          })}
+        </nav>
+      </div>
 
-            {canImportOui && (
-              <div className="flex flex-wrap gap-2">
-                {ouiStatus.system_file && (
+      {tab === 'hardware' && <HardwareInventory />}
+      {tab === 'environment' && <EnvironmentOverview />}
+
+      {tab === 'hosts' && (
+        <>
+        {/* OUI status */}
+        {ouiStatus && (
+          <div className="bg-white rounded-lg shadow p-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-4 text-sm">
+              <Tag className="h-5 w-5 text-gray-400" />
+              <span className="text-gray-900 font-medium">
+                {ouiStatus.prefixes.toLocaleString()} OUI prefixes loaded
+              </span>
+              <span className="text-gray-500 flex-1 min-w-[16rem]">
+                {ouiStatus.prefixes < 1000
+                  ? ouiStatus.note
+                  : 'Vendor lookup is populated.'}
+              </span>
+
+              {canImportOui && (
+                <div className="flex flex-wrap gap-2">
+                  {ouiStatus.system_file && (
+                    <button
+                      onClick={() => importOui.mutate('system')}
+                      disabled={importOui.isPending || uploadOui.isPending}
+                      className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                      title={ouiStatus.system_file}
+                    >
+                      Import from this host
+                    </button>
+                  )}
+
                   <button
-                    onClick={() => importOui.mutate('system')}
+                    onClick={() => importOui.mutate('ieee')}
                     disabled={importOui.isPending || uploadOui.isPending}
                     className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-                    title={ouiStatus.system_file}
+                    title={(ouiStatus.ieee_sources ?? []).join('\n')}
                   >
-                    Import from this host
+                    {importOui.isPending ? 'Downloading…' : 'Download registry'}
                   </button>
-                )}
 
-                <button
-                  onClick={() => importOui.mutate('ieee')}
-                  disabled={importOui.isPending || uploadOui.isPending}
-                  className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-                  title={(ouiStatus.ieee_sources ?? []).join('\n')}
-                >
-                  {importOui.isPending ? 'Downloading…' : 'Download registry'}
-                </button>
+                  {/* The way to populate vendor data on a host with no outbound
+                      internet access: a browser cannot give the server a local
+                      path, so the file itself is sent. */}
+                  <label
+                    className={`px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 cursor-pointer ${
+                      uploadOui.isPending ? 'opacity-50 pointer-events-none' : ''
+                    }`}
+                    title="Upload oui.csv, oui.txt, Wireshark's manuf or nmap-mac-prefixes"
+                  >
+                    <Upload className="h-3 w-3 inline mr-1" />
+                    {uploadOui.isPending ? 'Uploading…' : 'Upload a list'}
+                    <input
+                      type="file"
+                      className="hidden"
+                      accept=".csv,.txt,text/csv,text/plain"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) uploadOui.mutate(file);
+                        // Clear it, so choosing the same file twice re-fires.
+                        event.target.value = '';
+                      }}
+                    />
+                  </label>
 
-                {/* The way to populate vendor data on a host with no outbound
-                    internet access: a browser cannot give the server a local
-                    path, so the file itself is sent. */}
-                <label
-                  className={`px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 cursor-pointer ${
-                    uploadOui.isPending ? 'opacity-50 pointer-events-none' : ''
-                  }`}
-                  title="Upload oui.csv, oui.txt, Wireshark's manuf or nmap-mac-prefixes"
-                >
-                  <Upload className="h-3 w-3 inline mr-1" />
-                  {uploadOui.isPending ? 'Uploading…' : 'Upload a list'}
-                  <input
-                    type="file"
-                    className="hidden"
-                    accept=".csv,.txt,text/csv,text/plain"
-                    onChange={(event) => {
-                      const file = event.target.files?.[0];
-                      if (file) uploadOui.mutate(file);
-                      // Clear it, so choosing the same file twice re-fires.
-                      event.target.value = '';
-                    }}
-                  />
-                </label>
+                  {canWrite && (
+                    <button
+                      onClick={() => backfill.mutate()}
+                      disabled={backfill.isPending}
+                      className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      Resolve unknown vendors
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
 
-                {canWrite && (
+            {ouiError && (
+              <div className="border border-red-200 bg-red-50 rounded p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0">
+                    <AlertTriangle className="h-4 w-4 text-red-600 mt-0.5 shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-red-900">
+                        The OUI import did not complete
+                      </p>
+                      <pre className="mt-1 text-xs text-red-800 whitespace-pre-wrap break-words font-mono">
+                        {ouiError}
+                      </pre>
+                    </div>
+                  </div>
                   <button
-                    onClick={() => backfill.mutate()}
-                    disabled={backfill.isPending}
-                    className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                    onClick={() => setOuiError(null)}
+                    className="text-red-600 hover:text-red-900 shrink-0"
                   >
-                    Resolve unknown vendors
+                    <X className="h-4 w-4" />
                   </button>
-                )}
+                </div>
               </div>
             )}
           </div>
+        )}
 
-          {ouiError && (
-            <div className="border border-red-200 bg-red-50 rounded p-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-2 min-w-0">
-                  <AlertTriangle className="h-4 w-4 text-red-600 mt-0.5 shrink-0" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-red-900">
-                      The OUI import did not complete
-                    </p>
-                    <pre className="mt-1 text-xs text-red-800 whitespace-pre-wrap break-words font-mono">
-                      {ouiError}
-                    </pre>
-                  </div>
-                </div>
-                <button
-                  onClick={() => setOuiError(null)}
-                  className="text-red-600 hover:text-red-900 shrink-0"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
+        {/* Filters */}
+        <div className="bg-white rounded-lg shadow p-4">
+          <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
+            <form onSubmit={applySearch} className="md:col-span-2 relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
+              <input
+                value={searchInput}
+                onChange={(event) => setSearchInput(event.target.value)}
+                placeholder="MAC, IP or host name"
+                className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm"
+              />
+            </form>
 
-      {/* Filters */}
-      <div className="bg-white rounded-lg shadow p-4">
-        <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
-          <form onSubmit={applySearch} className="md:col-span-2 relative">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" />
-            <input
-              value={searchInput}
-              onChange={(event) => setSearchInput(event.target.value)}
-              placeholder="MAC, IP or host name"
-              className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg text-sm"
-            />
-          </form>
-
-          <select
-            value={deviceId}
-            onChange={(event) => {
-              setPage(1);
-              setDeviceId(event.target.value ? Number(event.target.value) : '');
-            }}
-            className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
-          >
-            <option value="">Every switch</option>
-            {devices?.items.map((device) => (
-              <option key={device.id} value={device.id}>
-                {device.hostname}
-              </option>
-            ))}
-          </select>
-
-          <input
-            value={vlan}
-            onChange={(event) => {
-              setPage(1);
-              setVlan(event.target.value.replace(/\D/g, ''));
-            }}
-            placeholder="VLAN"
-            className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
-          />
-
-          <input
-            value={vendor}
-            onChange={(event) => {
-              setPage(1);
-              setVendor(event.target.value);
-            }}
-            placeholder="Vendor"
-            className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
-          />
-
-          <select
-            value={seenWithin}
-            onChange={(event) => {
-              setPage(1);
-              setSeenWithin(event.target.value);
-            }}
-            className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
-          >
-            <option value="">Any time</option>
-            <option value="1">Last hour</option>
-            <option value="24">Last 24 hours</option>
-            <option value="168">Last week</option>
-          </select>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-4 mt-3 text-sm">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={activeOnly}
+            <select
+              value={deviceId}
               onChange={(event) => {
                 setPage(1);
-                setActiveOnly(event.target.checked);
+                setDeviceId(event.target.value ? Number(event.target.value) : '');
               }}
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            >
+              <option value="">Every switch</option>
+              {devices?.items.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.hostname}
+                </option>
+              ))}
+            </select>
+
+            <input
+              value={vlan}
+              onChange={(event) => {
+                setPage(1);
+                setVlan(event.target.value.replace(/\D/g, ''));
+              }}
+              placeholder="VLAN"
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
             />
-            Only hosts still being seen
-          </label>
 
-          <PageSizeSelect value={pageSize} onChange={changePageSize} noun="hosts" />
+            <input
+              value={vendor}
+              onChange={(event) => {
+                setPage(1);
+                setVendor(event.target.value);
+              }}
+              placeholder="Vendor"
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            />
 
-          <span className="ml-auto text-gray-500">
-            {data ? `${data.total.toLocaleString()} entries` : ''}
-          </span>
+            <select
+              value={seenWithin}
+              onChange={(event) => {
+                setPage(1);
+                setSeenWithin(event.target.value);
+              }}
+              className="px-3 py-2 border border-gray-300 rounded-lg text-sm"
+            >
+              <option value="">Any time</option>
+              <option value="1">Last hour</option>
+              <option value="24">Last 24 hours</option>
+              <option value="168">Last week</option>
+            </select>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-4 mt-3 text-sm">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={activeOnly}
+                onChange={(event) => {
+                  setPage(1);
+                  setActiveOnly(event.target.checked);
+                }}
+              />
+              Only hosts still being seen
+            </label>
+
+            <PageSizeSelect value={pageSize} onChange={changePageSize} noun="hosts" />
+
+            <span className="ml-auto text-gray-500">
+              {data ? `${data.total.toLocaleString()} entries` : ''}
+            </span>
+          </div>
         </div>
-      </div>
 
-      {/* Table */}
-      <div className="bg-white rounded-lg shadow overflow-hidden">
-        {isLoading ? (
-          <div className="p-12 flex justify-center">
-            <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
-          </div>
-        ) : !data?.items.length ? (
-          <div className="p-12 text-center text-gray-500">
-            <Database className="h-10 w-10 mx-auto mb-3 text-gray-300" />
-            <p className="font-medium text-gray-900">Nothing here yet</p>
-            <p className="text-sm mt-1">
-              Run a discovery crawl with inventory collection, or refresh from
-              devices.
-            </p>
-          </div>
-        ) : (
-          <>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200 text-sm">
-                <thead className="bg-gray-50">
-                  <tr>
-                    {SORTABLE.map((column) => (
-                      <SortHeader
-                        key={column.key}
-                        column={column}
-                        sortBy={sortBy}
-                        sortDir={sortDir}
-                        onSort={sort}
-                      />
-                    ))}
-                    {canWrite && <th className="px-4 py-3" />}
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200">
-                  {data.items.map((row) => (
-                    <tr key={row.id} className={row.is_active ? '' : 'bg-gray-50'}>
-                      <td className="px-4 py-3 font-mono text-xs text-gray-900">
-                        {row.mac_address}
-                      </td>
-                      <td className="px-4 py-3 text-gray-700 max-w-[14rem] truncate">
-                        {row.vendor || (
-                          <span className="text-gray-400">unknown</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-gray-700">
-                        {row.ip_address || '—'}
-                        {row.hostname && (
-                          <p className="text-xs text-gray-500">{row.hostname}</p>
-                        )}
-                      </td>
-                      {/* What the host itself announced over LLDP or CDP, as
-                          opposed to the name a person typed in. */}
-                      <td className="px-4 py-3 text-gray-700">
-                        {row.discovered_hostname ? (
-                          <>
-                            <span
-                              className="text-gray-900"
-                              title={row.discovered_platform ?? undefined}
-                            >
-                              {row.discovered_hostname}
-                            </span>
-                            {row.discovered_via && (
-                              <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-800 rounded text-xs uppercase">
-                                {row.discovered_via}
-                              </span>
-                            )}
-                          </>
-                        ) : (
-                          <span className="text-gray-400">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-gray-900">
-                        {row.device_id ? (
-                          <button
-                            type="button"
-                            onClick={() => setDetailDeviceId(row.device_id!)}
-                            data-testid={`inventory-switch-${row.id}`}
-                            className="text-blue-600 hover:text-blue-800 hover:underline"
-                            title="Show everything known about this switch"
-                          >
-                            {row.device_hostname}
-                          </button>
-                        ) : (
-                          <span title="This device is no longer on the backup list">
-                            {row.device_hostname}
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-gray-700">{row.interface}</td>
-                      <td className="px-4 py-3 text-gray-700">
-                        {row.vlan ? row.vlan : '—'}
-                      </td>
-                      <td className="px-4 py-3 text-gray-500">
-                        {relative(row.first_seen)}
-                      </td>
-                      <td className="px-4 py-3 text-gray-500">
-                        {relative(row.last_seen)}
-                        {!row.is_active && (
-                          <span className="ml-2 px-1.5 py-0.5 bg-gray-200 text-gray-700 rounded text-xs">
-                            gone
-                          </span>
-                        )}
-                      </td>
-                      {canWrite && (
-                        <td className="px-4 py-3 text-right">
-                          <button
-                            onClick={() => setEditing(row)}
-                            className="text-gray-400 hover:text-blue-600"
-                            title="Add a name or note"
-                          >
-                            <Pencil className="h-4 w-4" />
-                          </button>
-                        </td>
-                      )}
+        {/* Table */}
+        <div className="bg-white rounded-lg shadow overflow-hidden">
+          {isLoading ? (
+            <div className="p-12 flex justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-blue-600" />
+            </div>
+          ) : !data?.items.length ? (
+            <div className="p-12 text-center text-gray-500">
+              <Database className="h-10 w-10 mx-auto mb-3 text-gray-300" />
+              <p className="font-medium text-gray-900">Nothing here yet</p>
+              <p className="text-sm mt-1">
+                Run a discovery crawl with inventory collection, or refresh from
+                devices.
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200 text-sm">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      {SORTABLE.map((column) => (
+                        <SortHeader
+                          key={column.key}
+                          column={column}
+                          sortBy={sortBy}
+                          sortDir={sortDir}
+                          onSort={sort}
+                        />
+                      ))}
+                      {canWrite && <th className="px-4 py-3" />}
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200">
+                    {data.items.map((row) => (
+                      <tr key={row.id} className={row.is_active ? '' : 'bg-gray-50'}>
+                        <td className="px-4 py-3 font-mono text-xs text-gray-900">
+                          {row.mac_address}
+                        </td>
+                        <td className="px-4 py-3 text-gray-700 max-w-[14rem] truncate">
+                          {row.vendor || (
+                            <span className="text-gray-400">unknown</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-gray-700">
+                          {row.ip_address || '—'}
+                          {row.hostname && (
+                            <p className="text-xs text-gray-500">{row.hostname}</p>
+                          )}
+                        </td>
+                        {/* What the host itself announced over LLDP or CDP, as
+                            opposed to the name a person typed in. */}
+                        <td className="px-4 py-3 text-gray-700">
+                          {row.discovered_hostname ? (
+                            <>
+                              <span
+                                className="text-gray-900"
+                                title={row.discovered_platform ?? undefined}
+                              >
+                                {row.discovered_hostname}
+                              </span>
+                              {row.discovered_via && (
+                                <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-800 rounded text-xs uppercase">
+                                  {row.discovered_via}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-gray-400">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-gray-900">
+                          {row.device_id ? (
+                            <button
+                              type="button"
+                              onClick={() => setDetailDeviceId(row.device_id!)}
+                              data-testid={`inventory-switch-${row.id}`}
+                              className="text-blue-600 hover:text-blue-800 hover:underline"
+                              title="Show everything known about this switch"
+                            >
+                              {row.device_hostname}
+                            </button>
+                          ) : (
+                            <span title="This device is no longer on the backup list">
+                              {row.device_hostname}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-gray-700">{row.interface}</td>
+                        <td className="px-4 py-3 text-gray-700">
+                          {row.vlan ? row.vlan : '—'}
+                        </td>
+                        <td className="px-4 py-3 text-gray-500">
+                          {relative(row.first_seen)}
+                        </td>
+                        <td className="px-4 py-3 text-gray-500">
+                          {relative(row.last_seen)}
+                          {!row.is_active && (
+                            <span className="ml-2 px-1.5 py-0.5 bg-gray-200 text-gray-700 rounded text-xs">
+                              gone
+                            </span>
+                          )}
+                        </td>
+                        {canWrite && (
+                          <td className="px-4 py-3 text-right">
+                            <button
+                              onClick={() => setEditing(row)}
+                              className="text-gray-400 hover:text-blue-600"
+                              title="Add a name or note"
+                            >
+                              <Pencil className="h-4 w-4" />
+                            </button>
+                          </td>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
 
-            <div className="px-4 py-3 border-t border-gray-200 flex flex-wrap items-center justify-between gap-3 text-sm">
-              <div className="flex flex-wrap items-center gap-4">
-                <span className="text-gray-600">
-                  Page {data.page} of {data.total_pages}
-                  <span className="text-gray-400"> · {data.total} hosts</span>
-                </span>
+              <div className="px-4 py-3 border-t border-gray-200 flex flex-wrap items-center justify-between gap-3 text-sm">
+                <div className="flex flex-wrap items-center gap-4">
+                  <span className="text-gray-600">
+                    Page {data.page} of {data.total_pages}
+                    <span className="text-gray-400"> · {data.total} hosts</span>
+                  </span>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setPage((current) => Math.max(1, current - 1))}
+                    disabled={page <= 1 || isFetching}
+                    className="px-3 py-1.5 border border-gray-300 rounded disabled:opacity-50"
+                  >
+                    Previous
+                  </button>
+                  <button
+                    onClick={() => setPage((current) => current + 1)}
+                    disabled={page >= data.total_pages || isFetching}
+                    className="px-3 py-1.5 border border-gray-300 rounded disabled:opacity-50"
+                  >
+                    Next
+                  </button>
+                </div>
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setPage((current) => Math.max(1, current - 1))}
-                  disabled={page <= 1 || isFetching}
-                  className="px-3 py-1.5 border border-gray-300 rounded disabled:opacity-50"
-                >
-                  Previous
-                </button>
-                <button
-                  onClick={() => setPage((current) => current + 1)}
-                  disabled={page >= data.total_pages || isFetching}
-                  className="px-3 py-1.5 border border-gray-300 rounded disabled:opacity-50"
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          </>
-        )}
-      </div>
+            </>
+          )}
+        </div>
+        </>
+      )}
 
       {/* Drill into the switch a host was seen on */}
       {detailDeviceId !== null && (

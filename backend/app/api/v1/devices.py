@@ -6,13 +6,16 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.api.deps import get_current_user, get_organization_id, require_permission
 from app.models.credential import Credential
+from app.models.telemetry import DeviceComponent, DeviceSensor, SensorReading
 from app.models.device import Device
 from app.models.user import User
 from app.repositories.device import DeviceRepository, SORTABLE_COLUMNS
@@ -28,6 +31,7 @@ from app.schemas.common import PaginatedResponse, SuccessResponse
 from app.services import credentials as vault
 from app.services.credentials import resolve_for_device
 from app.services.rediscovery import RediscoveryService
+from app.services.telemetry import TelemetryService
 from app.services.device_connector import DeviceConnector, snmp_params
 from app.utils.encryption import encryption_service
 from app.utils.csv_parser import parse_device_csv, generate_csv_template, CSVParseError
@@ -64,6 +68,23 @@ class RediscoverRequest(BaseModel):
             "Queue to the worker. A probe walks every vault credential over "
             "SSH then telnet, so even one device can outlast an HTTP request, "
             "and a whole estate certainly does."
+        ),
+    )
+
+
+class TelemetryPollRequest(BaseModel):
+    """Which devices to poll over SNMP for hardware and readings"""
+
+    device_ids: Optional[List[int]] = Field(
+        None,
+        max_length=1000,
+        description="Devices to poll; every SNMP-capable device when omitted",
+    )
+    run_async: bool = Field(
+        True,
+        description=(
+            "Queue to the worker. Walking the entity, sensor and host-resource "
+            "tables is several round trips per device."
         ),
     )
 
@@ -189,6 +210,201 @@ def sortable_columns(
     Declared before /{device_id} so the literal path is matched first.
     """
     return {"columns": sorted(SORTABLE_COLUMNS)}
+
+
+
+
+@router.post("/poll-telemetry", status_code=status.HTTP_202_ACCEPTED)
+def poll_telemetry(
+    payload: TelemetryPollRequest,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll devices over SNMP for hardware inventory and environmental readings
+
+    Chassis, modules, power supplies and fans with their serial numbers, plus
+    temperature, voltage, current, power draw, fan speed, CPU and memory.
+
+    Declared before /{device_id} so the literal path is matched first.
+    """
+    if payload.run_async:
+        from app.tasks.telemetry import poll_telemetry_task
+
+        task = poll_telemetry_task.delay(
+            organization_id=organization_id,
+            device_ids=list(payload.device_ids) if payload.device_ids else None,
+            user_id=current_user.id,
+        )
+        return {
+            "queued": True,
+            "task_id": task.id,
+            "message": "Polling; hardware and readings appear as devices answer",
+        }
+
+    summary = TelemetryService(db).poll(
+        organization_id=organization_id, device_ids=payload.device_ids
+    )
+    return {"queued": False, **summary.as_dict()}
+
+
+@router.get("/components")
+def list_components_across_devices(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=500),
+    component_class: Optional[str] = Query(None),
+    search: Optional[str] = Query(None, description="Serial, model or name"),
+    active_only: bool = Query(True),
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("inventory:read")),
+    db: Session = Depends(get_db),
+):
+    """
+    Every part of every device, with its serial number
+
+    The estate-wide view: "which chassis is serial FOC2137L0AB in", and the
+    list somebody exports for an asset register.
+    """
+    filters = [DeviceComponent.organization_id == organization_id]
+
+    if component_class:
+        filters.append(DeviceComponent.component_class == component_class)
+    if active_only:
+        filters.append(DeviceComponent.is_active.is_(True))
+    if search:
+        pattern = f"%{search}%"
+        filters.append(
+            DeviceComponent.serial_number.ilike(pattern)
+            | DeviceComponent.model_name.ilike(pattern)
+            | DeviceComponent.name.ilike(pattern)
+            | DeviceComponent.description.ilike(pattern)
+        )
+
+    total = db.scalar(select(func.count(DeviceComponent.id)).where(*filters)) or 0
+
+    rows = db.execute(
+        select(DeviceComponent, Device.hostname)
+        .join(Device, DeviceComponent.device_id == Device.id)
+        .where(*filters)
+        .order_by(Device.hostname, DeviceComponent.component_class,
+                  DeviceComponent.entity_index)
+        .offset(skip)
+        .limit(limit)
+    ).all()
+
+    return {
+        "total": total,
+        "page": (skip // limit) + 1,
+        "page_size": limit,
+        "total_pages": (total + limit - 1) // limit,
+        "items": [
+            {
+                "id": component.id,
+                "device_id": component.device_id,
+                "device_hostname": hostname,
+                "entity_index": component.entity_index,
+                "name": component.name,
+                "description": component.description,
+                "component_class": component.component_class,
+                "model_name": component.model_name,
+                "serial_number": component.serial_number,
+                "hardware_rev": component.hardware_rev,
+                "firmware_rev": component.firmware_rev,
+                "software_rev": component.software_rev,
+                "is_active": component.is_active,
+                "first_seen": component.first_seen,
+                "last_seen": component.last_seen,
+            }
+            for component, hostname in rows
+        ],
+    }
+
+
+@router.get("/sensors")
+def list_sensors_across_devices(
+    sensor_type: Optional[str] = Query(None),
+    status_filter: Optional[str] = Query(None, alias="status"),
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("inventory:read")),
+    db: Session = Depends(get_db),
+):
+    """
+    Current readings across the estate, with a per-type summary
+
+    The summary is what a chart is drawn from - how many sensors of each type,
+    and the lowest, average and highest reading - so a dashboard does not have
+    to pull every row to draw one bar.
+    """
+    filters = [
+        DeviceSensor.organization_id == organization_id,
+        DeviceSensor.is_active.is_(True),
+    ]
+    if sensor_type:
+        filters.append(DeviceSensor.sensor_type == sensor_type)
+    if status_filter:
+        filters.append(DeviceSensor.status == status_filter)
+
+    rows = db.execute(
+        select(DeviceSensor, Device.hostname)
+        .join(Device, DeviceSensor.device_id == Device.id)
+        .where(*filters)
+        .order_by(Device.hostname, DeviceSensor.sensor_type, DeviceSensor.name)
+    ).all()
+
+    summary = db.execute(
+        select(
+            DeviceSensor.sensor_type,
+            # One row per type, not per (type, unit): a sensor that reports
+            # only a state carries no unit, and grouping on the unit would
+            # split "power" into a tile with watts and a second, numberless
+            # tile holding the failed supply.
+            func.max(func.nullif(DeviceSensor.unit, "")),
+            func.count(DeviceSensor.id),
+            func.min(DeviceSensor.value),
+            func.avg(DeviceSensor.value),
+            func.max(DeviceSensor.value),
+            func.count(DeviceSensor.id).filter(DeviceSensor.status != "ok"),
+        )
+        .where(
+            DeviceSensor.organization_id == organization_id,
+            DeviceSensor.is_active.is_(True),
+        )
+        .group_by(DeviceSensor.sensor_type)
+        .order_by(DeviceSensor.sensor_type)
+    ).all()
+
+    return {
+        "summary": [
+            {
+                "sensor_type": kind,
+                "unit": unit,
+                "count": count,
+                "min": round(low, 2) if low is not None else None,
+                "avg": round(float(average), 2) if average is not None else None,
+                "max": round(high, 2) if high is not None else None,
+                "unhealthy": unhealthy,
+            }
+            for kind, unit, count, low, average, high, unhealthy in summary
+        ],
+        "items": [
+            {
+                "id": sensor.id,
+                "device_id": sensor.device_id,
+                "device_hostname": hostname,
+                "name": sensor.name,
+                "sensor_type": sensor.sensor_type,
+                "unit": sensor.unit,
+                "value": sensor.value,
+                "status": sensor.status,
+                "source": sensor.source,
+                "last_reading_at": sensor.last_reading_at,
+            }
+            for sensor, hostname in rows
+        ],
+    }
+
+
 
 
 @router.post("/rediscover", status_code=status.HTTP_202_ACCEPTED)
@@ -837,6 +1053,170 @@ def update_device(
 
     _with_credential_names(db, [device])
     return device
+
+
+
+
+@router.get("/{device_id}/components")
+def device_components(
+    device_id: int,
+    active_only: bool = Query(True),
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("devices:read")),
+    db: Session = Depends(get_db),
+):
+    """What this device is made of, with a serial number per part"""
+    device = DeviceRepository(db).get_by_id_and_organization(device_id, organization_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+        )
+
+    filters = [DeviceComponent.device_id == device_id]
+    if active_only:
+        filters.append(DeviceComponent.is_active.is_(True))
+
+    components = list(
+        db.scalars(
+            select(DeviceComponent)
+            .where(*filters)
+            .order_by(DeviceComponent.component_class, DeviceComponent.entity_index)
+        )
+    )
+
+    return {
+        "device_id": device_id,
+        "hostname": device.hostname,
+        "polled_at": device.snmp_last_polled_at,
+        "components": [
+            {
+                "id": component.id,
+                "entity_index": component.entity_index,
+                "parent_index": component.parent_index,
+                "name": component.name,
+                "description": component.description,
+                "component_class": component.component_class,
+                "model_name": component.model_name,
+                "serial_number": component.serial_number,
+                "hardware_rev": component.hardware_rev,
+                "firmware_rev": component.firmware_rev,
+                "software_rev": component.software_rev,
+                "is_active": component.is_active,
+                "first_seen": component.first_seen,
+                "last_seen": component.last_seen,
+            }
+            for component in components
+        ],
+    }
+
+
+@router.get("/{device_id}/sensors")
+def device_sensors(
+    device_id: int,
+    history_hours: int = Query(
+        24, ge=0, le=720, description="Hours of history per sensor; 0 for none"
+    ),
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("devices:read")),
+    db: Session = Depends(get_db),
+):
+    """
+    Current readings for one device, with the history behind the charts
+
+    History comes back as a series per sensor rather than one flat list, which
+    is the shape a chart wants and saves the browser regrouping it.
+    """
+    device = DeviceRepository(db).get_by_id_and_organization(device_id, organization_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+        )
+
+    sensors = list(
+        db.scalars(
+            select(DeviceSensor)
+            .where(
+                DeviceSensor.device_id == device_id,
+                DeviceSensor.is_active.is_(True),
+            )
+            .order_by(DeviceSensor.sensor_type, DeviceSensor.name)
+        )
+    )
+
+    history: Dict[int, List[Dict[str, Any]]] = {}
+
+    if history_hours and sensors:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=history_hours)
+        readings = db.execute(
+            select(SensorReading)
+            .where(
+                SensorReading.sensor_id.in_([sensor.id for sensor in sensors]),
+                SensorReading.recorded_at >= cutoff,
+            )
+            .order_by(SensorReading.sensor_id, SensorReading.recorded_at)
+        ).scalars()
+
+        for reading in readings:
+            history.setdefault(reading.sensor_id, []).append(
+                {"at": reading.recorded_at, "value": reading.value}
+            )
+
+    return {
+        "device_id": device_id,
+        "hostname": device.hostname,
+        "polled_at": device.snmp_last_polled_at,
+        "sensors": [
+            {
+                "id": sensor.id,
+                "sensor_key": sensor.sensor_key,
+                "name": sensor.name,
+                "sensor_type": sensor.sensor_type,
+                "unit": sensor.unit,
+                "value": sensor.value,
+                "status": sensor.status,
+                "source": sensor.source,
+                "last_reading_at": sensor.last_reading_at,
+                "history": history.get(sensor.id, []),
+            }
+            for sensor in sensors
+        ],
+    }
+
+
+@router.post("/{device_id}/poll-telemetry")
+def poll_device_telemetry(
+    device_id: int,
+    organization_id: int = Depends(get_organization_id),
+    current_user: User = Depends(require_permission("discovery:run")),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll one device now and return what it reported
+
+    Inline, like the single-device re-probe: one device is a handful of walks
+    and the caller wants the answer.
+    """
+    device = DeviceRepository(db).get_by_id_and_organization(device_id, organization_id)
+    if not device:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+        )
+
+    summary = TelemetryService(db).poll(
+        organization_id=organization_id, device_ids=[device_id]
+    )
+
+    AuditLogRepository(db).log_action(
+        user_id=current_user.id,
+        action="device_telemetry_polled",
+        resource_type="device",
+        resource_id=device_id,
+        details={"hostname": device.hostname, **summary.as_dict()},
+    )
+
+    return summary.devices[0] if summary.devices else {"device_id": device_id}
+
+
 
 
 @router.post("/{device_id}/rediscover")

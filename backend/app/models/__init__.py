@@ -16,6 +16,7 @@ from app.models.network import (
     TopologyDiagram,
     DiscoveryRun,
 )
+from app.models.telemetry import DeviceComponent, DeviceSensor, SensorReading
 
 __all__ = [
     "Organization",
@@ -34,4 +35,7 @@ __all__ = [
     "OuiVendor",
     "TopologyDiagram",
     "DiscoveryRun",
+    "DeviceComponent",
+    "DeviceSensor",
+    "SensorReading",
 ]
