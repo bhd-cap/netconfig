@@ -27,6 +27,26 @@ class Device(Base):
     location = Column(String(255), nullable=True)
     tags = Column(JSONB, nullable=True, default=dict)  # Flexible metadata
     is_active = Column(Boolean, default=True, nullable=False)
+
+    # How to reach the device: ssh (default), telnet or snmp. SNMP is
+    # read-only and cannot retrieve a full configuration, so it is used for
+    # discovery and inventory rather than backup.
+    transport = Column(String(10), nullable=False, default="ssh", server_default="ssh")
+    snmp_version = Column(String(5), nullable=True)          # 1 | 2c | 3
+    snmp_community = Column(Text, nullable=True)             # Fernet encrypted
+    snmp_port = Column(Integer, nullable=False, default=161, server_default="161")
+    snmp_v3_user = Column(String(100), nullable=True)
+    snmp_v3_auth_key = Column(Text, nullable=True)           # Fernet encrypted
+    snmp_v3_priv_key = Column(Text, nullable=True)           # Fernet encrypted
+    snmp_v3_auth_protocol = Column(String(20), nullable=True)
+    snmp_v3_priv_protocol = Column(String(20), nullable=True)
+
+    # Set when the device was added by a discovery crawl rather than by hand,
+    # so operators can tell the two apart and review what was found.
+    discovered = Column(Boolean, default=False, nullable=False, server_default="false")
+    discovery_source = Column(String(255), nullable=True)
+    last_discovered_at = Column(DateTime(timezone=True), nullable=True)
+
     last_backup_at = Column(DateTime(timezone=True), nullable=True)
     last_backup_status = Column(String(20), nullable=True)  # success, failed, pending
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
