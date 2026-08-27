@@ -32,9 +32,10 @@ from sqlalchemy.orm import Session
 
 from app.config.discovery_commands import get_capabilities, supports_discovery
 from app.core.config import settings
+from app.models.credential import Credential as CredentialModel, DeviceProbe
 from app.models.device import Device
 from app.models.network import DiscoveryRun, HostInventory, Neighbor
-from app.services import parsers
+from app.services import credentials as vault, discovery_probe as probe, parsers
 from app.services.device_connector import (
     DeviceConnectionError,
     DeviceCommandError,
@@ -43,8 +44,26 @@ from app.services.device_connector import (
 )
 from app.services.config_retriever import DeviceSnapshot
 from app.services.oui import ensure_populated, oui_lookup
+from app.utils.encryption import encryption_service
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_decrypt(value: Optional[str]) -> Optional[str]:
+    """
+    Decrypt a stored secret, treating a failure as absent
+
+    A credential that cannot be decrypted must not abort a crawl: the run
+    should carry on with the credentials that do work and report the device as
+    unauthenticated.
+    """
+    if not value:
+        return None
+    try:
+        return encryption_service.decrypt(value)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Could not decrypt a stored secret during discovery: {e}")
+        return None
 
 
 @dataclass
@@ -800,10 +819,15 @@ class DiscoveryService:
         """
         Register a neighbour as a managed device
 
-        Credentials come from the seed, because a discovered device has none
-        of its own and the overwhelmingly common case is one set of
-        credentials across the estate. If they are wrong, the device simply
-        fails to back up and is visible as such.
+        The device is probed before it is registered: which transport answers,
+        which vault credential authenticates, and what the device actually is.
+        A device that authenticates is marked eligible for backup; one that
+        does not is still registered - it belongs in the inventory and can be
+        crawled - but stays inactive with the reason recorded.
+
+        This used to inherit the seed's credentials, transport and device type
+        outright, which is why a crawl from one Cisco switch registered every
+        neighbour as cisco_ios over SSH and put them all on the schedule.
 
         Returns:
             The new device id, or None when it could not be registered
@@ -825,25 +849,81 @@ class DiscoveryService:
         if existing:
             return None
 
-        device_type = guess_device_type(
-            neighbor.remote_platform, seed.device_type
+        assessment = self._assess_candidate(
+            organization_id, neighbor.remote_mgmt_ip, neighbor.remote_platform, seed
         )
+
+        # Only fall back to the seed's type when nothing identified the device,
+        # and say so in the description rather than leaving a silent guess.
+        device_type = assessment.device_type
+        guessed = device_type is None
+        if guessed:
+            device_type = guess_device_type(
+                neighbor.remote_platform, seed.device_type
+            )
+
+        facts = assessment.facts or {}
+        credentials_from = "the credential vault"
+
+        # A device that authenticated keeps the credential that worked. One
+        # that did not still needs something stored, or it cannot be retried
+        # from the Devices page, so it inherits the seed's - clearly marked as
+        # unverified by last_auth_status.
+        username = seed.username
+        encrypted_password = seed.encrypted_password
+        enable_secret = seed.enable_secret
+
+        if assessment.credential_id is not None:
+            working = self.db.get(CredentialModel, assessment.credential_id)
+            if working:
+                username = working.username or seed.username
+                encrypted_password = (
+                    working.encrypted_password or seed.encrypted_password
+                )
+                enable_secret = (
+                    working.encrypted_enable_secret or seed.enable_secret
+                )
+                credentials_from = f"credential '{working.name}'"
+
+        transport = assessment.transport or seed.transport or "ssh"
+        port = seed.port
+        if transport == "telnet":
+            port = 23
+        elif transport == "ssh":
+            port = 22
 
         device = Device(
             organization_id=organization_id,
             hostname=neighbor.remote_hostname[:255],
             ip_address=neighbor.remote_mgmt_ip,
             device_type=device_type,
-            port=seed.port,
-            username=seed.username,
-            encrypted_password=seed.encrypted_password,
-            enable_secret=seed.enable_secret,
-            transport=seed.transport or "ssh",
+            port=port,
+            username=username,
+            encrypted_password=encrypted_password,
+            enable_secret=enable_secret,
+            transport=transport,
             snmp_version=seed.snmp_version,
             snmp_community=seed.snmp_community,
             snmp_port=seed.snmp_port,
-            description=f"Discovered from {seed.hostname}",
-            is_active=True,
+            description=(
+                f"Discovered from {seed.hostname}"
+                + ("" if not guessed else f"; type not identified, assumed {device_type}")
+            ),
+            # The whole point: eligible for backup only if a login worked.
+            is_active=assessment.backup_eligible,
+            last_auth_status=assessment.auth_status,
+            last_auth_at=_now(),
+            auth_error=assessment.auth_error,
+            credential_id=assessment.credential_id,
+            model=facts.get("model"),
+            serial_number=facts.get("serial_number"),
+            os_version=facts.get("os_version"),
+            snmp_sysname=facts.get("snmp_sysname"),
+            snmp_sysdescr=facts.get("snmp_sysdescr"),
+            snmp_location=facts.get("snmp_location"),
+            snmp_contact=facts.get("snmp_contact"),
+            snmp_last_polled_at=_now() if facts.get("snmp_sysdescr") else None,
+            discovered_facts=facts or None,
             discovered=True,
             discovery_source=seed.hostname,
             last_discovered_at=_now(),
@@ -860,11 +940,153 @@ class DiscoveryService:
             self.db.rollback()
             return None
 
+        self._record_probes(organization_id, device.id, assessment)
+
         logger.info(
             f"Registered discovered device {device.hostname} "
-            f"({device.ip_address}) as {device_type}"
+            f"({device.ip_address}) as {device_type} over {transport}; "
+            f"auth {assessment.auth_status} via {credentials_from}; "
+            f"backup {'enabled' if assessment.backup_eligible else 'disabled'}"
         )
         return device.id
+
+    # ------------------------------------------------------------------
+    # Probing
+    # ------------------------------------------------------------------
+
+    def _credential_attempts(self, organization_id: int, seed: Device):
+        """
+        The credentials to try against a discovered device, CLI and SNMP
+
+        The vault comes first. The seed's own credentials are appended as a
+        last resort so a crawl still works before anyone has filled the vault
+        in - that was the only behaviour before it existed.
+
+        Args:
+            organization_id: Tenant scope
+            seed: The device the crawl came from
+
+        Returns:
+            (cli attempts, snmp attempts)
+        """
+        cli = vault.list_for_kind(self.db, organization_id, vault.CLI)
+        snmp = vault.list_for_kind(self.db, organization_id, vault.SNMP)
+
+        if seed.username and seed.encrypted_password:
+            cli.append(
+                vault.CredentialAttempt(
+                    id=None,
+                    name=f"inherited from {seed.hostname}",
+                    kind=vault.CLI,
+                    username=seed.username,
+                    password=_safe_decrypt(seed.encrypted_password),
+                    enable_secret=_safe_decrypt(seed.enable_secret),
+                    ssh_key_path=seed.ssh_key_path,
+                )
+            )
+
+        if seed.snmp_version and seed.snmp_community:
+            snmp.append(
+                vault.CredentialAttempt(
+                    id=None,
+                    name=f"inherited from {seed.hostname}",
+                    kind=vault.SNMP,
+                    snmp_version=seed.snmp_version,
+                    community=_safe_decrypt(seed.snmp_community),
+                )
+            )
+
+        return cli, snmp
+
+    def _assess_candidate(
+        self,
+        organization_id: int,
+        ip_address: str,
+        platform_hint: Optional[str],
+        seed: Device,
+    ):
+        """
+        Probe a candidate device before registering it
+
+        Never raises: a probe that blows up must not abort the crawl, so a
+        failure is reported as an unreachable assessment.
+
+        Args:
+            organization_id: Tenant scope
+            ip_address: Address to probe
+            platform_hint: What the neighbour advertised itself as
+            seed: The device the crawl came from
+
+        Returns:
+            DeviceAssessment
+        """
+        cli, snmp = self._credential_attempts(organization_id, seed)
+
+        try:
+            return probe.assess(
+                ip_address,
+                cli_attempts=cli,
+                snmp_attempts=snmp,
+                platform_hint=platform_hint,
+                snmp_port=seed.snmp_port or 161,
+            )
+        except Exception as e:  # noqa: BLE001 - a crawl must survive one bad host
+            logger.warning(f"Probe of {ip_address} failed: {e}")
+            assessment = probe.DeviceAssessment()
+            assessment.auth_status = probe.ERROR
+            assessment.auth_error = str(e)[:1000]
+            return assessment
+
+    def _record_probes(
+        self, organization_id: int, device_id: int, assessment
+    ) -> None:
+        """
+        Store the latest outcome per transport for a device
+
+        Upserted on (device, transport) so a device carries the current state
+        of each rather than an ever-growing log: "SSH refused, telnet timed
+        out, 4 credentials tried" is what the Devices page needs to explain an
+        ineligible device.
+        """
+        if not assessment.probes:
+            return
+
+        rows = [
+            {
+                "organization_id": organization_id,
+                "device_id": device_id,
+                "transport": outcome.transport,
+                "result": outcome.result,
+                "credential_id": outcome.credential_id,
+                "credential_name": outcome.credential_name,
+                "attempts": outcome.attempts,
+                "message": (outcome.message or "")[:2000],
+                "duration": outcome.duration_ms,
+                "probed_at": _now(),
+            }
+            for outcome in assessment.probes
+        ]
+
+        statement = pg_insert(DeviceProbe).values(rows)
+        statement = statement.on_conflict_do_update(
+            index_elements=[DeviceProbe.device_id, DeviceProbe.transport],
+            set_={
+                "result": statement.excluded.result,
+                "credential_id": statement.excluded.credential_id,
+                "credential_name": statement.excluded.credential_name,
+                "attempts": statement.excluded.attempts,
+                "message": statement.excluded.message,
+                "duration": statement.excluded.duration,
+                "probed_at": statement.excluded.probed_at,
+            },
+        )
+        self.db.execute(statement)
+
+        for outcome in assessment.probes:
+            if outcome.credential_id is not None:
+                vault.record_outcome(
+                    self.db, outcome.credential_id, outcome.ok, commit=False
+                )
 
 
 # Platform strings LLDP and CDP report, mapped to our device types. Matched

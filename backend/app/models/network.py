@@ -113,7 +113,17 @@ class HostInventory(Base):
 
     # Filled in from ARP when the switch or a router knows the address.
     ip_address = Column(String(45), nullable=True)
+    # Entered by a person, so it survives every crawl.
     hostname = Column(String(255), nullable=True)
+
+    # Learned from LLDP or CDP on the same port, which is how a switch, an AP
+    # or a phone announces itself. Kept separate from `hostname` so a crawl
+    # never overwrites what somebody typed, and so the UI can say which of
+    # the two it is showing.
+    discovered_hostname = Column(String(255), nullable=True)
+    discovered_via = Column(String(10), nullable=True)  # lldp | cdp
+    # The neighbour's own description of itself, when it sent one.
+    discovered_platform = Column(Text, nullable=True)
 
     # Resolved from the OUI table at write time so reports and the UI do not
     # have to join on every read.

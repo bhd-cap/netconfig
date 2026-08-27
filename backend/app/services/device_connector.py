@@ -81,6 +81,7 @@ class DeviceConnector:
         timeout: Optional[int] = None,
         transport: str = "ssh",
         snmp: Optional[Dict[str, Any]] = None,
+        snmp_plaintext: bool = False,
     ):
         """
         Initialize device connector
@@ -97,7 +98,10 @@ class DeviceConnector:
             timeout: Connection timeout in seconds
             transport: 'ssh', 'telnet' or 'snmp'
             snmp: SNMP parameters when transport is 'snmp' - version,
-                community (encrypted), port, and the v3 user and keys
+                community, port, and the v3 user and keys
+            snmp_plaintext: True when the SNMP secrets in `snmp` are already
+                decrypted, as they are for a credential taken from the vault.
+                A stored device passes ciphertext and leaves this False.
         """
         self.hostname = hostname
         self.ip_address = ip_address
@@ -130,7 +134,11 @@ class DeviceConnector:
             logger.error(f"Failed to decrypt credentials for {hostname}: {str(e)}")
             raise DeviceConnectionError(f"Credential decryption failed: {str(e)}")
 
-        if self.transport == "snmp":
+        # A stored device hands over ciphertext; a vault credential is already
+        # decrypted. Which it is has to be stated rather than guessed - a
+        # plaintext community that happened to look like a token would
+        # otherwise fail decryption and be reported as a credential error.
+        if self.transport == "snmp" and not snmp_plaintext:
             self._decrypt_snmp_credentials()
 
         # Get device-specific configuration

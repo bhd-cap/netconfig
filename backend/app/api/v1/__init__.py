@@ -13,6 +13,7 @@ from app.api.v1 import (
     inventory,
     users,
     settings,
+    credentials,
 )
 
 api_router = APIRouter()
@@ -46,3 +47,8 @@ api_router.include_router(users.router, prefix="/users", tags=["users"])
 
 # Include application settings and remote backup target routes
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+
+# Include the discovery credential vault
+api_router.include_router(
+    credentials.router, prefix="/credentials", tags=["credentials"]
+)
