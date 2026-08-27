@@ -8,9 +8,12 @@ import React, { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { formatDistanceToNow } from 'date-fns';
 import { toast } from 'react-hot-toast';
+import { Link } from 'react-router-dom';
 import {
   AlertCircle,
+  AlertTriangle,
   CheckCircle2,
+  KeyRound,
   Loader2,
   Play,
   RefreshCw,
@@ -19,7 +22,13 @@ import {
 } from 'lucide-react';
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
-import { Device, DiscoveryRun, Neighbor, PaginatedResponse } from '../types';
+import {
+  CredentialSummary,
+  Device,
+  DiscoveryRun,
+  Neighbor,
+  PaginatedResponse,
+} from '../types';
 
 const RUNNING_STATUSES = new Set(['running', 'pending']);
 
@@ -51,6 +60,15 @@ export const Discovery: React.FC = () => {
     queryKey: ['devices', 'for-discovery'],
     queryFn: async () =>
       (await api.get('/devices', { params: { limit: 100 } })).data,
+  });
+
+  // Worth knowing before a crawl rather than after: with no CLI credentials
+  // it maps the topology but authenticates nothing, so nothing it finds
+  // becomes eligible for backup.
+  const { data: credentials } = useQuery<CredentialSummary>({
+    queryKey: ['credential-summary'],
+    queryFn: async () => (await api.get('/credentials/summary')).data,
+    retry: false,
   });
 
   const { data: runs } = useQuery<DiscoveryRun[]>({
@@ -180,6 +198,45 @@ export const Discovery: React.FC = () => {
             </div>
           </div>
 
+          {/* What the crawl will authenticate with */}
+          {credentials && (
+            <div
+              className={`mt-4 rounded border p-3 text-sm flex items-start gap-2 ${
+                credentials.cli > 0
+                  ? 'border-gray-200 bg-gray-50'
+                  : 'border-amber-200 bg-amber-50'
+              }`}
+            >
+              {credentials.cli > 0 ? (
+                <KeyRound className="h-4 w-4 text-gray-500 mt-0.5 shrink-0" />
+              ) : (
+                <AlertTriangle className="h-4 w-4 text-amber-600 mt-0.5 shrink-0" />
+              )}
+              <div>
+                {credentials.cli > 0 ? (
+                  <p className="text-gray-700">
+                    {credentials.cli} CLI login
+                    {credentials.cli === 1 ? '' : 's'} and {credentials.snmp} SNMP
+                    credential{credentials.snmp === 1 ? '' : 's'} will be tried,
+                    in vault order, against everything found.
+                  </p>
+                ) : (
+                  <p className="text-amber-900">
+                    No CLI logins are in the vault. The crawl will still map the
+                    topology, but nothing it finds can authenticate, so nothing
+                    becomes eligible for backup.
+                  </p>
+                )}
+                <Link
+                  to="/settings"
+                  className="text-xs text-blue-600 hover:text-blue-800"
+                >
+                  Manage the credential vault →
+                </Link>
+              </div>
+            </div>
+          )}
+
           <div className="flex flex-wrap gap-6 mt-4 text-sm">
             <label className="flex items-center gap-2 cursor-pointer">
               <input
@@ -189,7 +246,8 @@ export const Discovery: React.FC = () => {
               />
               Add discovered neighbours as devices
               <span className="text-xs text-gray-500">
-                (they inherit the seed's credentials)
+                (each is probed with the vault; only one that logs in is added to
+                the backup list)
               </span>
             </label>
 

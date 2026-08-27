@@ -4,6 +4,12 @@
  * Draws the graph the backend derives from LLDP and CDP adjacencies, and lets
  * it be rearranged and saved.
  *
+ * Only infrastructure is drawn by default - the core, what hangs off it, and
+ * unmanaged switches and firewalls at the edge. End hosts are a drill-down:
+ * a switch with 200 MACs behind it makes a diagram nobody can read, and those
+ * hosts are already in the inventory. Click a node and ask for its hosts to
+ * unfold just that one.
+ *
  * The graph itself is never stored. A saved diagram holds only the edits -
  * positions, renamed labels, hidden nodes, hand-drawn links - so a device
  * discovered after the diagram was saved still appears, and a layout someone
@@ -13,21 +19,29 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-hot-toast';
 import {
+  ExternalLink,
   Eye,
   EyeOff,
+  Layers,
   Link2,
   Loader2,
+  Maximize2,
+  Minimize2,
   Network,
   Plus,
   RefreshCw,
   Save,
   Trash2,
+  Users,
   X,
 } from 'lucide-react';
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
 import {
+  ALL_TIERS,
   DiagramLayout,
+  INFRASTRUCTURE_TIERS,
+  Tier,
   TopologyDiagram,
   TopologyGraph,
   TopologyLink,
@@ -38,39 +52,80 @@ const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 720;
 const NODE_RADIUS = 26;
 
+/** Top of the diagram to the bottom: the core first, end hosts last. */
+const TIER_ROWS: Tier[] = ['core', 'distribution', 'access', 'edge', 'host'];
+
+const TIER_LABELS: Record<Tier, string> = {
+  core: 'Core',
+  distribution: 'Distribution',
+  access: 'Access',
+  edge: 'Unmanaged edge',
+  host: 'End hosts',
+};
+
+const TIER_HINTS: Record<Tier, string> = {
+  core: 'Managed devices linking several others together',
+  distribution: 'Managed devices linking at least one other',
+  access: 'Managed devices with nothing further behind them',
+  edge: 'Switches, firewalls and routers we do not manage',
+  host: 'Phones, access points and workstations - usually best left folded',
+};
+
 interface Positioned extends TopologyNode {
   x: number;
   y: number;
+}
+
+function tierOf(node: TopologyNode): Tier {
+  return node.tier ?? (node.managed ? 'access' : 'host');
 }
 
 /**
  * Give every node a position
  *
  * A node the saved layout already places keeps that position. Everything else
- * is laid out on a circle, which keeps a fresh graph readable without pulling
- * in a physics library: nodes never overlap and the edges are all visible.
+ * is laid out in rows by tier, core at the top, which is what makes the shape
+ * of the network readable without pulling in a physics library: the core sits
+ * above the switches that hang off it, and drilled-in hosts appear underneath
+ * them.
  */
 function placeNodes(nodes: TopologyNode[]): Positioned[] {
   const unplaced = nodes.filter((node) => node.x == null || node.y == null);
-  const radius = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) / 2 - NODE_RADIUS * 3;
-  const centreX = CANVAS_WIDTH / 2;
-  const centreY = CANVAS_HEIGHT / 2;
 
-  let index = 0;
+  const byTier = new Map<Tier, TopologyNode[]>();
+  unplaced.forEach((node) => {
+    const tier = tierOf(node);
+    const row = byTier.get(tier);
+    if (row) row.push(node);
+    else byTier.set(tier, [node]);
+  });
+
+  const rows = TIER_ROWS.filter((tier) => byTier.has(tier));
+  const rowHeight = CANVAS_HEIGHT / (rows.length + 1);
+
+  const placement = new Map<string, { x: number; y: number }>();
+
+  rows.forEach((tier, rowIndex) => {
+    const row = byTier.get(tier)!;
+    row.forEach((node, index) => {
+      placement.set(node.key, {
+        x: (CANVAS_WIDTH * (index + 1)) / (row.length + 1),
+        y: rowHeight * (rowIndex + 1),
+      });
+    });
+  });
 
   return nodes.map((node) => {
     if (node.x != null && node.y != null) {
       return { ...node, x: node.x, y: node.y } as Positioned;
     }
 
-    const angle = (2 * Math.PI * index) / Math.max(unplaced.length, 1);
-    index += 1;
+    const spot = placement.get(node.key) ?? {
+      x: CANVAS_WIDTH / 2,
+      y: CANVAS_HEIGHT / 2,
+    };
 
-    return {
-      ...node,
-      x: centreX + radius * Math.cos(angle),
-      y: centreY + radius * Math.sin(angle),
-    } as Positioned;
+    return { ...node, ...spot } as Positioned;
   });
 }
 
@@ -80,6 +135,14 @@ function nodeColour(node: TopologyNode): string {
   if (node.last_backup_status === 'failed') return '#ef4444';
   if (node.last_backup_status === 'success') return '#10b981';
   return '#3b82f6';
+}
+
+/** The core is drawn largest, an end host smallest. */
+function nodeRadius(node: TopologyNode): number {
+  const tier = tierOf(node);
+  if (tier === 'core') return NODE_RADIUS + 6;
+  if (tier === 'host') return NODE_RADIUS - 10;
+  return NODE_RADIUS;
 }
 
 export const Topology: React.FC = () => {
@@ -93,6 +156,20 @@ export const Topology: React.FC = () => {
   const [includeUnmanaged, setIncludeUnmanaged] = useState(true);
   const [activeOnly, setActiveOnly] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
+
+  // Infrastructure only to begin with. The host tier is opt-in because it is
+  // what turns a diagram into a hairball.
+  const [tiers, setTiers] = useState<Tier[]>([...INFRASTRUCTURE_TIERS]);
+
+  // Node keys whose end hosts have been unfolded - the drill-down.
+  const [expanded, setExpanded] = useState<string[]>([]);
+
+  // Opened with ?view=full - the "open in a new tab" link lands here.
+  const [fullscreen, setFullscreen] = useState(
+    () =>
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('view') === 'full'
+  );
 
   const [nodes, setNodes] = useState<Positioned[]>([]);
   const [links, setLinks] = useState<TopologyLink[]>([]);
@@ -112,15 +189,27 @@ export const Topology: React.FC = () => {
     refetch,
     isFetching,
   } = useQuery<TopologyGraph>({
-    queryKey: ['topology', diagramId, activeOnly, includeUnmanaged],
+    queryKey: [
+      'topology',
+      diagramId,
+      activeOnly,
+      includeUnmanaged,
+      tiers.join(','),
+      expanded.join(','),
+    ],
     queryFn: async () => {
       const params: Record<string, any> = {
         active_only: activeOnly,
         include_unmanaged: includeUnmanaged,
+        tiers: tiers.join(','),
       };
+      if (expanded.length) params.expand = expanded.join(',');
       if (diagramId) params.diagram_id = diagramId;
       return (await api.get('/discovery/topology', { params })).data;
     },
+    // An empty tier selection would ask the API for nothing, and its default
+    // would quietly put the infrastructure back.
+    enabled: tiers.length > 0,
   });
 
   // Pick up the default diagram the first time the list arrives, so the
@@ -132,15 +221,71 @@ export const Topology: React.FC = () => {
     }
   }, [diagrams, diagramId]);
 
-  // Reset the working copy whenever a fresh graph arrives. Unsaved drags are
-  // deliberately discarded here - the refresh was asked for.
+  // Fold the fresh graph into the working copy. Positions, renames and hidden
+  // flags from this session are kept: drilling into a switch refetches, and
+  // losing a half-arranged layout to a drill-down click would be maddening.
   useEffect(() => {
     if (!graph) return;
-    setNodes(placeNodes(graph.nodes));
-    setLinks(graph.links);
-    setDirty(false);
+
+    setNodes((current) => {
+      const previous = new Map(current.map((node) => [node.key, node]));
+
+      return placeNodes(
+        graph.nodes.map((node) => {
+          const seen = previous.get(node.key);
+          if (!seen) return node;
+          return {
+            ...node,
+            x: seen.x,
+            y: seen.y,
+            hidden: seen.hidden,
+            label: seen.label,
+          };
+        })
+      );
+    });
+
+    setLinks((current) => {
+      // The API already returns the saved diagram's manual links; these are
+      // the ones drawn since the last save.
+      const fresh = new Set(graph.links.map((link) => link.key));
+      const unsavedManual = current.filter(
+        (link) => link.manual && !fresh.has(link.key)
+      );
+      const hiddenHere = new Set(
+        current.filter((link) => link.hidden).map((link) => link.key)
+      );
+
+      return [
+        ...graph.links.map((link) =>
+          hiddenHere.has(link.key) ? { ...link, hidden: true } : link
+        ),
+        ...unsavedManual,
+      ];
+    });
+
     setLinkFrom(null);
   }, [graph]);
+
+  // Switching diagram is a fresh start; whatever was unsaved belonged to the
+  // diagram being left.
+  useEffect(() => {
+    setDirty(false);
+    setExpanded([]);
+  }, [diagramId]);
+
+  // Escape leaves the expanded view, which is the only way out when the page
+  // is covering the navigation.
+  useEffect(() => {
+    if (!fullscreen) return;
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false);
+    };
+
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [fullscreen]);
 
   const nodesByKey = useMemo(() => {
     const map = new Map<string, Positioned>();
@@ -165,6 +310,40 @@ export const Topology: React.FC = () => {
       }),
     [links, nodesByKey, showHidden]
   );
+
+  // --------------------------------------------------------- tiers and hosts
+
+  const showingHosts = tiers.includes('host');
+
+  const toggleTier = (tier: Tier) => {
+    setTiers((current) => {
+      if (current.includes(tier)) {
+        // Something has to be left on the canvas.
+        if (current.length === 1) return current;
+        return current.filter((entry) => entry !== tier);
+      }
+      // Kept in tier order so the chips and the query string read the same
+      // way whichever order they were clicked in.
+      return ALL_TIERS.filter((entry) => entry === tier || current.includes(entry));
+    });
+    setSelected(null);
+  };
+
+  const toggleExpanded = (key: string) => {
+    setExpanded((current) =>
+      current.includes(key)
+        ? current.filter((entry) => entry !== key)
+        : [...current, key]
+    );
+  };
+
+  /** Open the diagram on its own, with the whole window to work with */
+  const openInNewTab = () => {
+    const url = new URL(window.location.href);
+    url.pathname = '/topology';
+    url.searchParams.set('view', 'full');
+    window.open(url.toString(), '_blank', 'noopener');
+  };
 
   // ---------------------------------------------------------------- dragging
 
@@ -360,12 +539,20 @@ export const Topology: React.FC = () => {
   }
 
   return (
-    <div className="space-y-4">
+    <div
+      className={
+        fullscreen
+          ? 'fixed inset-0 z-40 bg-gray-50 overflow-y-auto p-4 space-y-4'
+          : 'space-y-4'
+      }
+    >
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Network Topology</h1>
           <p className="text-gray-600">
-            Built from LLDP and CDP adjacencies. Drag to rearrange, then save.
+            Infrastructure built from LLDP and CDP adjacencies. Drag to
+            rearrange, then save.
+            {fullscreen && ' Press Esc to leave full screen.'}
           </p>
         </div>
 
@@ -394,6 +581,34 @@ export const Topology: React.FC = () => {
               className={`h-4 w-4 mr-2 ${isFetching ? 'animate-spin' : ''}`}
             />
             Refresh
+          </button>
+
+          <button
+            onClick={() => setFullscreen((current) => !current)}
+            data-testid="topology-fullscreen"
+            className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
+            title={
+              fullscreen
+                ? 'Back to the normal layout (Esc)'
+                : 'Use the whole window'
+            }
+          >
+            {fullscreen ? (
+              <Minimize2 className="h-4 w-4 mr-2" />
+            ) : (
+              <Maximize2 className="h-4 w-4 mr-2" />
+            )}
+            {fullscreen ? 'Exit full screen' : 'Full screen'}
+          </button>
+
+          <button
+            onClick={openInNewTab}
+            data-testid="topology-new-tab"
+            className="inline-flex items-center px-3 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50"
+            title="Open the diagram in its own tab"
+          >
+            <ExternalLink className="h-4 w-4 mr-2" />
+            New tab
           </button>
 
           {canEdit && (
@@ -430,6 +645,57 @@ export const Topology: React.FC = () => {
             </>
           )}
         </div>
+      </div>
+
+      {/* Layers */}
+      <div className="bg-white rounded-lg shadow p-4 space-y-3">
+        <div className="flex flex-wrap items-center gap-2">
+          <Layers className="h-4 w-4 text-gray-400" />
+          <span className="text-sm text-gray-700 mr-2">Layers</span>
+
+          {ALL_TIERS.map((tier) => {
+            const on = tiers.includes(tier);
+            const count = graph?.stats.by_tier?.[tier] ?? 0;
+
+            return (
+              <button
+                key={tier}
+                onClick={() => toggleTier(tier)}
+                data-testid={`tier-${tier}`}
+                aria-pressed={on}
+                title={TIER_HINTS[tier]}
+                className={`px-3 py-1.5 rounded-full text-xs font-medium border transition ${
+                  on
+                    ? 'bg-blue-600 border-blue-600 text-white'
+                    : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                {TIER_LABELS[tier]}
+                {on && count ? ` · ${count}` : ''}
+              </button>
+            );
+          })}
+
+          {expanded.length > 0 && (
+            <button
+              onClick={() => setExpanded([])}
+              className="ml-2 px-3 py-1.5 rounded-full text-xs border border-purple-300 bg-purple-50 text-purple-800 hover:bg-purple-100"
+              title="Fold every drilled-in node back up"
+            >
+              Fold {expanded.length} drill-down{expanded.length > 1 ? 's' : ''}
+            </button>
+          )}
+        </div>
+
+        {!showingHosts && (graph?.stats.hidden_hosts ?? 0) > 0 && (
+          <p className="text-xs text-gray-500 flex items-center gap-1.5">
+            <Users className="h-3.5 w-3.5" />
+            {graph?.stats.hidden_hosts?.toLocaleString()} end host
+            {graph?.stats.hidden_hosts === 1 ? '' : 's'} folded away. Click a
+            node and drill in to see what is behind that one, or turn on the
+            end-host layer to see them all.
+          </p>
+        )}
       </div>
 
       {/* Filters and counts */}
@@ -488,9 +754,17 @@ export const Topology: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-4">
+      <div
+        className={`grid grid-cols-1 gap-4 ${
+          fullscreen ? 'lg:grid-cols-5' : 'lg:grid-cols-4'
+        }`}
+      >
         {/* Canvas */}
-        <div className="lg:col-span-3 bg-white rounded-lg shadow overflow-hidden">
+        <div
+          className={`bg-white rounded-lg shadow overflow-hidden ${
+            fullscreen ? 'lg:col-span-4' : 'lg:col-span-3'
+          }`}
+        >
           {visibleNodes.length === 0 ? (
             <div className="p-12 text-center text-gray-500">
               <Network className="h-12 w-12 mx-auto mb-4 text-gray-300" />
@@ -504,7 +778,9 @@ export const Topology: React.FC = () => {
               ref={svgRef}
               data-testid="topology-canvas"
               viewBox={`0 0 ${CANVAS_WIDTH} ${CANVAS_HEIGHT}`}
-              className="w-full h-[520px] select-none"
+              className={`w-full select-none ${
+                fullscreen ? 'h-[calc(100vh-19rem)] min-h-[400px]' : 'h-[520px]'
+              }`}
               onMouseMove={handleMouseMove}
               onMouseUp={() => setDragging(null)}
               onMouseLeave={() => setDragging(null)}
@@ -553,49 +829,91 @@ export const Topology: React.FC = () => {
                 );
               })}
 
-              {visibleNodes.map((node) => (
-                <g
-                  key={node.key}
-                  data-node-key={node.key}
-                  transform={`translate(${node.x}, ${node.y})`}
-                  onMouseDown={() => canEdit && setDragging(node.key)}
-                  onClick={() => handleNodeClick(node.key)}
-                  className={canEdit ? 'cursor-move' : 'cursor-pointer'}
-                  opacity={node.hidden ? 0.35 : 1}
-                >
-                  <circle
-                    r={NODE_RADIUS}
-                    fill={nodeColour(node)}
-                    stroke={selected === node.key ? '#1d4ed8' : '#ffffff'}
-                    strokeWidth={selected === node.key ? 4 : 2}
-                  />
-                  {!node.managed && (
+              {visibleNodes.map((node) => {
+                const radius = nodeRadius(node);
+                const hosts = node.host_count ?? 0;
+                const drilled = expanded.includes(node.key);
+
+                return (
+                  <g
+                    key={node.key}
+                    data-node-key={node.key}
+                    data-tier={tierOf(node)}
+                    transform={`translate(${node.x}, ${node.y})`}
+                    onMouseDown={() => canEdit && setDragging(node.key)}
+                    onClick={() => handleNodeClick(node.key)}
+                    className={canEdit ? 'cursor-move' : 'cursor-pointer'}
+                    opacity={node.hidden ? 0.35 : 1}
+                  >
                     <circle
-                      r={NODE_RADIUS}
-                      fill="none"
-                      stroke="#64748b"
-                      strokeWidth={2}
-                      strokeDasharray="4 3"
+                      r={radius}
+                      fill={nodeColour(node)}
+                      stroke={selected === node.key ? '#1d4ed8' : '#ffffff'}
+                      strokeWidth={selected === node.key ? 4 : 2}
                     />
-                  )}
-                  <text
-                    y={NODE_RADIUS + 16}
-                    textAnchor="middle"
-                    fontSize={12}
-                    className="fill-gray-900 font-medium"
-                  >
-                    {node.label}
-                  </text>
-                  <text
-                    y={4}
-                    textAnchor="middle"
-                    fontSize={11}
-                    className="fill-white font-semibold"
-                  >
-                    {node.link_count}
-                  </text>
-                </g>
-              ))}
+                    {!node.managed && (
+                      <circle
+                        r={radius}
+                        fill="none"
+                        stroke="#64748b"
+                        strokeWidth={2}
+                        strokeDasharray="4 3"
+                      />
+                    )}
+                    <text
+                      y={radius + 16}
+                      textAnchor="middle"
+                      fontSize={12}
+                      className="fill-gray-900 font-medium"
+                    >
+                      {node.label}
+                    </text>
+                    <text
+                      y={4}
+                      textAnchor="middle"
+                      fontSize={11}
+                      className="fill-white font-semibold"
+                    >
+                      {node.link_count}
+                    </text>
+
+                    {/* How many end hosts are behind this node, so the
+                        drill-down is discoverable without expanding it. */}
+                    {hosts > 0 && !showingHosts && (
+                      <g
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          toggleExpanded(node.key);
+                        }}
+                        data-testid={`drill-${node.key}`}
+                        className="cursor-pointer"
+                      >
+                        <circle
+                          cx={radius - 2}
+                          cy={-radius + 2}
+                          r={11}
+                          fill={drilled ? '#7c3aed' : '#ffffff'}
+                          stroke={drilled ? '#7c3aed' : '#94a3b8'}
+                          strokeWidth={1.5}
+                        />
+                        <text
+                          x={radius - 2}
+                          y={-radius + 6}
+                          textAnchor="middle"
+                          fontSize={10}
+                          className={
+                            drilled
+                              ? 'fill-white font-semibold'
+                              : 'fill-gray-700 font-semibold'
+                          }
+                        >
+                          {drilled ? '−' : hosts > 99 ? '99+' : hosts}
+                        </text>
+                      </g>
+                    )}
+                  </g>
+                );
+              })}
             </svg>
           )}
 
@@ -619,6 +937,12 @@ export const Topology: React.FC = () => {
             <span className="flex items-center gap-1">
               <span className="inline-block h-3 w-6 border-t-2 border-dashed border-purple-500" />
               Hand-drawn link
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-flex items-center justify-center h-4 w-4 rounded-full border border-gray-400 text-[9px] font-semibold text-gray-700">
+                n
+              </span>
+              End hosts behind it - click to drill in
             </span>
           </div>
         </div>
@@ -649,8 +973,25 @@ export const Topology: React.FC = () => {
                 </div>
                 <p className="text-xs text-gray-500 mt-1">
                   {selectedNode.managed ? 'Managed device' : 'Unmanaged neighbour'}
+                  {' · '}
+                  {TIER_LABELS[tierOf(selectedNode)]}
                 </p>
               </div>
+
+              {/* Drill-down: unfold just this node's end hosts */}
+              {(selectedNode.host_count ?? 0) > 0 && !showingHosts && (
+                <button
+                  onClick={() => toggleExpanded(selectedNode.key)}
+                  className="w-full inline-flex items-center justify-center px-3 py-2 border border-purple-300 bg-purple-50 text-purple-800 rounded text-sm hover:bg-purple-100"
+                >
+                  <Users className="h-4 w-4 mr-2" />
+                  {expanded.includes(selectedNode.key)
+                    ? 'Fold its hosts away'
+                    : `Show its ${selectedNode.host_count} end host${
+                        selectedNode.host_count === 1 ? '' : 's'
+                      }`}
+                </button>
+              )}
 
               <dl className="text-sm space-y-1">
                 {selectedNode.ip_address && (

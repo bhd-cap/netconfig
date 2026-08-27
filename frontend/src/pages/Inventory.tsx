@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
+import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
 import {
   Device,
   HostInventoryEntry,
@@ -58,6 +59,7 @@ export const Inventory: React.FC = () => {
   const [activeOnly, setActiveOnly] = useState(true);
   const [seenWithin, setSeenWithin] = useState('');
   const [editing, setEditing] = useState<HostInventoryEntry | null>(null);
+  const [detailDeviceId, setDetailDeviceId] = useState<number | null>(null);
 
   const { data: devices } = useQuery<PaginatedResponse<Device>>({
     queryKey: ['devices', 'for-inventory'],
@@ -443,6 +445,9 @@ export const Inventory: React.FC = () => {
                       Address
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
+                      Discovered name
+                    </th>
+                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
                       Switch
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
@@ -477,8 +482,43 @@ export const Inventory: React.FC = () => {
                           <p className="text-xs text-gray-500">{row.hostname}</p>
                         )}
                       </td>
+                      {/* What the host itself announced over LLDP or CDP, as
+                          opposed to the name a person typed in. */}
+                      <td className="px-4 py-3 text-gray-700">
+                        {row.discovered_hostname ? (
+                          <>
+                            <span
+                              className="text-gray-900"
+                              title={row.discovered_platform ?? undefined}
+                            >
+                              {row.discovered_hostname}
+                            </span>
+                            {row.discovered_via && (
+                              <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-800 rounded text-xs uppercase">
+                                {row.discovered_via}
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-gray-400">—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-900">
-                        {row.device_hostname}
+                        {row.device_id ? (
+                          <button
+                            type="button"
+                            onClick={() => setDetailDeviceId(row.device_id!)}
+                            data-testid={`inventory-switch-${row.id}`}
+                            className="text-blue-600 hover:text-blue-800 hover:underline"
+                            title="Show everything known about this switch"
+                          >
+                            {row.device_hostname}
+                          </button>
+                        ) : (
+                          <span title="This device is no longer on the backup list">
+                            {row.device_hostname}
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-gray-700">{row.interface}</td>
                       <td className="px-4 py-3 text-gray-700">
@@ -537,6 +577,14 @@ export const Inventory: React.FC = () => {
         )}
       </div>
 
+      {/* Drill into the switch a host was seen on */}
+      {detailDeviceId !== null && (
+        <DeviceDetailPanel
+          deviceId={detailDeviceId}
+          onClose={() => setDetailDeviceId(null)}
+        />
+      )}
+
       {/* Annotate */}
       {editing && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -544,10 +592,23 @@ export const Inventory: React.FC = () => {
             <h3 className="text-lg font-semibold text-gray-900 mb-1">
               Annotate host
             </h3>
-            <p className="font-mono text-xs text-gray-500 mb-4">
+            <p className="font-mono text-xs text-gray-500 mb-1">
               {editing.mac_address} on {editing.device_hostname}{' '}
               {editing.interface}
             </p>
+
+            {editing.discovered_hostname && (
+              <p className="text-xs text-gray-500 mb-4">
+                It announces itself as{' '}
+                <span className="font-medium text-gray-700">
+                  {editing.discovered_hostname}
+                </span>
+                {editing.discovered_via
+                  ? ` over ${editing.discovered_via.toUpperCase()}`
+                  : ''}
+                .
+              </p>
+            )}
 
             <form
               onSubmit={(event) => {
@@ -559,7 +620,7 @@ export const Inventory: React.FC = () => {
                   notes: String(form.get('notes') ?? ''),
                 });
               }}
-              className="space-y-4"
+              className="space-y-4 mt-4"
             >
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">

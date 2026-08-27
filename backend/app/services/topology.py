@@ -49,8 +49,10 @@ _INFRASTRUCTURE_CAPABILITIES = ("router", "bridge", "switch", "l3", "l2", "trans
 _HOST_CAPABILITIES = ("phone", "station", "host", "telephone")
 
 # A managed device linking to at least this many other managed devices is
-# treated as core. Two is deliberate: a device between two others is already
-# carrying transit traffic.
+# treated as core. Three is deliberate: a device between two others is
+# carrying transit traffic, but that describes every switch in a chain as
+# much as it describes a hub. Three separate neighbours is where the middle
+# of the network actually is.
 CORE_LINK_THRESHOLD = 3
 
 

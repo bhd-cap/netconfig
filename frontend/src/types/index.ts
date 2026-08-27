@@ -49,9 +49,20 @@ export interface Device extends DeviceSnmpFields {
   last_backup_at?: string;
   last_backup_status?: string;
   organization_id: number;
+  location?: string | null;
+  description?: string | null;
   // Set when a discovery crawl registered the device rather than a person.
   discovered?: boolean;
+  discovery_source?: string | null;
   last_discovered_at?: string | null;
+  // Whether a CLI login has actually succeeded. A device is only worth
+  // scheduling for backup when it has.
+  last_auth_status?: AuthStatus;
+  last_auth_at?: string | null;
+  auth_error?: string | null;
+  model?: string | null;
+  serial_number?: string | null;
+  os_version?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -407,6 +418,14 @@ export interface Neighbor {
 
 export interface TopologyNode {
   key: string;
+  // Which layer of the network this sits in. The default view returns
+  // infrastructure only; hosts appear on drill-down.
+  tier?: Tier;
+  // How many end hosts hang off this node, so a drill-down can be offered
+  // without having fetched them.
+  host_count?: number;
+  infrastructure_links?: number;
+  capabilities?: string | null;
   id: number | null;
   label: string;
   type: 'device' | 'unmanaged';
@@ -451,6 +470,10 @@ export interface TopologyGraph {
     links: number;
     isolated_nodes: number;
     manual_links?: number;
+    hidden_hosts?: number;
+    total_hosts?: number;
+    tiers?: string[];
+    by_tier?: Record<string, number>;
   };
   diagram?: { id: number; name: string };
 }
@@ -484,14 +507,20 @@ export interface TopologyDiagram {
 
 export interface HostInventoryEntry {
   id: number;
-  device_id: number;
+  // Null once the switch is deleted; the row survives as history.
+  device_id?: number | null;
   device_hostname?: string;
   interface: string;
   mac_address: string;
   vlan?: number | null;
   entry_type?: string | null;
   ip_address?: string | null;
+  // Entered by a person.
   hostname?: string | null;
+  // Announced by the host over LLDP or CDP on this port.
+  discovered_hostname?: string | null;
+  discovered_via?: string | null;
+  discovered_platform?: string | null;
   vendor?: string | null;
   first_seen: string;
   last_seen: string;
@@ -698,3 +727,159 @@ export const WEEKDAYS = [
   'Saturday',
   'Sunday',
 ] as const;
+
+// ---------------------------------------------------------------------------
+// Credential vault
+// ---------------------------------------------------------------------------
+
+export type CredentialKind = 'cli' | 'snmp';
+
+export interface Credential {
+  id: number;
+  name: string;
+  description?: string | null;
+  kind: CredentialKind;
+  priority: number;
+  is_enabled: boolean;
+
+  username?: string | null;
+  ssh_key_path?: string | null;
+
+  snmp_version?: '1' | '2c' | '3' | null;
+  snmp_v3_user?: string | null;
+  snmp_v3_auth_protocol?: string | null;
+  snmp_v3_priv_protocol?: string | null;
+
+  // Secrets are write-only: a read says only whether one is stored.
+  has_password: boolean;
+  has_enable_secret: boolean;
+  has_community: boolean;
+  has_v3_auth_key: boolean;
+  has_v3_priv_key: boolean;
+
+  success_count: number;
+  failure_count: number;
+  last_success_at?: string | null;
+  last_failure_at?: string | null;
+  created_at: string;
+  updated_at?: string | null;
+}
+
+export interface CredentialSummary {
+  cli: number;
+  snmp: number;
+  disabled: number;
+  total: number;
+}
+
+export interface CredentialTestResult {
+  success: boolean;
+  credential: string;
+  device: string;
+  transport: string;
+  result: string;
+  message: string;
+  duration_ms: number;
+  facts: Record<string, any>;
+}
+
+// ---------------------------------------------------------------------------
+// Topology tiers
+// ---------------------------------------------------------------------------
+
+export type Tier = 'core' | 'distribution' | 'access' | 'edge' | 'host';
+
+export const INFRASTRUCTURE_TIERS: Tier[] = [
+  'core',
+  'distribution',
+  'access',
+  'edge',
+];
+
+export const ALL_TIERS: Tier[] = [...INFRASTRUCTURE_TIERS, 'host'];
+
+// ---------------------------------------------------------------------------
+// Device detail
+// ---------------------------------------------------------------------------
+
+export type AuthStatus = 'never' | 'success' | 'auth_failed' | 'unreachable' | 'error';
+
+export interface DeviceProbeResult {
+  transport: string;
+  result: string;
+  credential_name?: string | null;
+  attempts: number;
+  message?: string | null;
+  duration_ms?: number | null;
+  probed_at: string;
+}
+
+export interface DeviceDetail {
+  device: {
+    id: number;
+    hostname: string;
+    ip_address: string;
+    device_type: string;
+    transport: string;
+    port: number;
+    username: string;
+    location?: string | null;
+    description?: string | null;
+    tags?: Record<string, any> | null;
+    is_active: boolean;
+    discovered: boolean;
+    discovery_source?: string | null;
+    last_discovered_at?: string | null;
+    last_backup_at?: string | null;
+    last_backup_status?: string | null;
+    created_at: string;
+  };
+  authentication: {
+    status: AuthStatus;
+    at?: string | null;
+    error?: string | null;
+    credential_id?: number | null;
+    credential_name?: string | null;
+    backup_eligible: boolean;
+  };
+  facts: {
+    model?: string | null;
+    serial_number?: string | null;
+    os_version?: string | null;
+    snmp_sysname?: string | null;
+    snmp_sysdescr?: string | null;
+    snmp_location?: string | null;
+    snmp_contact?: string | null;
+    snmp_uptime_seconds?: number | null;
+    snmp_last_polled_at?: string | null;
+    extra: Record<string, any>;
+  };
+  probes: DeviceProbeResult[];
+  neighbors: Array<{
+    local_interface: string;
+    remote_hostname: string;
+    remote_interface?: string | null;
+    remote_platform?: string | null;
+    remote_mgmt_ip?: string | null;
+    remote_device_id?: number | null;
+    protocol: string;
+    is_active: boolean;
+    last_seen: string;
+  }>;
+  hosts: {
+    total: number;
+    active: number;
+    ports_in_use: number;
+  };
+}
+
+export interface BulkDeviceUpdate {
+  device_ids: number[];
+  is_active?: boolean;
+  device_type?: string;
+  transport?: Transport;
+  port?: number;
+  location?: string;
+  description?: string;
+  tags?: Record<string, any>;
+}

@@ -966,6 +966,42 @@ class DiscoveryService:
         elif transport == "ssh":
             port = 22
 
+        # Store the SNMP credential that actually answered, not the seed's.
+        # A device found with the vault's third community would otherwise be
+        # polled with the seed's first one on every later crawl and go quiet.
+        snmp_fields = {
+            "snmp_version": seed.snmp_version,
+            "snmp_community": seed.snmp_community,
+            "snmp_v3_user": seed.snmp_v3_user,
+            "snmp_v3_auth_key": seed.snmp_v3_auth_key,
+            "snmp_v3_priv_key": seed.snmp_v3_priv_key,
+            "snmp_v3_auth_protocol": seed.snmp_v3_auth_protocol,
+            "snmp_v3_priv_protocol": seed.snmp_v3_priv_protocol,
+        }
+
+        snmp_probe = assessment.probe_for("snmp")
+        if snmp_probe is not None and snmp_probe.ok and snmp_probe.credential_id:
+            answered = self.db.get(CredentialModel, snmp_probe.credential_id)
+            if answered:
+                snmp_fields.update(
+                    {
+                        "snmp_version": answered.snmp_version
+                        or snmp_fields["snmp_version"],
+                        "snmp_community": answered.encrypted_community
+                        or snmp_fields["snmp_community"],
+                        "snmp_v3_user": answered.snmp_v3_user
+                        or snmp_fields["snmp_v3_user"],
+                        "snmp_v3_auth_key": answered.encrypted_v3_auth_key
+                        or snmp_fields["snmp_v3_auth_key"],
+                        "snmp_v3_priv_key": answered.encrypted_v3_priv_key
+                        or snmp_fields["snmp_v3_priv_key"],
+                        "snmp_v3_auth_protocol": answered.snmp_v3_auth_protocol
+                        or snmp_fields["snmp_v3_auth_protocol"],
+                        "snmp_v3_priv_protocol": answered.snmp_v3_priv_protocol
+                        or snmp_fields["snmp_v3_priv_protocol"],
+                    }
+                )
+
         device = Device(
             organization_id=organization_id,
             hostname=neighbor.remote_hostname[:255],
@@ -976,9 +1012,8 @@ class DiscoveryService:
             encrypted_password=encrypted_password,
             enable_secret=enable_secret,
             transport=transport,
-            snmp_version=seed.snmp_version,
-            snmp_community=seed.snmp_community,
             snmp_port=seed.snmp_port,
+            **snmp_fields,
             description=(
                 f"Discovered from {seed.hostname}"
                 + ("" if not guessed else f"; type not identified, assumed {device_type}")

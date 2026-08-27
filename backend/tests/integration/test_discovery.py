@@ -521,6 +521,78 @@ def test_crawl_auto_add_registers_discovered_devices(db, org, devices, service):
     assert created.encrypted_password == devices[0].encrypted_password
 
 
+def test_discovered_device_keeps_the_snmp_credential_that_answered(
+    db, org, devices, service
+):
+    """
+    The community that answered is what gets stored
+
+    Otherwise a device found with the vault's second community would be polled
+    with the seed's first one on every later crawl, and go quiet.
+    """
+    from app.models.credential import Credential
+    from app.services import discovery_probe as probe
+
+    answered = Credential(
+        organization_id=org.id,
+        name="site community",
+        kind="snmp",
+        priority=10,
+        is_enabled=True,
+        snmp_version="2c",
+        encrypted_community=encryption_service.encrypt("site-secret"),
+    )
+    db.add(answered)
+    db.commit()
+
+    # SNMP answered, no CLI login did: inventory only, never backed up.
+    assessment = probe.DeviceAssessment(
+        device_type="cisco_ios",
+        transport="snmp",
+        backup_eligible=False,
+        auth_status=probe.AUTH_FAILED,
+        auth_error="ssh: authentication failed",
+        probes=[
+            probe.ProbeOutcome(
+                transport="snmp",
+                result=probe.SUCCESS,
+                credential_id=answered.id,
+                credential_name=answered.name,
+                attempts=1,
+            )
+        ],
+    )
+
+    topology = {
+        "core-01": {
+            "neighbors": [
+                parsers.Neighbor(local_interface="Gi1/0/9", remote_hostname="snmp-only",
+                                 protocol="lldp", remote_interface="1",
+                                 remote_mgmt_ip="10.9.9.10")
+            ]
+        },
+        "snmp-only": {},
+    }
+
+    with mock.patch.object(
+        DiscoveryService, "probe", staticmethod(_probe_returning(topology))
+    ), mock.patch.object(
+        DiscoveryService, "_assess_candidate", return_value=assessment
+    ):
+        summary = service.crawl(org.id, devices[0].id, max_hops=1, auto_add=True)
+
+    assert summary.devices_created == 1
+
+    created = db.execute(
+        select(Device).where(Device.hostname == "snmp-only")
+    ).scalars().one()
+
+    assert created.transport == "snmp"
+    assert created.is_active is False, "no CLI login, so not on the backup list"
+    assert created.snmp_version == "2c"
+    assert encryption_service.decrypt(created.snmp_community) == "site-secret"
+
+
 def test_crawl_auto_add_skips_neighbours_without_an_address(db, org, devices, service):
     topology = {
         "core-01": {
