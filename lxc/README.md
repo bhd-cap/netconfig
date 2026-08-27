@@ -101,6 +101,17 @@ If `/opt/netconfig` is not a git checkout there is nothing to update from, and
 the installer says so and rebuilds what is there. Re-clone it, or run the curl
 one-liner, to pick up new code.
 
+The update path has its own checks, which need nothing but git and bash:
+
+```bash
+./lxc/tests/update_path.sh
+```
+
+It builds a throwaway upstream and a throwaway shallow installation in a temp
+directory and exercises the real `obtain_source()` against them. Worth running
+after any change to that function - it has broken twice, both times while
+reporting success.
+
 ## After installing
 
 - Web UI: `http://<container-ip>`
