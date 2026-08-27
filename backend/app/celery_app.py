@@ -10,7 +10,15 @@ celery_app = Celery(
     "netconfig_backup",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
-    include=["app.tasks.backup", "app.tasks.cleanup", "app.tasks.discovery"],
+    # Every task module a worker must know about. app.tasks.remote_backup is
+    # listed explicitly rather than relying on app.tasks.backup importing it:
+    # dropping that import would silently leave the export tasks unregistered.
+    include=[
+        "app.tasks.backup",
+        "app.tasks.cleanup",
+        "app.tasks.discovery",
+        "app.tasks.remote_backup",
+    ],
 )
 
 # Celery configuration
