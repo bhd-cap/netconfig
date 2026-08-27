@@ -366,10 +366,16 @@ update_checkout() {
 
     # A modified tracked file is somebody's edit. Refusing to touch it is the
     # right call, but it has to be said out loud, or the install looks like it
-    # updated when it did not.
-    if ! git -C "$APP_DIR" diff --quiet HEAD 2>/dev/null; then
-        warn "Uncommitted changes under $APP_DIR; the source was NOT updated"
-        info "Commit or discard them and re-run:  git -C $APP_DIR status"
+    # updated when it did not - and it must not count the env files this
+    # script deletes itself, which would block every update after the first.
+    local -a scope=()
+    mapfile -t scope < <(stray_env_pathspec)
+
+    if ! git -C "$APP_DIR" diff --quiet HEAD -- "${scope[@]}" 2>/dev/null; then
+        warn "Local changes under $APP_DIR; the source was NOT updated"
+        git -C "$APP_DIR" status --short -- "${scope[@]}" 2>/dev/null \
+            | head -10 | sed 's/^/        /' || true
+        info "Commit or discard those and re-run, or set APP_DIR elsewhere"
         return
     fi
 
@@ -398,11 +404,30 @@ record_revision() {
     SOURCE_BRANCH=$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 }
 
+# Env files the installer removes from the source tree on every run. At least
+# one of them (.env) is tracked in the repository, so deleting it leaves the
+# checkout permanently "dirty" - which the update below has to know about, or
+# the installer's own housekeeping blocks every future update.
+STRAY_ENV_PATHS=(.env backend/.env frontend/.env)
+
 drop_stray_env() {
     # A .env belonging to the Docker deployment is not used by this install -
     # everything is configured through $CONFIG_FILE - and it may hold secrets
     # that have no business sitting in the source tree.
-    rm -f "$APP_DIR/.env" "$APP_DIR/backend/.env" "$APP_DIR/frontend/.env"
+    local path
+    for path in "${STRAY_ENV_PATHS[@]}"; do
+        rm -f "$APP_DIR/$path"
+    done
+}
+
+# Pathspec args that exclude the files above, so a check for local edits sees
+# only changes somebody actually made.
+stray_env_pathspec() {
+    local path
+    printf '%s\n' ':(top)'
+    for path in "${STRAY_ENV_PATHS[@]}"; do
+        printf ':(exclude,top)%s\n' "$path"
+    done
 }
 
 # --------------------------------------------------------------------------
