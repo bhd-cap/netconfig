@@ -127,6 +127,8 @@ def refresh_inventory_task(organization_id: int, device_ids: list = None):
                 result.mac_entries,
                 result.arp_entries,
                 seen_at,
+                neighbors=result.neighbors,
+                device_hostname=result.snapshot.hostname,
             )
 
         db.commit()

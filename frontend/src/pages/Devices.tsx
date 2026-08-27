@@ -1,7 +1,11 @@
 /**
  * Devices Page - Network device management
+ *
+ * The list is sortable on every column the API catalogues, rows can be
+ * selected in bulk to change details or drop them from the backup list, and
+ * the hostname drills into everything discovery learned about the device.
  */
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Server,
@@ -13,11 +17,23 @@ import {
   RefreshCw,
   Activity,
   CheckCircle,
-  XCircle
+  XCircle,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
+  Search,
+  ShieldCheck,
+  ShieldX,
+  ShieldQuestion,
+  X,
 } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 import api from '../lib/api';
+import { usePermissions } from '../hooks/usePermissions';
+import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
 import {
+  AuthStatus,
+  BulkDeviceUpdate,
   Device,
   DeviceCreate,
   DeviceUpdate,
@@ -27,22 +43,133 @@ import {
   Transport,
 } from '../types';
 
+type SortDir = 'asc' | 'desc';
+
+/**
+ * The columns with a header the user can click
+ *
+ * Every key here is in the API's own SORTABLE_COLUMNS catalogue; sorting on
+ * anything else is refused with a 400 rather than silently ignored.
+ */
+const SORTABLE: Array<{ key: string; label: string }> = [
+  { key: 'hostname', label: 'Device' },
+  { key: 'ip_address', label: 'IP Address' },
+  { key: 'device_type', label: 'Type' },
+  { key: 'transport', label: 'Transport' },
+  { key: 'last_auth_status', label: 'Login' },
+  { key: 'is_active', label: 'Status' },
+  { key: 'last_backup_at', label: 'Last Backup' },
+];
+
+const AUTH_LABELS: Record<AuthStatus, string> = {
+  never: 'Not tried',
+  success: 'Authenticated',
+  auth_failed: 'Login refused',
+  unreachable: 'No answer',
+  error: 'Probe error',
+};
+
+/**
+ * Whether a login has ever succeeded, at a glance
+ *
+ * A device with no working credential can still be crawled and inventoried,
+ * so this is deliberately separate from the active/inactive flag.
+ */
+const AuthBadge: React.FC<{ device: Device }> = ({ device }) => {
+  const status = (device.last_auth_status ?? 'never') as AuthStatus;
+
+  const tone =
+    status === 'success'
+      ? 'bg-emerald-100 text-emerald-800'
+      : status === 'never'
+      ? 'bg-gray-100 text-gray-700'
+      : 'bg-amber-100 text-amber-800';
+
+  const Icon =
+    status === 'success' ? ShieldCheck : status === 'never' ? ShieldQuestion : ShieldX;
+
+  return (
+    <span
+      className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${tone}`}
+      title={device.auth_error ?? AUTH_LABELS[status]}
+    >
+      <Icon className="h-3 w-3 mr-1" />
+      {AUTH_LABELS[status] ?? status}
+    </span>
+  );
+};
+
 export const Devices: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingDevice, setEditingDevice] = useState<Device | null>(null);
+  const [detailDeviceId, setDetailDeviceId] = useState<number | null>(null);
+  const [bulkEditing, setBulkEditing] = useState(false);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState('hostname');
+  const [sortDir, setSortDir] = useState<SortDir>('asc');
   const [page, setPage] = useState(1);
   const [limit] = useState(20);
   const queryClient = useQueryClient();
+  const { can } = usePermissions();
+  const canWrite = can('devices:write');
+  const canDelete = can('devices:delete');
 
   // Fetch devices
   const { data: devicesData, isLoading } = useQuery({
-    queryKey: ['devices', page, limit],
+    queryKey: ['devices', page, limit, sortBy, sortDir, search],
     queryFn: async () => {
-      const skip = (page - 1) * limit;
-      const response = await api.get<PaginatedResponse<Device>>(`/devices?skip=${skip}&limit=${limit}`);
+      const params = new URLSearchParams({
+        skip: String((page - 1) * limit),
+        limit: String(limit),
+        sort_by: sortBy,
+        sort_dir: sortDir,
+      });
+      if (search.trim()) params.set('search', search.trim());
+      const response = await api.get<PaginatedResponse<Device>>(`/devices?${params}`);
       return response.data;
     },
   });
+
+  const rows = devicesData?.items ?? [];
+
+  // Only what is on screen can be selected, so the header checkbox and the
+  // bulk actions both mean "these rows" and never a hidden page.
+  const selectedOnPage = useMemo(
+    () => rows.filter((device) => selected.has(device.id)),
+    [rows, selected]
+  );
+  const allOnPageSelected = rows.length > 0 && selectedOnPage.length === rows.length;
+
+  const clearSelection = () => setSelected(new Set());
+
+  const toggleOne = (deviceId: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(deviceId)) next.delete(deviceId);
+      else next.add(deviceId);
+      return next;
+    });
+  };
+
+  const toggleAllOnPage = () => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (allOnPageSelected) rows.forEach((device) => next.delete(device.id));
+      else rows.forEach((device) => next.add(device.id));
+      return next;
+    });
+  };
+
+  const sort = (key: string) => {
+    if (key === sortBy) {
+      setSortDir((dir) => (dir === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortBy(key);
+      setSortDir('asc');
+    }
+    setPage(1);
+  };
 
   // Delete device mutation
   const deleteMutation = useMutation({
@@ -58,10 +185,43 @@ export const Devices: React.FC = () => {
     },
   });
 
+  const bulkUpdateMutation = useMutation({
+    mutationFn: async (payload: BulkDeviceUpdate) => {
+      const response = await api.patch('/devices/bulk', payload);
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
+      toast.success(data.message || 'Devices updated');
+      clearSelection();
+      setBulkEditing(false);
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Failed to update devices');
+    },
+  });
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: async (deviceIds: number[]) => {
+      const response = await api.post('/devices/bulk-delete', { device_ids: deviceIds });
+      return response.data;
+    },
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
+      // The inventory keeps its rows, so refresh it too.
+      queryClient.invalidateQueries({ queryKey: ['inventory'] });
+      toast.success(data.message || 'Devices removed');
+      clearSelection();
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Failed to remove devices');
+    },
+  });
+
   // Trigger backup mutation
   const backupMutation = useMutation({
-    mutationFn: async (deviceId: number) => {
-      const response = await api.post(`/backups/trigger`, { device_ids: [deviceId] });
+    mutationFn: async (deviceIds: number[]) => {
+      const response = await api.post(`/backups/trigger`, { device_ids: deviceIds });
       return response.data;
     },
     onSuccess: () => {
@@ -79,6 +239,7 @@ export const Devices: React.FC = () => {
       return response.data;
     },
     onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['devices'] });
       if (data.success) {
         toast.success(`Connection successful: ${data.message}`);
       } else {
@@ -96,12 +257,22 @@ export const Devices: React.FC = () => {
     }
   };
 
-  const handleBackup = (device: Device) => {
-    backupMutation.mutate(device.id);
+  const handleBulkDelete = () => {
+    const ids = selectedOnPage.map((device) => device.id);
+    if (!ids.length) return;
+
+    const message =
+      `Remove ${ids.length} device(s) from the backup list?\n\n` +
+      'Their stored configurations go with them, but the hosts seen on their ' +
+      'ports and the adjacencies they reported stay in the inventory.';
+
+    if (window.confirm(message)) bulkDeleteMutation.mutate(ids);
   };
 
-  const handleTest = (device: Device) => {
-    testMutation.mutate(device.id);
+  const handleBulkActive = (isActive: boolean) => {
+    const ids = selectedOnPage.map((device) => device.id);
+    if (!ids.length) return;
+    bulkUpdateMutation.mutate({ device_ids: ids, is_active: isActive });
   };
 
   const getStatusBadge = (device: Device) => {
@@ -140,6 +311,29 @@ export const Devices: React.FC = () => {
     );
   };
 
+  const SortHeader: React.FC<{ column: { key: string; label: string } }> = ({ column }) => {
+    const active = sortBy === column.key;
+    const Icon = !active ? ArrowUpDown : sortDir === 'asc' ? ArrowUp : ArrowDown;
+
+    return (
+      <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+        <button
+          type="button"
+          onClick={() => sort(column.key)}
+          data-testid={`sort-${column.key}`}
+          aria-sort={active ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}
+          className={`inline-flex items-center gap-1 hover:text-gray-900 transition ${
+            active ? 'text-gray-900' : ''
+          }`}
+          title={`Sort by ${column.label}`}
+        >
+          {column.label}
+          <Icon className={`h-3 w-3 ${active ? 'text-blue-600' : 'text-gray-400'}`} />
+        </button>
+      </th>
+    );
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -157,6 +351,80 @@ export const Devices: React.FC = () => {
         </button>
       </div>
 
+      {/* Search */}
+      <div className="relative max-w-md">
+        <Search className="h-4 w-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+        <input
+          type="search"
+          value={search}
+          onChange={(e) => {
+            setSearch(e.target.value);
+            setPage(1);
+          }}
+          placeholder="Search hostname or IP"
+          className="w-full pl-9 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        />
+      </div>
+
+      {/* Bulk action bar */}
+      {selectedOnPage.length > 0 && (
+        <div
+          data-testid="bulk-bar"
+          className="flex flex-wrap items-center gap-3 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3"
+        >
+          <span className="text-sm font-medium text-blue-900">
+            {selectedOnPage.length} selected
+          </span>
+
+          {canWrite && (
+            <>
+              <button
+                onClick={() => setBulkEditing(true)}
+                className="inline-flex items-center px-3 py-1.5 text-sm bg-white border border-blue-300 text-blue-700 rounded hover:bg-blue-100"
+              >
+                <Edit className="h-4 w-4 mr-1.5" />
+                Edit details
+              </button>
+              <button
+                onClick={() => handleBulkActive(true)}
+                disabled={bulkUpdateMutation.isPending}
+                className="inline-flex items-center px-3 py-1.5 text-sm bg-white border border-blue-300 text-blue-700 rounded hover:bg-blue-100 disabled:opacity-50"
+              >
+                <Power className="h-4 w-4 mr-1.5" />
+                Add to backup list
+              </button>
+              <button
+                onClick={() => handleBulkActive(false)}
+                disabled={bulkUpdateMutation.isPending}
+                className="inline-flex items-center px-3 py-1.5 text-sm bg-white border border-blue-300 text-blue-700 rounded hover:bg-blue-100 disabled:opacity-50"
+              >
+                <PowerOff className="h-4 w-4 mr-1.5" />
+                Remove from backup list
+              </button>
+            </>
+          )}
+
+          {canDelete && (
+            <button
+              onClick={handleBulkDelete}
+              disabled={bulkDeleteMutation.isPending}
+              className="inline-flex items-center px-3 py-1.5 text-sm bg-white border border-red-300 text-red-700 rounded hover:bg-red-50 disabled:opacity-50"
+            >
+              <Trash2 className="h-4 w-4 mr-1.5" />
+              Delete devices
+            </button>
+          )}
+
+          <button
+            onClick={clearSelection}
+            className="ml-auto inline-flex items-center text-sm text-blue-700 hover:text-blue-900"
+          >
+            <X className="h-4 w-4 mr-1" />
+            Clear
+          </button>
+        </div>
+      )}
+
       {/* Devices List */}
       {isLoading ? (
         <div className="bg-white rounded-lg shadow p-12 text-center">
@@ -165,91 +433,120 @@ export const Devices: React.FC = () => {
         </div>
       ) : devicesData && devicesData.items.length > 0 ? (
         <div className="bg-white rounded-lg shadow overflow-hidden">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Device
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  IP Address
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Type
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Status
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Last Backup
-                </th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Actions
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {devicesData.items.map((device) => (
-                <tr key={device.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center">
-                      <Server className="h-5 w-5 text-gray-400 mr-3" />
-                      <div>
-                        <div className="text-sm font-medium text-gray-900">{device.hostname}</div>
-                        <div className="text-sm text-gray-500">User: {device.username}</div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    {device.ip_address}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                    {DEVICE_TYPES[device.device_type as keyof typeof DEVICE_TYPES] || device.device_type}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    {getStatusBadge(device)}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {device.last_backup_at
-                      ? new Date(device.last_backup_at).toLocaleString()
-                      : 'Never'}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                    <div className="flex justify-end gap-2">
-                      <button
-                        onClick={() => handleTest(device)}
-                        className="text-purple-600 hover:text-purple-900"
-                        title="Test Connection"
-                      >
-                        <Activity className="h-5 w-5" />
-                      </button>
-                      <button
-                        onClick={() => handleBackup(device)}
-                        className="text-green-600 hover:text-green-900"
-                        title="Backup Now"
-                      >
-                        <RefreshCw className="h-5 w-5" />
-                      </button>
-                      <button
-                        onClick={() => setEditingDevice(device)}
-                        className="text-blue-600 hover:text-blue-900"
-                        title="Edit"
-                      >
-                        <Edit className="h-5 w-5" />
-                      </button>
-                      <button
-                        onClick={() => handleDelete(device)}
-                        className="text-red-600 hover:text-red-900"
-                        title="Delete"
-                      >
-                        <Trash2 className="h-5 w-5" />
-                      </button>
-                    </div>
-                  </td>
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-4 py-3 w-10">
+                    <input
+                      type="checkbox"
+                      checked={allOnPageSelected}
+                      onChange={toggleAllOnPage}
+                      data-testid="select-all"
+                      aria-label="Select every device on this page"
+                      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                  </th>
+                  {SORTABLE.map((column) => (
+                    <SortHeader key={column.key} column={column} />
+                  ))}
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Actions
+                  </th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {devicesData.items.map((device) => (
+                  <tr
+                    key={device.id}
+                    data-device-id={device.id}
+                    className={selected.has(device.id) ? 'bg-blue-50' : 'hover:bg-gray-50'}
+                  >
+                    <td className="px-4 py-4">
+                      <input
+                        type="checkbox"
+                        checked={selected.has(device.id)}
+                        onChange={() => toggleOne(device.id)}
+                        aria-label={`Select ${device.hostname}`}
+                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap">
+                      <div className="flex items-center">
+                        <Server className="h-5 w-5 text-gray-400 mr-3 shrink-0" />
+                        <div>
+                          <button
+                            type="button"
+                            onClick={() => setDetailDeviceId(device.id)}
+                            data-testid={`device-name-${device.id}`}
+                            className="text-sm font-medium text-blue-600 hover:text-blue-800 hover:underline text-left"
+                            title="Show everything known about this device"
+                          >
+                            {device.hostname}
+                          </button>
+                          <div className="text-sm text-gray-500">
+                            {device.model ? device.model : `User: ${device.username}`}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {device.ip_address}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900">
+                      {DEVICE_TYPES[device.device_type as keyof typeof DEVICE_TYPES] ||
+                        device.device_type}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {TRANSPORTS[(device.transport ?? 'ssh') as Transport] ??
+                        device.transport}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap">
+                      <AuthBadge device={device} />
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap">{getStatusBadge(device)}</td>
+                    <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-500">
+                      {device.last_backup_at
+                        ? new Date(device.last_backup_at).toLocaleString()
+                        : 'Never'}
+                    </td>
+                    <td className="px-4 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      <div className="flex justify-end gap-2">
+                        <button
+                          onClick={() => testMutation.mutate(device.id)}
+                          className="text-purple-600 hover:text-purple-900"
+                          title="Test Connection"
+                        >
+                          <Activity className="h-5 w-5" />
+                        </button>
+                        <button
+                          onClick={() => backupMutation.mutate([device.id])}
+                          className="text-green-600 hover:text-green-900"
+                          title="Backup Now"
+                        >
+                          <RefreshCw className="h-5 w-5" />
+                        </button>
+                        <button
+                          onClick={() => setEditingDevice(device)}
+                          className="text-blue-600 hover:text-blue-900"
+                          title="Edit"
+                        >
+                          <Edit className="h-5 w-5" />
+                        </button>
+                        <button
+                          onClick={() => handleDelete(device)}
+                          className="text-red-600 hover:text-red-900"
+                          title="Delete"
+                        >
+                          <Trash2 className="h-5 w-5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {/* Pagination */}
           {devicesData.total_pages > 1 && (
@@ -318,9 +615,13 @@ export const Devices: React.FC = () => {
       ) : (
         <div className="bg-white rounded-lg shadow p-12 text-center">
           <Server className="h-16 w-16 text-gray-400 mx-auto mb-4" />
-          <h3 className="text-lg font-medium text-gray-900 mb-2">No devices yet</h3>
+          <h3 className="text-lg font-medium text-gray-900 mb-2">
+            {search ? 'No devices match that search' : 'No devices yet'}
+          </h3>
           <p className="text-gray-600 mb-4">
-            Get started by adding your first network device.
+            {search
+              ? 'Try a different hostname or IP address.'
+              : 'Get started by adding your first network device.'}
           </p>
           <button
             onClick={() => setShowAddModal(true)}
@@ -347,6 +648,187 @@ export const Devices: React.FC = () => {
           }}
         />
       )}
+
+      {/* Bulk edit modal */}
+      {bulkEditing && (
+        <BulkEditModal
+          devices={selectedOnPage}
+          isSaving={bulkUpdateMutation.isPending}
+          onClose={() => setBulkEditing(false)}
+          onSubmit={(changes) =>
+            bulkUpdateMutation.mutate({
+              device_ids: selectedOnPage.map((device) => device.id),
+              ...changes,
+            })
+          }
+        />
+      )}
+
+      {/* Detail drill-in */}
+      {detailDeviceId !== null && (
+        <DeviceDetailPanel
+          deviceId={detailDeviceId}
+          onClose={() => setDetailDeviceId(null)}
+        />
+      )}
+    </div>
+  );
+};
+
+// Bulk edit modal
+interface BulkEditModalProps {
+  devices: Device[];
+  isSaving: boolean;
+  onClose: () => void;
+  onSubmit: (changes: Omit<BulkDeviceUpdate, 'device_ids'>) => void;
+}
+
+/**
+ * Change the same details on a selection
+ *
+ * Every field starts blank and a blank field is left alone, so a bulk edit
+ * only ever writes what was deliberately filled in. Credentials are absent by
+ * design - pushing one password onto a selection is how a rack ends up locked
+ * out, and the credential vault is where shared logins belong.
+ */
+const BulkEditModal: React.FC<BulkEditModalProps> = ({
+  devices,
+  isSaving,
+  onClose,
+  onSubmit,
+}) => {
+  const [deviceType, setDeviceType] = useState('');
+  const [transport, setTransport] = useState('');
+  const [port, setPort] = useState('');
+  const [location, setLocation] = useState('');
+  const [description, setDescription] = useState('');
+
+  const changes: Omit<BulkDeviceUpdate, 'device_ids'> = {};
+  if (deviceType) changes.device_type = deviceType;
+  if (transport) changes.transport = transport as Transport;
+  if (port) changes.port = parseInt(port, 10);
+  if (location) changes.location = location;
+  if (description) changes.description = description;
+
+  const nothingToDo = Object.keys(changes).length === 0;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (nothingToDo) return;
+    onSubmit(changes);
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+      <div className="bg-white rounded-lg shadow-xl max-w-lg w-full">
+        <div className="p-6">
+          <h2 className="text-xl font-bold text-gray-900">
+            Edit {devices.length} device(s)
+          </h2>
+          <p className="text-sm text-gray-600 mt-1">
+            Anything left blank is kept as it is. Credentials are set per device
+            or shared through the credential vault, not here.
+          </p>
+
+          <form onSubmit={handleSubmit} className="space-y-4 mt-5">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Device type
+              </label>
+              <select
+                value={deviceType}
+                onChange={(e) => setDeviceType(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">Leave unchanged</option>
+                {Object.entries(DEVICE_TYPES).map(([key, label]) => (
+                  <option key={key} value={key}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Transport
+                </label>
+                <select
+                  value={transport}
+                  onChange={(e) => setTransport(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                >
+                  <option value="">Leave unchanged</option>
+                  {Object.entries(TRANSPORTS).map(([key, label]) => (
+                    <option key={key} value={key}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Port
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={port}
+                  onChange={(e) => setPort(e.target.value)}
+                  placeholder="Leave unchanged"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Location
+              </label>
+              <input
+                type="text"
+                value={location}
+                onChange={(e) => setLocation(e.target.value)}
+                placeholder="Leave unchanged"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Description
+              </label>
+              <input
+                type="text"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Leave unchanged"
+                className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+
+            <div className="flex justify-end gap-3 pt-4 border-t">
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isSaving || nothingToDo}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              >
+                {isSaving ? 'Saving...' : 'Apply to selection'}
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
     </div>
   );
 };

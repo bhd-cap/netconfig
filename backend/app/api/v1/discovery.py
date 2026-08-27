@@ -17,7 +17,12 @@ from app.models.network import DiscoveryRun, Neighbor, TopologyDiagram
 from app.models.user import User
 from app.repositories.audit_log import AuditLogRepository
 from app.services.discovery import DiscoveryService
-from app.services.topology import build_graph, merge_layout
+from app.services.topology import (
+    INFRASTRUCTURE_TIERS,
+    TIER_HOST,
+    build_graph,
+    merge_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +333,20 @@ def get_topology(
     include_unmanaged: bool = Query(
         True, description="Include neighbours that are not managed devices"
     ),
+    tiers: Optional[str] = Query(
+        None,
+        description=(
+            "Comma-separated tiers to show: core, distribution, access, edge, "
+            "host. Defaults to infrastructure only."
+        ),
+    ),
+    expand: Optional[str] = Query(
+        None,
+        description=(
+            "Comma-separated node keys whose end hosts to include - the "
+            "drill-down"
+        ),
+    ),
     current_user: User = Depends(require_permission("discovery:read")),
     organization_id: int = Depends(get_organization_id),
     db: Session = Depends(get_db),
@@ -338,12 +357,41 @@ def get_topology(
     The graph is always rebuilt from current adjacencies. A saved diagram
     contributes only the user's edits on top of it, so newly discovered
     devices appear without discarding a hand-arranged layout.
+
+    By default only infrastructure is returned - core, distribution, access
+    and unmanaged edge devices. End hosts are excluded because a switch with
+    200 MACs behind it makes a diagram nobody can read; pass their parent's
+    key in `expand` to drill into one, or ask for the host tier to see them
+    all.
     """
+    def split(value: Optional[str]) -> Optional[List[str]]:
+        if not value:
+            return None
+        return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+    requested_tiers = split(tiers)
+    if requested_tiers:
+        unknown = [
+            tier
+            for tier in requested_tiers
+            if tier not in (*INFRASTRUCTURE_TIERS, TIER_HOST)
+        ]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Unknown tier(s): {', '.join(unknown)}. Valid tiers are "
+                    f"{', '.join((*INFRASTRUCTURE_TIERS, TIER_HOST))}"
+                ),
+            )
+
     graph = build_graph(
         db,
         organization_id,
         active_only=active_only,
         include_unmanaged=include_unmanaged,
+        tiers=requested_tiers,
+        expand=split(expand),
     )
 
     if diagram_id is not None:

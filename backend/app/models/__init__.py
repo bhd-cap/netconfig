@@ -8,6 +8,7 @@ from app.models.configuration import Configuration
 from app.models.backup_job import BackupJob
 from app.models.audit_log import AuditLog
 from app.models.administration import Role, AppSettings, BackupTarget
+from app.models.credential import Credential, DeviceProbe
 from app.models.network import (
     Neighbor,
     HostInventory,
@@ -26,6 +27,8 @@ __all__ = [
     "Role",
     "AppSettings",
     "BackupTarget",
+    "Credential",
+    "DeviceProbe",
     "Neighbor",
     "HostInventory",
     "OuiVendor",

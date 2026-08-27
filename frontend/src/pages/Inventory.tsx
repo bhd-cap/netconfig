@@ -12,6 +12,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { formatDistanceToNow } from 'date-fns';
 import { toast } from 'react-hot-toast';
 import {
+  AlertTriangle,
   Database,
   Download,
   Loader2,
@@ -19,9 +20,12 @@ import {
   RefreshCw,
   Search,
   Tag,
+  Upload,
+  X,
 } from 'lucide-react';
 import api from '../lib/api';
 import { usePermissions } from '../hooks/usePermissions';
+import { DeviceDetailPanel } from '../components/devices/DeviceDetailPanel';
 import {
   Device,
   HostInventoryEntry,
@@ -55,6 +59,7 @@ export const Inventory: React.FC = () => {
   const [activeOnly, setActiveOnly] = useState(true);
   const [seenWithin, setSeenWithin] = useState('');
   const [editing, setEditing] = useState<HostInventoryEntry | null>(null);
+  const [detailDeviceId, setDetailDeviceId] = useState<number | null>(null);
 
   const { data: devices } = useQuery<PaginatedResponse<Device>>({
     queryKey: ['devices', 'for-inventory'],
@@ -101,12 +106,47 @@ export const Inventory: React.FC = () => {
       toast.success('Inventory refresh queued; results appear as devices respond'),
   });
 
+  // The import can fail for a reason worth reading in full - which sources
+  // were tried and what each said - so it is held on screen rather than in a
+  // toast that disappears.
+  const [ouiError, setOuiError] = useState<string | null>(null);
+
   const importOui = useMutation({
     mutationFn: async (source: string) =>
       (await api.post('/inventory/oui/import', { source })).data,
     onSuccess: (result) => {
+      setOuiError(null);
       queryClient.invalidateQueries({ queryKey: ['oui-status'] });
+      queryClient.invalidateQueries({ queryKey: ['inventory'] });
       toast.success(result.message);
+    },
+    onError: (error: any) => {
+      setOuiError(
+        error.response?.data?.detail ?? 'The import failed for an unknown reason'
+      );
+    },
+  });
+
+  const uploadOui = useMutation({
+    mutationFn: async (file: File) => {
+      const form = new FormData();
+      form.append('file', file);
+      return (
+        await api.post('/inventory/oui/upload', form, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+        })
+      ).data;
+    },
+    onSuccess: (result) => {
+      setOuiError(null);
+      queryClient.invalidateQueries({ queryKey: ['oui-status'] });
+      queryClient.invalidateQueries({ queryKey: ['inventory'] });
+      toast.success(result.message);
+    },
+    onError: (error: any) => {
+      setOuiError(
+        error.response?.data?.detail ?? 'The upload failed for an unknown reason'
+      );
     },
   });
 
@@ -194,43 +234,98 @@ export const Inventory: React.FC = () => {
 
       {/* OUI status */}
       {ouiStatus && (
-        <div className="bg-white rounded-lg shadow p-4 flex flex-wrap items-center gap-4 text-sm">
-          <Tag className="h-5 w-5 text-gray-400" />
-          <span className="text-gray-900 font-medium">
-            {ouiStatus.prefixes.toLocaleString()} OUI prefixes loaded
-          </span>
-          <span className="text-gray-500 flex-1 min-w-[16rem]">
-            {ouiStatus.prefixes < 1000 ? ouiStatus.note : 'Vendor lookup is populated.'}
-          </span>
+        <div className="bg-white rounded-lg shadow p-4 space-y-3">
+          <div className="flex flex-wrap items-center gap-4 text-sm">
+            <Tag className="h-5 w-5 text-gray-400" />
+            <span className="text-gray-900 font-medium">
+              {ouiStatus.prefixes.toLocaleString()} OUI prefixes loaded
+            </span>
+            <span className="text-gray-500 flex-1 min-w-[16rem]">
+              {ouiStatus.prefixes < 1000
+                ? ouiStatus.note
+                : 'Vendor lookup is populated.'}
+            </span>
 
-          {canImportOui && (
-            <div className="flex flex-wrap gap-2">
-              {ouiStatus.system_file && (
+            {canImportOui && (
+              <div className="flex flex-wrap gap-2">
+                {ouiStatus.system_file && (
+                  <button
+                    onClick={() => importOui.mutate('system')}
+                    disabled={importOui.isPending || uploadOui.isPending}
+                    className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                    title={ouiStatus.system_file}
+                  >
+                    Import from this host
+                  </button>
+                )}
+
                 <button
-                  onClick={() => importOui.mutate('system')}
-                  disabled={importOui.isPending}
+                  onClick={() => importOui.mutate('ieee')}
+                  disabled={importOui.isPending || uploadOui.isPending}
                   className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-                  title={ouiStatus.system_file}
+                  title={(ouiStatus.ieee_sources ?? []).join('\n')}
                 >
-                  Import from this host
+                  {importOui.isPending ? 'Downloading…' : 'Download registry'}
                 </button>
-              )}
-              <button
-                onClick={() => importOui.mutate('ieee')}
-                disabled={importOui.isPending}
-                className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
-              >
-                {importOui.isPending ? 'Importing…' : 'Import IEEE registry'}
-              </button>
-              {canWrite && (
+
+                {/* The way to populate vendor data on a host with no outbound
+                    internet access: a browser cannot give the server a local
+                    path, so the file itself is sent. */}
+                <label
+                  className={`px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 cursor-pointer ${
+                    uploadOui.isPending ? 'opacity-50 pointer-events-none' : ''
+                  }`}
+                  title="Upload oui.csv, oui.txt, Wireshark's manuf or nmap-mac-prefixes"
+                >
+                  <Upload className="h-3 w-3 inline mr-1" />
+                  {uploadOui.isPending ? 'Uploading…' : 'Upload a list'}
+                  <input
+                    type="file"
+                    className="hidden"
+                    accept=".csv,.txt,text/csv,text/plain"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (file) uploadOui.mutate(file);
+                      // Clear it, so choosing the same file twice re-fires.
+                      event.target.value = '';
+                    }}
+                  />
+                </label>
+
+                {canWrite && (
+                  <button
+                    onClick={() => backfill.mutate()}
+                    disabled={backfill.isPending}
+                    className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    Resolve unknown vendors
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {ouiError && (
+            <div className="border border-red-200 bg-red-50 rounded p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertTriangle className="h-4 w-4 text-red-600 mt-0.5 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-red-900">
+                      The OUI import did not complete
+                    </p>
+                    <pre className="mt-1 text-xs text-red-800 whitespace-pre-wrap break-words font-mono">
+                      {ouiError}
+                    </pre>
+                  </div>
+                </div>
                 <button
-                  onClick={() => backfill.mutate()}
-                  disabled={backfill.isPending}
-                  className="px-3 py-1.5 border border-gray-300 rounded text-xs hover:bg-gray-50 disabled:opacity-50"
+                  onClick={() => setOuiError(null)}
+                  className="text-red-600 hover:text-red-900 shrink-0"
                 >
-                  Resolve unknown vendors
+                  <X className="h-4 w-4" />
                 </button>
-              )}
+              </div>
             </div>
           )}
         </div>
@@ -350,6 +445,9 @@ export const Inventory: React.FC = () => {
                       Address
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
+                      Discovered name
+                    </th>
+                    <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
                       Switch
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-gray-500 uppercase text-xs">
@@ -384,8 +482,43 @@ export const Inventory: React.FC = () => {
                           <p className="text-xs text-gray-500">{row.hostname}</p>
                         )}
                       </td>
+                      {/* What the host itself announced over LLDP or CDP, as
+                          opposed to the name a person typed in. */}
+                      <td className="px-4 py-3 text-gray-700">
+                        {row.discovered_hostname ? (
+                          <>
+                            <span
+                              className="text-gray-900"
+                              title={row.discovered_platform ?? undefined}
+                            >
+                              {row.discovered_hostname}
+                            </span>
+                            {row.discovered_via && (
+                              <span className="ml-2 px-1.5 py-0.5 bg-blue-100 text-blue-800 rounded text-xs uppercase">
+                                {row.discovered_via}
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          <span className="text-gray-400">—</span>
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-900">
-                        {row.device_hostname}
+                        {row.device_id ? (
+                          <button
+                            type="button"
+                            onClick={() => setDetailDeviceId(row.device_id!)}
+                            data-testid={`inventory-switch-${row.id}`}
+                            className="text-blue-600 hover:text-blue-800 hover:underline"
+                            title="Show everything known about this switch"
+                          >
+                            {row.device_hostname}
+                          </button>
+                        ) : (
+                          <span title="This device is no longer on the backup list">
+                            {row.device_hostname}
+                          </span>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-gray-700">{row.interface}</td>
                       <td className="px-4 py-3 text-gray-700">
@@ -444,6 +577,14 @@ export const Inventory: React.FC = () => {
         )}
       </div>
 
+      {/* Drill into the switch a host was seen on */}
+      {detailDeviceId !== null && (
+        <DeviceDetailPanel
+          deviceId={detailDeviceId}
+          onClose={() => setDetailDeviceId(null)}
+        />
+      )}
+
       {/* Annotate */}
       {editing && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -451,10 +592,23 @@ export const Inventory: React.FC = () => {
             <h3 className="text-lg font-semibold text-gray-900 mb-1">
               Annotate host
             </h3>
-            <p className="font-mono text-xs text-gray-500 mb-4">
+            <p className="font-mono text-xs text-gray-500 mb-1">
               {editing.mac_address} on {editing.device_hostname}{' '}
               {editing.interface}
             </p>
+
+            {editing.discovered_hostname && (
+              <p className="text-xs text-gray-500 mb-4">
+                It announces itself as{' '}
+                <span className="font-medium text-gray-700">
+                  {editing.discovered_hostname}
+                </span>
+                {editing.discovered_via
+                  ? ` over ${editing.discovered_via.toUpperCase()}`
+                  : ''}
+                .
+              </p>
+            )}
 
             <form
               onSubmit={(event) => {
@@ -466,7 +620,7 @@ export const Inventory: React.FC = () => {
                   notes: String(form.get('notes') ?? ''),
                 });
               }}
-              className="space-y-4"
+              className="space-y-4 mt-4"
             >
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1">

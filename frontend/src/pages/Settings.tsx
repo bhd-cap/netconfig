@@ -12,6 +12,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from 'react-hot-toast';
 import {
   HardDriveUpload,
+  KeyRound,
   Loader2,
   Lock,
   Settings as SettingsIcon,
@@ -23,11 +24,18 @@ import api from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
 import { usePermissions } from '../hooks/usePermissions';
 import { ApplicationTab } from '../components/settings/ApplicationTab';
+import { CredentialsTab } from '../components/settings/CredentialsTab';
 import { RolesTab } from '../components/settings/RolesTab';
 import { TargetsTab } from '../components/settings/TargetsTab';
 import { UsersTab } from '../components/settings/UsersTab';
 
-type TabId = 'profile' | 'users' | 'roles' | 'application' | 'targets';
+type TabId =
+  | 'profile'
+  | 'users'
+  | 'roles'
+  | 'credentials'
+  | 'application'
+  | 'targets';
 
 interface Tab {
   id: TabId;
@@ -40,6 +48,12 @@ const TABS: Tab[] = [
   { id: 'profile', label: 'Profile', icon: User },
   { id: 'users', label: 'Users', icon: Users, permission: 'users:read' },
   { id: 'roles', label: 'Roles', icon: Shield, permission: 'users:read' },
+  {
+    id: 'credentials',
+    label: 'Credentials',
+    icon: KeyRound,
+    permission: 'credentials:read',
+  },
   {
     id: 'application',
     label: 'Application',
@@ -267,6 +281,7 @@ export const Settings: React.FC = () => {
               {current === 'profile' && <ProfileTab />}
               {current === 'users' && <UsersTab currentUserId={user?.id} />}
               {current === 'roles' && <RolesTab />}
+              {current === 'credentials' && <CredentialsTab />}
               {current === 'application' && <ApplicationTab />}
               {current === 'targets' && <TargetsTab />}
             </>

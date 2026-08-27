@@ -373,7 +373,16 @@ def test_both_ends_of_a_link_collapse_into_one_edge(
 
 
 def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switches):
-    add_neighbor(db, org, switches[0], "unmanaged-sw", remote_mgmt_ip="10.9.9.9")
+    """
+    An unmanaged neighbour advertising Bridge is infrastructure
+
+    It shows in the default view; an end host does not. That distinction is
+    the point of the tiered graph.
+    """
+    add_neighbor(
+        db, org, switches[0], "unmanaged-sw",
+        remote_mgmt_ip="10.9.9.9", capabilities="Bridge",
+    )
 
     session = as_user(client, operator)
 
@@ -382,12 +391,151 @@ def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switche
     unmanaged = next(n for n in included["nodes"] if not n["managed"])
     assert unmanaged["label"] == "unmanaged-sw"
     assert unmanaged["ip_address"] == "10.9.9.9"
+    assert unmanaged["tier"] == "edge"
 
     excluded = session.get(
         "/api/v1/discovery/topology", params={"include_unmanaged": False}
     ).json()
     assert excluded["stats"]["unmanaged_nodes"] == 0
     assert excluded["stats"]["links"] == 0
+
+
+def test_end_hosts_are_hidden_from_the_default_view(client, db, org, operator, switches):
+    """
+    The reported problem: every connected host on one diagram
+
+    A phone or a PC is inventory, not topology. It is excluded by default and
+    counted, so the UI can offer a drill-down rather than silently omitting
+    it.
+    """
+    add_neighbor(
+        db, org, switches[0], "desk-phone-204",
+        local_interface="Gi1/0/4", capabilities="Telephone, Bridge",
+    )
+    add_neighbor(
+        db, org, switches[0], "laptop-jc",
+        local_interface="Gi1/0/5", capabilities="Station",
+    )
+    add_neighbor(
+        db, org, switches[0], "idf-2-sw",
+        local_interface="Gi1/0/24", capabilities="Bridge, Router",
+    )
+
+    session = as_user(client, operator)
+    body = session.get("/api/v1/discovery/topology").json()
+
+    labels = {node["label"] for node in body["nodes"]}
+    assert "idf-2-sw" in labels
+    # A phone advertising Bridge as well as Telephone is still a phone.
+    assert "desk-phone-204" not in labels
+    assert "laptop-jc" not in labels
+
+    assert body["stats"]["hidden_hosts"] == 2
+    assert body["stats"]["total_hosts"] == 2
+    assert body["stats"]["by_tier"]["host"] == 2
+
+    # The switch says how many hosts are behind it, so a drill-down can be
+    # offered without fetching them.
+    switch_node = next(n for n in body["nodes"] if n["label"] == "core-01")
+    assert switch_node["host_count"] == 2
+
+
+def test_a_single_node_can_be_drilled_into(client, db, org, operator, switches):
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+    add_neighbor(
+        db, org, switches[1], "phone-b",
+        local_interface="Gi1/0/9", capabilities="Telephone",
+    )
+
+    session = as_user(client, operator)
+    core_key = f"device:{switches[0].id}"
+
+    body = session.get(
+        "/api/v1/discovery/topology", params={"expand": core_key}
+    ).json()
+
+    labels = {node["label"] for node in body["nodes"]}
+    # Only the expanded switch's hosts appear, not the whole network's.
+    assert "phone-a" in labels
+    assert "phone-b" not in labels
+
+
+def test_every_host_can_be_asked_for_explicitly(client, db, org, operator, switches):
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+
+    body = as_user(client, operator).get(
+        "/api/v1/discovery/topology",
+        params={"tiers": "core,distribution,access,edge,host"},
+    ).json()
+
+    assert "phone-a" in {node["label"] for node in body["nodes"]}
+    assert body["stats"]["hidden_hosts"] == 0
+
+
+def test_an_unknown_tier_is_rejected(client, operator):
+    response = as_user(client, operator).get(
+        "/api/v1/discovery/topology", params={"tiers": "core,mezzanine"}
+    )
+
+    assert response.status_code == 400
+    assert "mezzanine" in response.json()["detail"]
+
+
+def test_managed_devices_are_tiered_by_infrastructure_links(
+    client, db, org, operator, switches
+):
+    """
+    A device's tier comes from links to other infrastructure, not its total
+
+    An access switch with 40 hosts on it is still an access switch; counting
+    those would promote it above the core.
+    """
+    # core-01 <-> access-01, plus two more managed devices off core-01.
+    extra = []
+    for index, hostname in enumerate(("dist-01", "dist-02"), start=10):
+        device = Device(
+            organization_id=org.id,
+            hostname=hostname,
+            ip_address=f"10.0.0.{index}",
+            device_type="cisco_ios",
+            username="admin",
+            encrypted_password=encryption_service.encrypt("secret"),
+            is_active=True,
+        )
+        db.add(device)
+        extra.append(device)
+    db.commit()
+
+    add_neighbor(db, org, switches[0], "access-01", remote_device_id=switches[1].id)
+    add_neighbor(
+        db, org, switches[0], "dist-01",
+        local_interface="Gi1/0/2", remote_device_id=extra[0].id,
+    )
+    add_neighbor(
+        db, org, switches[0], "dist-02",
+        local_interface="Gi1/0/3", remote_device_id=extra[1].id,
+    )
+    # And 5 end hosts on the access switch, which must not promote it.
+    for port in range(1, 6):
+        add_neighbor(
+            db, org, switches[1], f"pc-{port}",
+            local_interface=f"Gi1/0/{port}", capabilities="Station",
+        )
+
+    body = as_user(client, operator).get("/api/v1/discovery/topology").json()
+    by_label = {node["label"]: node for node in body["nodes"]}
+
+    assert by_label["core-01"]["tier"] == "core"
+    assert by_label["access-01"]["tier"] == "distribution"
+    assert by_label["dist-01"]["tier"] == "distribution"
+    # Its five hosts did not count.
+    assert by_label["access-01"]["infrastructure_links"] == 1
 
 
 def test_a_saved_layout_is_applied_over_a_fresh_graph(
@@ -792,6 +940,137 @@ def test_a_short_prefix_is_dropped_rather_than_stored(db):
 
     assert written == 1
     assert db.scalar(select(func.count(OuiVendor.oui))) == 1
+
+
+def test_oui_upload_imports_a_manuf_file(client, db, org, roles):
+    """
+    The escape hatch for an install with no outbound internet access
+
+    A browser cannot hand the server a local path, which made the 'file'
+    source unusable from the UI - so "Import IEEE" was the only button, and it
+    fails on any network that cannot reach IEEE.
+    """
+    admin = user_admin.create_user(
+        db, org.id, "uploadadmin", "uploadadmin@example.com",
+        password="uploadpass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    clear_oui(db)
+
+    content = b"F0D5BF Intel Corporate\n001B2C Atron electronic GmbH\n"
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("nmap-mac-prefixes", content, "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["imported"] == 2
+
+    stored = dict(db.execute(select(OuiVendor.oui, OuiVendor.vendor_name)).all())
+    # The whole vendor name, not just its last word.
+    assert stored["f0d5bf"] == "Intel Corporate"
+
+
+def test_oui_upload_rejects_an_empty_file(client, db, org, roles):
+    admin = user_admin.create_user(
+        db, org.id, "emptyadmin", "emptyadmin@example.com",
+        password="emptypass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("empty.csv", b"", "text/plain")},
+    )
+
+    assert response.status_code == 400
+    assert "empty" in response.json()["detail"].lower()
+
+
+def test_oui_upload_rejects_a_file_it_cannot_parse(client, db, org, roles):
+    """
+    An HTML error page must not become 39,000 rows of nonsense
+    """
+    admin = user_admin.create_user(
+        db, org.id, "junkadmin", "junkadmin@example.com",
+        password="junkpass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    response = as_user(client, admin).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("403.html", b"<html><body>Forbidden</body></html>", "text/html")},
+    )
+
+    assert response.status_code == 400
+    assert "No usable OUI entries" in response.json()["detail"]
+
+
+def test_oui_upload_needs_settings_write(client, operator):
+    response = as_user(client, operator).post(
+        "/api/v1/inventory/oui/upload",
+        files={"file": ("x.csv", b"001122 Acme\n", "text/plain")},
+    )
+
+    assert response.status_code == 403
+
+
+def test_a_failed_ieee_import_says_what_it_tried(client, db, org, roles):
+    """
+    The old handler let anything that was not a RuntimeError become a bare 500
+
+    An operator got "500 Internal Server Error" with nothing to act on. Now
+    the response names each source and suggests the upload route.
+    """
+    from unittest import mock
+
+    admin = user_admin.create_user(
+        db, org.id, "ieeeadmin", "ieeeadmin@example.com",
+        password="ieeepass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    with mock.patch(
+        "app.services.oui.import_from_ieee",
+        side_effect=RuntimeError(
+            "Could not fetch the OUI registry from any source. Tried:\n  "
+            "https://standards-oui.ieee.org/oui/oui.csv: 403 Forbidden"
+        ),
+    ):
+        response = as_user(client, admin).post(
+            "/api/v1/inventory/oui/import", json={"source": "ieee"}
+        )
+
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "403 Forbidden" in detail
+    assert "standards-oui.ieee.org" in detail
+
+
+def test_a_write_failure_is_reported_not_swallowed(client, db, org, roles):
+    """
+    A database error mid-import used to surface as an opaque 500
+
+    It still returns 500 - it is a server fault - but names the exception and
+    points at the log, which is the difference between diagnosable and not.
+    """
+    from unittest import mock
+
+    admin = user_admin.create_user(
+        db, org.id, "writeadmin", "writeadmin@example.com",
+        password="writepass1", role_id=roles["Administrator"].id,
+    )["user"]
+
+    with mock.patch(
+        "app.services.oui.import_bundled",
+        side_effect=ValueError("column overflowed"),
+    ):
+        response = as_user(client, admin).post(
+            "/api/v1/inventory/oui/import", json={"source": "bundled"}
+        )
+
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "ValueError" in detail
+    assert "column overflowed" in detail
+    assert "journalctl" in detail
 
 
 def test_backfill_resolves_vendors_for_existing_rows(

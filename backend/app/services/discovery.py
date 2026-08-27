@@ -32,9 +32,10 @@ from sqlalchemy.orm import Session
 
 from app.config.discovery_commands import get_capabilities, supports_discovery
 from app.core.config import settings
+from app.models.credential import Credential as CredentialModel, DeviceProbe
 from app.models.device import Device
 from app.models.network import DiscoveryRun, HostInventory, Neighbor
-from app.services import parsers
+from app.services import credentials as vault, discovery_probe as probe, parsers
 from app.services.device_connector import (
     DeviceConnectionError,
     DeviceCommandError,
@@ -43,8 +44,26 @@ from app.services.device_connector import (
 )
 from app.services.config_retriever import DeviceSnapshot
 from app.services.oui import ensure_populated, oui_lookup
+from app.utils.encryption import encryption_service
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_decrypt(value: Optional[str]) -> Optional[str]:
+    """
+    Decrypt a stored secret, treating a failure as absent
+
+    A credential that cannot be decrypted must not abort a crawl: the run
+    should carry on with the credentials that do work and report the device as
+    unauthenticated.
+    """
+    if not value:
+        return None
+    try:
+        return encryption_service.decrypt(value)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Could not decrypt a stored secret during discovery: {e}")
+        return None
 
 
 @dataclass
@@ -270,12 +289,24 @@ class DiscoveryService:
     # Persistence (single threaded)
     # ------------------------------------------------------------------
 
+    def _hostname_of(self, device_id: Optional[int]) -> Optional[str]:
+        """
+        The hostname of a device, for denormalising onto a discovery row
+
+        One small query rather than making every caller pass it, and it is
+        only reached when a caller did not.
+        """
+        if not device_id:
+            return None
+        return self.db.scalar(select(Device.hostname).where(Device.id == device_id))
+
     def save_neighbors(
         self,
         organization_id: int,
         device_id: int,
         neighbors: Sequence[parsers.Neighbor],
         seen_at: Optional[datetime] = None,
+        device_hostname: Optional[str] = None,
     ) -> int:
         """
         Upsert adjacencies for one device
@@ -285,6 +316,9 @@ class DiscoveryService:
             device_id: The device that reported them
             neighbors: Parsed adjacencies
             seen_at: Timestamp for this observation
+            device_hostname: The reporting device's name, stored on the row so
+                the adjacency still reads sensibly if that device is later
+                deleted
 
         Returns:
             Number of rows written
@@ -293,6 +327,7 @@ class DiscoveryService:
             return 0
 
         seen_at = seen_at or _now()
+        device_hostname = device_hostname or self._hostname_of(device_id)
 
         rows = []
         keys: Set[Tuple] = set()
@@ -316,6 +351,7 @@ class DiscoveryService:
                 {
                     "organization_id": organization_id,
                     "device_id": device_id,
+                    "device_hostname": device_hostname,
                     "local_interface": key[0],
                     "remote_hostname": key[1],
                     "remote_interface": key[2],
@@ -339,6 +375,7 @@ class DiscoveryService:
             set_={
                 "last_seen": statement.excluded.last_seen,
                 "is_active": True,
+                "device_hostname": statement.excluded.device_hostname,
                 "remote_platform": statement.excluded.remote_platform,
                 "remote_mgmt_ip": statement.excluded.remote_mgmt_ip,
                 "remote_chassis_id": statement.excluded.remote_chassis_id,
@@ -357,6 +394,8 @@ class DiscoveryService:
         mac_entries: Sequence[parsers.MacEntry],
         arp_entries: Sequence[parsers.ArpEntry] = (),
         seen_at: Optional[datetime] = None,
+        neighbors: Sequence[parsers.Neighbor] = (),
+        device_hostname: Optional[str] = None,
     ) -> int:
         """
         Upsert host inventory for one device
@@ -367,6 +406,11 @@ class DiscoveryService:
             mac_entries: MAC address table rows
             arp_entries: ARP rows, used to attach IP addresses
             seen_at: Timestamp for this observation
+            neighbors: Adjacencies from the same sweep. A MAC on a port where
+                LLDP or CDP saw a neighbour is that neighbour, which is how a
+                switch, an AP or a phone gets a name instead of just a vendor.
+            device_hostname: The switch's name, stored on the row so it still
+                reads sensibly if the switch is later deleted
 
         Returns:
             Number of rows written
@@ -375,6 +419,23 @@ class DiscoveryService:
             return 0
 
         seen_at = seen_at or _now()
+        device_hostname = device_hostname or self._hostname_of(device_id)
+
+        # What LLDP/CDP announced on each port, so a MAC seen there can be
+        # named. A port with several neighbours is an uplink or a hub, and
+        # naming a host after one of many would be a guess, so those are
+        # skipped.
+        by_port: Dict[str, List[parsers.Neighbor]] = {}
+        for neighbor in neighbors or ():
+            port = parsers.canonical_interface(neighbor.local_interface or "")
+            if port:
+                by_port.setdefault(port, []).append(neighbor)
+
+        announced = {
+            port: found[0]
+            for port, found in by_port.items()
+            if len(found) == 1 and found[0].remote_hostname
+        }
 
         # Resolve vendors from the in-process OUI cache rather than a query
         # per host.
@@ -394,16 +455,22 @@ class DiscoveryService:
                 continue
             keys.add(key)
 
+            neighbor = announced.get(parsers.canonical_interface(entry.interface))
+
             rows.append(
                 {
                     "organization_id": organization_id,
                     "device_id": device_id,
+                    "device_hostname": device_hostname,
                     "interface": entry.interface,
                     "mac_address": entry.mac,
                     "vlan": entry.vlan or 0,
                     "entry_type": entry.entry_type,
                     "ip_address": ip_by_mac.get(entry.mac),
                     "vendor": oui_lookup.lookup(entry.mac, self.db),
+                    "discovered_hostname": neighbor.remote_hostname if neighbor else None,
+                    "discovered_via": neighbor.protocol if neighbor else None,
+                    "discovered_platform": neighbor.remote_platform if neighbor else None,
                     "first_seen": seen_at,
                     "last_seen": seen_at,
                     "is_active": True,
@@ -426,6 +493,20 @@ class DiscoveryService:
                     statement.excluded.ip_address, HostInventory.ip_address
                 ),
                 "vendor": statement.excluded.vendor,
+                "device_hostname": statement.excluded.device_hostname,
+                # Same reasoning as ip_address: a sweep that happened not to
+                # read LLDP must not erase a name an earlier one learned.
+                "discovered_hostname": func_coalesce(
+                    statement.excluded.discovered_hostname,
+                    HostInventory.discovered_hostname,
+                ),
+                "discovered_via": func_coalesce(
+                    statement.excluded.discovered_via, HostInventory.discovered_via
+                ),
+                "discovered_platform": func_coalesce(
+                    statement.excluded.discovered_platform,
+                    HostInventory.discovered_platform,
+                ),
             },
         )
         self.db.execute(statement)
@@ -710,10 +791,22 @@ class DiscoveryService:
         summary.devices_probed += 1
 
         summary.neighbors_found += self.save_neighbors(
-            organization_id, device_id, result.neighbors, seen_at
+            organization_id,
+            device_id,
+            result.neighbors,
+            seen_at,
+            device_hostname=result.snapshot.hostname,
         )
         summary.hosts_found += self.save_inventory(
-            organization_id, device_id, result.mac_entries, result.arp_entries, seen_at
+            organization_id,
+            device_id,
+            result.mac_entries,
+            result.arp_entries,
+            seen_at,
+            # From the same sweep, so a MAC on a port where LLDP or CDP saw a
+            # neighbour gets that neighbour's name.
+            neighbors=result.neighbors,
+            device_hostname=result.snapshot.hostname,
         )
 
         self.db.execute(
@@ -800,10 +893,15 @@ class DiscoveryService:
         """
         Register a neighbour as a managed device
 
-        Credentials come from the seed, because a discovered device has none
-        of its own and the overwhelmingly common case is one set of
-        credentials across the estate. If they are wrong, the device simply
-        fails to back up and is visible as such.
+        The device is probed before it is registered: which transport answers,
+        which vault credential authenticates, and what the device actually is.
+        A device that authenticates is marked eligible for backup; one that
+        does not is still registered - it belongs in the inventory and can be
+        crawled - but stays inactive with the reason recorded.
+
+        This used to inherit the seed's credentials, transport and device type
+        outright, which is why a crawl from one Cisco switch registered every
+        neighbour as cisco_ios over SSH and put them all on the schedule.
 
         Returns:
             The new device id, or None when it could not be registered
@@ -825,25 +923,116 @@ class DiscoveryService:
         if existing:
             return None
 
-        device_type = guess_device_type(
-            neighbor.remote_platform, seed.device_type
+        assessment = self._assess_candidate(
+            organization_id, neighbor.remote_mgmt_ip, neighbor.remote_platform, seed
         )
+
+        # Only fall back to the seed's type when nothing identified the device,
+        # and say so in the description rather than leaving a silent guess.
+        device_type = assessment.device_type
+        guessed = device_type is None
+        if guessed:
+            device_type = guess_device_type(
+                neighbor.remote_platform, seed.device_type
+            )
+
+        facts = assessment.facts or {}
+        credentials_from = "the credential vault"
+
+        # A device that authenticated keeps the credential that worked. One
+        # that did not still needs something stored, or it cannot be retried
+        # from the Devices page, so it inherits the seed's - clearly marked as
+        # unverified by last_auth_status.
+        username = seed.username
+        encrypted_password = seed.encrypted_password
+        enable_secret = seed.enable_secret
+
+        if assessment.credential_id is not None:
+            working = self.db.get(CredentialModel, assessment.credential_id)
+            if working:
+                username = working.username or seed.username
+                encrypted_password = (
+                    working.encrypted_password or seed.encrypted_password
+                )
+                enable_secret = (
+                    working.encrypted_enable_secret or seed.enable_secret
+                )
+                credentials_from = f"credential '{working.name}'"
+
+        transport = assessment.transport or seed.transport or "ssh"
+        port = seed.port
+        if transport == "telnet":
+            port = 23
+        elif transport == "ssh":
+            port = 22
+
+        # Store the SNMP credential that actually answered, not the seed's.
+        # A device found with the vault's third community would otherwise be
+        # polled with the seed's first one on every later crawl and go quiet.
+        snmp_fields = {
+            "snmp_version": seed.snmp_version,
+            "snmp_community": seed.snmp_community,
+            "snmp_v3_user": seed.snmp_v3_user,
+            "snmp_v3_auth_key": seed.snmp_v3_auth_key,
+            "snmp_v3_priv_key": seed.snmp_v3_priv_key,
+            "snmp_v3_auth_protocol": seed.snmp_v3_auth_protocol,
+            "snmp_v3_priv_protocol": seed.snmp_v3_priv_protocol,
+        }
+
+        snmp_probe = assessment.probe_for("snmp")
+        if snmp_probe is not None and snmp_probe.ok and snmp_probe.credential_id:
+            answered = self.db.get(CredentialModel, snmp_probe.credential_id)
+            if answered:
+                snmp_fields.update(
+                    {
+                        "snmp_version": answered.snmp_version
+                        or snmp_fields["snmp_version"],
+                        "snmp_community": answered.encrypted_community
+                        or snmp_fields["snmp_community"],
+                        "snmp_v3_user": answered.snmp_v3_user
+                        or snmp_fields["snmp_v3_user"],
+                        "snmp_v3_auth_key": answered.encrypted_v3_auth_key
+                        or snmp_fields["snmp_v3_auth_key"],
+                        "snmp_v3_priv_key": answered.encrypted_v3_priv_key
+                        or snmp_fields["snmp_v3_priv_key"],
+                        "snmp_v3_auth_protocol": answered.snmp_v3_auth_protocol
+                        or snmp_fields["snmp_v3_auth_protocol"],
+                        "snmp_v3_priv_protocol": answered.snmp_v3_priv_protocol
+                        or snmp_fields["snmp_v3_priv_protocol"],
+                    }
+                )
 
         device = Device(
             organization_id=organization_id,
             hostname=neighbor.remote_hostname[:255],
             ip_address=neighbor.remote_mgmt_ip,
             device_type=device_type,
-            port=seed.port,
-            username=seed.username,
-            encrypted_password=seed.encrypted_password,
-            enable_secret=seed.enable_secret,
-            transport=seed.transport or "ssh",
-            snmp_version=seed.snmp_version,
-            snmp_community=seed.snmp_community,
+            port=port,
+            username=username,
+            encrypted_password=encrypted_password,
+            enable_secret=enable_secret,
+            transport=transport,
             snmp_port=seed.snmp_port,
-            description=f"Discovered from {seed.hostname}",
-            is_active=True,
+            **snmp_fields,
+            description=(
+                f"Discovered from {seed.hostname}"
+                + ("" if not guessed else f"; type not identified, assumed {device_type}")
+            ),
+            # The whole point: eligible for backup only if a login worked.
+            is_active=assessment.backup_eligible,
+            last_auth_status=assessment.auth_status,
+            last_auth_at=_now(),
+            auth_error=assessment.auth_error,
+            credential_id=assessment.credential_id,
+            model=facts.get("model"),
+            serial_number=facts.get("serial_number"),
+            os_version=facts.get("os_version"),
+            snmp_sysname=facts.get("snmp_sysname"),
+            snmp_sysdescr=facts.get("snmp_sysdescr"),
+            snmp_location=facts.get("snmp_location"),
+            snmp_contact=facts.get("snmp_contact"),
+            snmp_last_polled_at=_now() if facts.get("snmp_sysdescr") else None,
+            discovered_facts=facts or None,
             discovered=True,
             discovery_source=seed.hostname,
             last_discovered_at=_now(),
@@ -860,11 +1049,153 @@ class DiscoveryService:
             self.db.rollback()
             return None
 
+        self._record_probes(organization_id, device.id, assessment)
+
         logger.info(
             f"Registered discovered device {device.hostname} "
-            f"({device.ip_address}) as {device_type}"
+            f"({device.ip_address}) as {device_type} over {transport}; "
+            f"auth {assessment.auth_status} via {credentials_from}; "
+            f"backup {'enabled' if assessment.backup_eligible else 'disabled'}"
         )
         return device.id
+
+    # ------------------------------------------------------------------
+    # Probing
+    # ------------------------------------------------------------------
+
+    def _credential_attempts(self, organization_id: int, seed: Device):
+        """
+        The credentials to try against a discovered device, CLI and SNMP
+
+        The vault comes first. The seed's own credentials are appended as a
+        last resort so a crawl still works before anyone has filled the vault
+        in - that was the only behaviour before it existed.
+
+        Args:
+            organization_id: Tenant scope
+            seed: The device the crawl came from
+
+        Returns:
+            (cli attempts, snmp attempts)
+        """
+        cli = vault.list_for_kind(self.db, organization_id, vault.CLI)
+        snmp = vault.list_for_kind(self.db, organization_id, vault.SNMP)
+
+        if seed.username and seed.encrypted_password:
+            cli.append(
+                vault.CredentialAttempt(
+                    id=None,
+                    name=f"inherited from {seed.hostname}",
+                    kind=vault.CLI,
+                    username=seed.username,
+                    password=_safe_decrypt(seed.encrypted_password),
+                    enable_secret=_safe_decrypt(seed.enable_secret),
+                    ssh_key_path=seed.ssh_key_path,
+                )
+            )
+
+        if seed.snmp_version and seed.snmp_community:
+            snmp.append(
+                vault.CredentialAttempt(
+                    id=None,
+                    name=f"inherited from {seed.hostname}",
+                    kind=vault.SNMP,
+                    snmp_version=seed.snmp_version,
+                    community=_safe_decrypt(seed.snmp_community),
+                )
+            )
+
+        return cli, snmp
+
+    def _assess_candidate(
+        self,
+        organization_id: int,
+        ip_address: str,
+        platform_hint: Optional[str],
+        seed: Device,
+    ):
+        """
+        Probe a candidate device before registering it
+
+        Never raises: a probe that blows up must not abort the crawl, so a
+        failure is reported as an unreachable assessment.
+
+        Args:
+            organization_id: Tenant scope
+            ip_address: Address to probe
+            platform_hint: What the neighbour advertised itself as
+            seed: The device the crawl came from
+
+        Returns:
+            DeviceAssessment
+        """
+        cli, snmp = self._credential_attempts(organization_id, seed)
+
+        try:
+            return probe.assess(
+                ip_address,
+                cli_attempts=cli,
+                snmp_attempts=snmp,
+                platform_hint=platform_hint,
+                snmp_port=seed.snmp_port or 161,
+            )
+        except Exception as e:  # noqa: BLE001 - a crawl must survive one bad host
+            logger.warning(f"Probe of {ip_address} failed: {e}")
+            assessment = probe.DeviceAssessment()
+            assessment.auth_status = probe.ERROR
+            assessment.auth_error = str(e)[:1000]
+            return assessment
+
+    def _record_probes(
+        self, organization_id: int, device_id: int, assessment
+    ) -> None:
+        """
+        Store the latest outcome per transport for a device
+
+        Upserted on (device, transport) so a device carries the current state
+        of each rather than an ever-growing log: "SSH refused, telnet timed
+        out, 4 credentials tried" is what the Devices page needs to explain an
+        ineligible device.
+        """
+        if not assessment.probes:
+            return
+
+        rows = [
+            {
+                "organization_id": organization_id,
+                "device_id": device_id,
+                "transport": outcome.transport,
+                "result": outcome.result,
+                "credential_id": outcome.credential_id,
+                "credential_name": outcome.credential_name,
+                "attempts": outcome.attempts,
+                "message": (outcome.message or "")[:2000],
+                "duration": outcome.duration_ms,
+                "probed_at": _now(),
+            }
+            for outcome in assessment.probes
+        ]
+
+        statement = pg_insert(DeviceProbe).values(rows)
+        statement = statement.on_conflict_do_update(
+            index_elements=[DeviceProbe.device_id, DeviceProbe.transport],
+            set_={
+                "result": statement.excluded.result,
+                "credential_id": statement.excluded.credential_id,
+                "credential_name": statement.excluded.credential_name,
+                "attempts": statement.excluded.attempts,
+                "message": statement.excluded.message,
+                "duration": statement.excluded.duration,
+                "probed_at": statement.excluded.probed_at,
+            },
+        )
+        self.db.execute(statement)
+
+        for outcome in assessment.probes:
+            if outcome.credential_id is not None:
+                vault.record_outcome(
+                    self.db, outcome.credential_id, outcome.ok, commit=False
+                )
 
 
 # Platform strings LLDP and CDP report, mapped to our device types. Matched

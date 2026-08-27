@@ -1,7 +1,16 @@
 """
 Device model for network devices
 """
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Integer,
+    String,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -46,6 +55,45 @@ class Device(Base):
     discovered = Column(Boolean, default=False, nullable=False, server_default="false")
     discovery_source = Column(String(255), nullable=True)
     last_discovered_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Whether a CLI login has ever actually succeeded. is_active alone cannot
+    # answer this: a discovered device is in the inventory whether or not
+    # anyone can log into it, and only a device that authenticates is worth
+    # putting on a backup schedule.
+    #
+    # 'never'  - not tried yet
+    # 'success' - a credential worked; the device is backup-eligible
+    # 'auth_failed' - reachable, but no credential was accepted
+    # 'unreachable' - nothing answered on any CLI transport
+    last_auth_status = Column(
+        String(20), nullable=False, default="never", server_default="never"
+    )
+    last_auth_at = Column(DateTime(timezone=True), nullable=True)
+    auth_error = Column(Text, nullable=True)
+
+    # The vault credential that last worked, so the next run tries it first
+    # instead of walking the whole list again.
+    credential_id = Column(
+        Integer, ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # --- facts learned from the device itself -----------------------------
+    # Populated by SNMP where available, otherwise from CLI version output.
+    # These are the fields people search and report on; anything else lands
+    # in discovered_facts.
+    model = Column(String(255), nullable=True)
+    serial_number = Column(String(255), nullable=True)
+    os_version = Column(String(255), nullable=True)
+    snmp_sysname = Column(String(255), nullable=True)
+    snmp_sysdescr = Column(Text, nullable=True)
+    snmp_location = Column(String(255), nullable=True)
+    snmp_contact = Column(String(255), nullable=True)
+    snmp_uptime_seconds = Column(BigInteger, nullable=True)
+    snmp_last_polled_at = Column(DateTime(timezone=True), nullable=True)
+    # Everything else the probe returned - interface counts, chassis ids,
+    # per-vendor OIDs. Free-form on purpose: which OIDs answer varies by
+    # vendor and firmware, and a column per fact would never keep up.
+    discovered_facts = Column(JSONB, nullable=True)
 
     last_backup_at = Column(DateTime(timezone=True), nullable=True)
     last_backup_status = Column(String(20), nullable=True)  # success, failed, pending

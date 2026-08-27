@@ -55,8 +55,13 @@ Authorization: Bearer {token}
 ### List Devices
 ```http
 GET /devices?skip=0&limit=20&device_type=cisco_ios&is_active=true&search=router
+     &sort_by=hostname&sort_dir=asc
 Authorization: Bearer {token}
 ```
+
+`sort_by` accepts any column from `GET /devices/sortable`; anything else is a
+400 rather than a silently ignored parameter. NULLs sort last either way, and
+hostname is the tiebreak so paging through equal values does not repeat rows.
 
 **Response:**
 ```json
@@ -166,6 +171,113 @@ Authorization: Bearer {token}
   "duration": 2.5
 }
 ```
+
+### Everything Known About One Device
+```http
+GET /devices/{id}/detail
+Authorization: Bearer {token}
+```
+
+What the probe learned, the outcome of every transport it tried, the
+credential that worked, the device's adjacencies and how many hosts have been
+seen on its ports. This is what the device name links to on both the Devices
+page and the Inventory page.
+
+**Response:**
+```json
+{
+  "device": { "id": 5, "hostname": "edge-fw", "transport": "snmp", "is_active": false },
+  "authentication": {
+    "status": "auth_failed",
+    "at": "2026-08-27T10:12:00Z",
+    "error": "ssh: authentication failed for every credential; telnet: nothing listening",
+    "credential_id": null,
+    "credential_name": null,
+    "backup_eligible": false
+  },
+  "facts": {
+    "model": "FortiGate-100F",
+    "serial_number": "FG100F0000",
+    "os_version": "7.2.5",
+    "snmp_sysname": "edge-fw",
+    "snmp_uptime_seconds": 864000,
+    "extra": {}
+  },
+  "probes": [
+    {
+      "transport": "snmp",
+      "result": "success",
+      "credential_name": "Read-only community",
+      "attempts": 1,
+      "message": "sysDescr read",
+      "duration_ms": 140,
+      "probed_at": "2026-08-27T10:12:00Z"
+    }
+  ],
+  "neighbors": [],
+  "hosts": { "total": 0, "active": 0, "ports_in_use": 0 }
+}
+```
+
+`authentication.status` is `never`, `success`, `auth_failed`, `unreachable` or
+`error`. A device only becomes eligible for backup once a CLI login has
+actually succeeded - SNMP cannot retrieve a configuration.
+
+### Sortable Columns
+```http
+GET /devices/sortable
+Authorization: Bearer {token}
+```
+
+```json
+{ "columns": ["created_at", "device_type", "hostname", "ip_address", "is_active",
+              "last_auth_status", "last_backup_at", "last_backup_status",
+              "last_discovered_at", "location", "model", "os_version", "transport"] }
+```
+
+### Change Many Devices
+```http
+PATCH /devices/bulk
+Authorization: Bearer {token}
+Content-Type: application/json
+
+{
+  "device_ids": [1, 2, 3],
+  "is_active": false,
+  "location": "Lab rack 4"
+}
+```
+
+Only the fields supplied are written. Credentials are deliberately not
+settable here: pushing one password across a selection is how a whole rack
+ends up unable to authenticate, and the credential vault exists for sharing
+logins.
+
+**Response:**
+```json
+{
+  "success": true,
+  "updated": 3,
+  "not_found": [],
+  "fields": ["is_active", "location"],
+  "message": "Updated 3 device(s)"
+}
+```
+
+### Remove Many Devices
+```http
+POST /devices/bulk-delete
+Authorization: Bearer {token}
+Content-Type: application/json
+
+{ "device_ids": [4, 5] }
+```
+
+The inventory and adjacency history survive: those rows record what was
+plugged into a port and what a switch was cabled to, and deleting the switch
+is not a statement about either. Their `device_id` is nulled and the hostname
+they were seen on is already stored on the row. Stored configuration files go
+with the device, because they are the device's own data.
 
 ### Bulk Upload (CSV)
 ```http
@@ -672,11 +784,29 @@ gone away and when they were last seen.
 ### Topology Graph
 ```http
 GET /discovery/topology?diagram_id=3&active_only=true&include_unmanaged=true
+     &tiers=core,distribution,access,edge&expand=device:4
 ```
 
 The graph is always rebuilt from the current adjacencies. Passing a
 `diagram_id` applies that diagram's saved edits on top, so a device
 discovered since it was saved still appears.
+
+**Tiers.** Every node is placed in a tier and only infrastructure is returned
+by default, because a switch with 200 MACs behind it makes a diagram nobody
+can read - those hosts are inventory, not topology.
+
+| Tier | What it is |
+|------|------------|
+| `core` | A managed device linking to three or more other managed devices |
+| `distribution` | A managed device linking to at least one other |
+| `access` | A managed device with no onward infrastructure links |
+| `edge` | An unmanaged neighbour acting as infrastructure - a switch, router or firewall we do not manage |
+| `host` | An unmanaged neighbour that is not: a phone, an access point, a workstation |
+
+`tiers` is a comma-separated subset; an unknown tier is a 400. `expand` takes
+node keys whose end hosts should be included even while the host tier is
+filtered out - that is the drill-down: unfold one switch without unfolding the
+whole network.
 
 **Response:**
 ```json
@@ -705,9 +835,22 @@ discovered since it was saved still appears.
       "manual": false
     }
   ],
-  "stats": { "nodes": 6, "managed_nodes": 5, "unmanaged_nodes": 1, "links": 5 }
+  "stats": {
+    "nodes": 6,
+    "managed_nodes": 5,
+    "unmanaged_nodes": 1,
+    "links": 5,
+    "hidden_hosts": 12,
+    "total_hosts": 12,
+    "tiers": ["core", "distribution", "access", "edge"],
+    "by_tier": { "core": 1, "distribution": 3, "access": 1, "edge": 1 }
+  }
 }
 ```
+
+Each node also carries `tier`, `host_count` (how many end hosts hang off it,
+so a drill-down can be offered without having fetched them) and
+`infrastructure_links`.
 
 A cable both ends report is one link, not two.
 
@@ -748,6 +891,16 @@ GET /inventory?device_id=3&vlan=10&vendor=cisco&search=aa:bb&active_only=true&se
 
 Returns a paginated list of every host seen on a switch port, with its
 first-seen and last-seen times and the vendor resolved from its MAC.
+
+Each row carries two kinds of name: `hostname`, which a person typed in, and
+`discovered_hostname`, which the host announced over LLDP or CDP on that port
+(`discovered_via` says which protocol, `discovered_platform` what it called
+itself). Only a port with exactly one neighbour gets an announced name - on an
+uplink carrying a whole switch's MACs, attributing the neighbour's name to any
+one of them would be a guess.
+
+`device_id` is null once the switch has been deleted; `device_hostname` still
+names the switch the host was seen on, because the row is history.
 
 ### Annotate a Host
 ```http
@@ -790,6 +943,103 @@ GET /inventory/reports/export        # text/csv
 
 `by-port` flags a port carrying more than five MACs as `likely_uplink`.
 `changes` splits hosts that appeared from hosts that stopped being seen.
+
+---
+
+## Credential Vault
+
+The ordered list of logins discovery tries against a device it has just found.
+Order matters for more than tidiness: every credential that fails costs a
+connection timeout, so the one most likely to work belongs first.
+
+```http
+GET    /credentials?kind=cli&enabled_only=true
+GET    /credentials/summary
+POST   /credentials
+GET    /credentials/{id}
+PUT    /credentials/{id}
+POST   /credentials/reorder      { "credential_ids": [3, 1, 2] }
+DELETE /credentials/{id}
+POST   /credentials/{id}/test?device_id=7
+```
+
+`kind` is `cli` (SSH and telnet, through Netmiko) or `snmp` (read-only:
+inventory and identification, never a backup).
+
+### Create
+```http
+POST /credentials
+Authorization: Bearer {token}
+
+{
+  "name": "Network admin",
+  "kind": "cli",
+  "priority": 10,
+  "username": "netadmin",
+  "password": "…",
+  "enable_secret": "…"
+}
+```
+
+An SNMP credential takes `snmp_version` and either `community` or the v3
+fields (`snmp_v3_user`, `v3_auth_key`, `v3_priv_key`, and the protocols). A CLI
+credential needs a password or an `ssh_key_path`; an SNMP one needs a
+community or a v3 auth key. Anything else is refused rather than stored as a
+credential that can never succeed.
+
+**Response** (and every read): secrets are reduced to booleans.
+```json
+{
+  "id": 1,
+  "name": "Network admin",
+  "kind": "cli",
+  "priority": 10,
+  "is_enabled": true,
+  "username": "netadmin",
+  "has_password": true,
+  "has_enable_secret": true,
+  "has_community": false,
+  "success_count": 12,
+  "failure_count": 1,
+  "last_success_at": "2026-08-27T10:12:00Z"
+}
+```
+
+A `PUT` that omits a secret keeps the stored one; `clear_password`,
+`clear_enable_secret`, `clear_community`, `clear_v3_auth_key` and
+`clear_v3_priv_key` remove one explicitly.
+
+### Try One Against One Device
+```http
+POST /credentials/{id}/test?device_id=7
+```
+
+Returns the outcome rather than raising, so the device's own refusal text can
+be shown:
+```json
+{
+  "success": false,
+  "credential": "Local fallback",
+  "device": "edge-fw",
+  "transport": "ssh",
+  "result": "auth_failed",
+  "message": "Authentication failed",
+  "duration_ms": 2140,
+  "facts": {}
+}
+```
+
+### Summary
+```http
+GET /credentials/summary
+```
+```json
+{ "cli": 2, "snmp": 2, "disabled": 1, "total": 4 }
+```
+
+Shown where a crawl is started: with no CLI credentials a crawl maps the
+topology but authenticates nothing, which is worth saying before the run
+rather than after.
 
 ---
 
@@ -1021,6 +1271,7 @@ flag. A 403 names the permission that was missing.
 | `jobs` | `read`, `write`, `delete` |
 | `discovery` | `read`, `run`, `write` |
 | `inventory` | `read`, `write` |
+| `credentials` | `read`, `write`, `delete` |
 | `reports` | `read` |
 | `users` | `read`, `write`, `delete`, `reset_password` |
 | `settings` | `read`, `write` |
@@ -1069,5 +1320,5 @@ Supported values for `device_type`:
 
 ---
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 **Last Updated:** 2026-08-27

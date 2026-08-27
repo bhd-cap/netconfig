@@ -50,6 +50,11 @@ PERMISSION_CATALOGUE: Dict[str, Dict[str, str]] = {
         "delete": "Delete users",
         "reset_password": "Reset another user's password",
     },
+    "credentials": {
+        "read": "View the credential vault (never the secrets themselves)",
+        "write": "Add and edit discovery credentials",
+        "delete": "Delete discovery credentials",
+    },
     "settings": {
         "read": "View application settings",
         "write": "Change application settings",
@@ -184,6 +189,7 @@ SYSTEM_ROLES: Dict[str, Dict[str, object]] = {
             "inventory:*",
             "reports:read",
             "targets:read",
+            "credentials:read",
         ],
         "is_admin": False,
     },

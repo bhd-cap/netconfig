@@ -279,6 +279,12 @@ columns probably needs one too.
 - Pagination: `skip` (default 0), `limit` (default 20, max 100)
 - Return `PaginatedResponse[T]` with total, page, page_size, total_pages, items
 
+**Sorting**: a sortable column must be in a catalogue - `SORTABLE_COLUMNS` in
+`app/repositories/device.py` maps a name to a mapped column, and anything else
+is a 400. A column name straight from a query string would otherwise be
+interpolated into SQL. Append a stable tiebreak to the ORDER BY (hostname, for
+devices) or paging through equal values repeats and skips rows.
+
 **Authentication**:
 - Use `Depends(get_current_user)` for authenticated endpoints
 - Use `Depends(get_current_admin_user)` for admin-only endpoints
@@ -335,6 +341,38 @@ labels, hidden nodes, hand-drawn links - so a device discovered afterwards
 still appears and a hand-arranged layout is not thrown away by a refresh.
 `_link_key` normalises direction, so a cable both ends report is one edge.
 
+**Tiers and drill-down**: `assign_tiers()` puts every node in `core`,
+`distribution`, `access`, `edge` or `host`, and `build_graph()` returns
+infrastructure only unless asked otherwise. A switch with 200 MACs behind it
+makes a diagram nobody can read, and those hosts are inventory rather than
+topology; `expand=<node key>` unfolds one node's hosts without unfolding the
+network. Two details worth keeping:
+
+- A managed device is tiered by how many *other infrastructure nodes* it links
+  to, never by its total link count. Counting hosts would promote a busy
+  access switch above the core.
+- An unmanaged neighbour is classified from its advertised capabilities, but
+  promoted to `edge` if it has two or more links regardless. Plenty of
+  switches advertise nothing, and one cabled to two devices is forwarding
+  between them whoever owns it.
+
+**Discovered devices are probed, not assumed.** `_register_discovered()` runs
+`discovery_probe.assess()` before writing the row: SNMP first (read-only and
+fast, and sysDescr identifies a platform better than anything short of logging
+in), then each vault CLI credential over SSH, then telnet. `is_active` is set
+from `backup_eligible`, which is true only when a CLI login actually
+succeeded - a device that authenticates nothing stays in the inventory, gets
+crawled, and is kept off the backup schedule with the reason in `auth_error`.
+`identify_platform()` returns **None** when nothing matches rather than
+guessing, which is what stopped every neighbour of a Cisco seed being
+registered as `cisco_ios` over SSH.
+
+Two things a change here must preserve: the SNMP credential that *answered* is
+stored on the new device (not the seed's, or a later crawl polls it with the
+wrong community), and each transport's outcome is upserted into `device_probes`
+on `(device_id, transport)` so the detail view can say "SSH refused, telnet
+timed out, 4 credentials tried".
+
 **OUI**: prefixes are stored as six lowercase hex characters.
 `import_entries()` normalises whatever it is given, because the IEEE registry
 writes them uppercase and a lookup normalises the MAC to lowercase. The bundled
@@ -387,11 +425,31 @@ the role that grants it, is refused.
 The frontend reads `/users/me` to decide what to render. That is a courtesy,
 not a boundary - the API checks every permission itself.
 
+## Credential Vault
+
+`Credential` rows are the ordered list of logins discovery tries against a
+device it has just found: `kind` is `cli` (SSH and telnet) or `snmp`, and
+`priority` is the order within a kind. `POST /credentials/reorder` rewrites
+priority as `position * 10`, so inserting between two later needs no
+renumbering.
+
+Order is not cosmetic - every credential that fails costs a connection
+timeout, and a crawl tries them against every neighbour it finds.
+
+`CredentialAttempt` (`app/services/credentials.py`) is a plain dataclass
+holding *decrypted* values, deliberately not an ORM object: the probe runs off
+the session in a thread pool, and passing a `Credential` row into a worker
+thread would use the session from two threads at once.
+
+`vault.list_for_kind()` returns the enabled credentials for a kind; the seed
+device's own credentials are appended as a last resort so a crawl still works
+before anyone has filled the vault in.
+
 ## Secrets
 
-Device passwords, enable secrets, SNMP communities and v3 keys, the SMTP
-password, and backup-target passwords and private keys are all Fernet
-encrypted with `ENCRYPTION_KEY`.
+Device passwords, enable secrets, SNMP communities and v3 keys, vault
+credentials, the SMTP password, and backup-target passwords and private keys
+are all Fernet encrypted with `ENCRYPTION_KEY`.
 
 Every one of them is write-only over the API: a read returns whether one is
 stored, never the value, and an update that omits the field leaves the stored
@@ -547,21 +605,27 @@ Things to know before changing it:
 ## Current Status
 
 **Complete**:
-- Backend API (86 endpoints)
+- Backend API (98 endpoints)
 - Authentication, roles and per-permission authorization
-- Device management over SSH, telnet and SNMP
+- Device management over SSH, telnet and SNMP, with column sorting, bulk edit
+  and delete, and a detail view of everything discovery learned
+- Credential vault: an ordered list of CLI and SNMP credentials discovery
+  tries, with per-credential success counts and a test-against-one-device
+  endpoint
 - Backup system (manual + scheduled, concurrent), held during maintenance
   windows, with per-job device filtering
 - Configuration comparison
 - Dashboard statistics API
-- Neighbour discovery, seed crawl and the derived topology graph
-- Editable, saved topology diagrams
-- Host inventory with first/last seen and OUI vendor mapping
+- Neighbour discovery, seed crawl and the derived topology graph, tiered into
+  core/distribution/access/edge/host with per-node drill-down
+- Editable, saved topology diagrams, full screen or in their own tab
+- Host inventory with first/last seen, the name each host announces over
+  LLDP/CDP, and OUI vendor mapping
 - Connected-device reports and a CSV export
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (339 tests) and a browser smoke test
+- Backend test suite (407 tests) and browser smoke tests
 - One-line installer
 
 **Incomplete**:

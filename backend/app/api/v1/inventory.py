@@ -7,7 +7,16 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -24,6 +33,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# The full IEEE registry is around 3 MB; Wireshark's manuf is smaller. 32 MB
+# leaves plenty of headroom without letting an upload exhaust memory.
+MAX_OUI_UPLOAD_BYTES = 32 * 1024 * 1024
+
 
 # --------------------------------------------------------------------------
 # Schemas
@@ -34,14 +47,21 @@ class HostResponse(BaseModel):
     """One host seen on a switch port"""
 
     id: int
-    device_id: int
+    # Null once the switch has been deleted: the row is kept as history and
+    # device_hostname still says where the host was seen.
+    device_id: Optional[int] = None
     device_hostname: Optional[str] = None
     interface: str
     mac_address: str
     vlan: Optional[int]
     entry_type: Optional[str]
     ip_address: Optional[str]
+    # Entered by a person.
     hostname: Optional[str]
+    # Announced by the host over LLDP or CDP on this port.
+    discovered_hostname: Optional[str] = None
+    discovered_via: Optional[str] = None
+    discovered_platform: Optional[str] = None
     vendor: Optional[str]
     first_seen: datetime
     last_seen: datetime
@@ -121,15 +141,19 @@ def list_hosts(
             HostInventory.mac_address.ilike(pattern)
             | HostInventory.ip_address.ilike(pattern)
             | HostInventory.hostname.ilike(pattern)
+            | HostInventory.discovered_hostname.ilike(pattern)
         )
 
     total = db.scalar(
         select(func.count(HostInventory.id)).where(*filters)
     ) or 0
 
+    # An outer join: a host whose switch has been deleted is still inventory,
+    # and an inner join would silently drop exactly the history this table
+    # exists to keep.
     rows = db.execute(
         select(HostInventory, Device.hostname)
-        .join(Device, HostInventory.device_id == Device.id)
+        .outerjoin(Device, HostInventory.device_id == Device.id)
         .where(*filters)
         .order_by(HostInventory.last_seen.desc())
         .offset(skip)
@@ -138,7 +162,8 @@ def list_hosts(
 
     items = [
         HostResponse.model_validate(host).model_copy(
-            update={"device_hostname": device_hostname}
+            # Fall back to the name stored on the row when the device is gone.
+            update={"device_hostname": device_hostname or host.device_hostname}
         )
         for host, device_hostname in rows
     ]
@@ -216,10 +241,14 @@ def oui_status(
         "prefixes": count,
         "system_file": oui_service.find_system_oui_file(),
         "ieee_url": oui_service.IEEE_OUI_CSV_URL,
-        "sources": ["system", "bundled", "ieee", "url", "file"],
+        # Every URL an 'ieee' import will try, in order, so the UI can explain
+        # what a failure actually attempted.
+        "ieee_sources": list(oui_service.IEEE_OUI_SOURCES),
+        "sources": ["system", "bundled", "ieee", "url", "file", "upload"],
         "note": (
             "The bundled list is a small starter set. Import the IEEE registry "
-            "or a local OUI database for full vendor coverage."
+            "or a local OUI database for full vendor coverage. With no outbound "
+            "internet access, upload oui.csv or Wireshark's manuf instead."
         ),
     }
 
@@ -263,7 +292,28 @@ def import_oui(
     except HTTPException:
         raise
     except RuntimeError as e:
+        # A source that could not be fetched or parsed. The message names what
+        # was tried, so it is worth returning verbatim.
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OSError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Could not read the OUI source: {e}",
+        )
+    except Exception as e:  # noqa: BLE001
+        # Anything else - a database error mid-import, an unexpected format
+        # crash - used to surface as a bare 500 with nothing to go on. Log the
+        # traceback and return something an operator can act on.
+        logger.exception(f"OUI import from '{request.source}' failed")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=(
+                f"The OUI import failed while writing: {type(e).__name__}: {e}. "
+                f"The full traceback is in the API log "
+                f"(journalctl -u netconfig-api)."
+            ),
+        )
 
     total = db.scalar(select(func.count(OuiVendor.oui))) or 0
 
@@ -272,6 +322,65 @@ def import_oui(
         "imported": written,
         "total_prefixes": total,
         "message": f"Imported {written} prefixes ({total} held in total)",
+    }
+
+
+@router.post("/oui/upload")
+async def upload_oui(
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_permission("settings:write")),
+    db: Session = Depends(get_db),
+):
+    """
+    Import an OUI list from an uploaded file
+
+    The way to populate vendor data on an install with no outbound internet
+    access: download the registry somewhere that has it and upload it here. A
+    browser cannot hand the server a local path, which is what made the
+    'file' source unusable from the UI.
+
+    Accepts the IEEE oui.csv or oui.txt, Wireshark's manuf, or nmap's
+    nmap-mac-prefixes; the format is detected.
+    """
+    content = await file.read()
+
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="The uploaded file is empty"
+        )
+
+    if len(content) > MAX_OUI_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"The uploaded file is {len(content) // 1_000_000} MB; the limit "
+                f"is {MAX_OUI_UPLOAD_BYTES // 1_000_000} MB. The full IEEE "
+                f"registry is around 3 MB."
+            ),
+        )
+
+    try:
+        written = oui_service.import_from_bytes(
+            db, content, filename=file.filename or "upload"
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"OUI upload of '{file.filename}' failed")
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"The upload failed while writing: {type(e).__name__}: {e}",
+        )
+
+    total = db.scalar(select(func.count(OuiVendor.oui))) or 0
+
+    return {
+        "success": True,
+        "imported": written,
+        "total_prefixes": total,
+        "message": f"Imported {written} prefixes from '{file.filename}' "
+        f"({total} held in total)",
     }
 
 
@@ -551,7 +660,7 @@ def export_inventory(
 
     rows = db.execute(
         select(
-            Device.hostname.label("switch"),
+            func.coalesce(Device.hostname, HostInventory.device_hostname).label("switch"),
             HostInventory.interface,
             HostInventory.vlan,
             HostInventory.mac_address,
@@ -560,13 +669,16 @@ def export_inventory(
             # Both tables have a 'hostname'; label the host's so neither is
             # shadowed when the row is read by name.
             HostInventory.hostname.label("host_name"),
+            HostInventory.discovered_hostname,
+            HostInventory.discovered_via,
             HostInventory.entry_type,
             HostInventory.first_seen,
             HostInventory.last_seen,
             HostInventory.is_active,
             HostInventory.notes,
         )
-        .join(Device, HostInventory.device_id == Device.id)
+        # Outer, so a host whose switch was deleted still exports.
+        .outerjoin(Device, HostInventory.device_id == Device.id)
         .where(*filters)
         .order_by(Device.hostname, HostInventory.interface, HostInventory.mac_address)
         .limit(50000)
@@ -577,7 +689,8 @@ def export_inventory(
     writer.writerow(
         [
             "switch", "interface", "vlan", "mac_address", "vendor", "ip_address",
-            "host_name", "entry_type", "first_seen", "last_seen", "active", "notes",
+            "host_name", "discovered_hostname", "discovered_via", "entry_type",
+            "first_seen", "last_seen", "active", "notes",
         ]
     )
 
@@ -591,6 +704,8 @@ def export_inventory(
                 row.vendor or "",
                 row.ip_address or "",
                 row.host_name or "",
+                row.discovered_hostname or "",
+                row.discovered_via or "",
                 row.entry_type or "",
                 row.first_seen.isoformat() if row.first_seen else "",
                 row.last_seen.isoformat() if row.last_seen else "",
