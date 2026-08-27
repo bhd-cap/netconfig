@@ -20,6 +20,7 @@ import io
 import logging
 import re
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -48,6 +49,48 @@ IEEE_OUI_SOURCES = (
 
 # The longest vendor name the column can hold.
 VENDOR_NAME_LIMIT = 255
+
+
+def normalise_vendor_name(value) -> str:
+    """
+    Tidy a vendor name from a registry file
+
+    The IEEE registry is hand-maintained, and it shows: entries contain
+    non-breaking spaces ("Atron\xa0electronic GmbH"), stray tabs, and the
+    occasional zero-width character. Left alone they are invisible in the UI
+    but not invisible to the database - a name holding U+00A0 does not match a
+    search for the same name typed with a normal space.
+
+    Only whitespace and control characters are touched. Accented and CJK
+    letters are part of the company's name and are kept as they are; folding
+    them to ASCII would turn "Télécom" into something nobody searches for.
+
+    Args:
+        value: The name as parsed, possibly None
+
+    Returns:
+        The name with every kind of space collapsed to single spaces, control
+        and format characters removed, and the ends stripped
+    """
+    if value is None:
+        return ""
+
+    out = []
+    for char in str(value):
+        category = unicodedata.category(char)
+
+        if category in ("Zs", "Zl", "Zp"):
+            # Every kind of space separator, U+00A0 included.
+            out.append(" ")
+        elif category in ("Cc", "Cf"):
+            # Control and format characters: tabs and newlines become spaces,
+            # zero-width joiners and similar are dropped outright.
+            out.append(" " if char in "\t\r\n\v\f" else "")
+        else:
+            out.append(char)
+
+    # Collapse runs of whitespace and strip the ends in one step.
+    return " ".join("".join(out).split())
 
 # Shipped with the application so a brand new install is useful offline.
 BUNDLED_OUI_PATH = Path(__file__).resolve().parent.parent / "data" / "oui_common.csv"
@@ -282,7 +325,7 @@ def import_entries(db: Session, entries: List[Tuple[str, str]]) -> int:
         if len(cleaned) != 6:
             continue
 
-        name = (str(vendor) if vendor is not None else "").strip()
+        name = normalise_vendor_name(vendor)
         if not name:
             continue
 
