@@ -1,0 +1,8 @@
+.git/
+.venv/
+venv/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+backups/
+config-backup.zip

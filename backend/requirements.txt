@@ -1,0 +1,39 @@
+# Runtime dependencies only. Development and test tooling lives in
+# requirements-dev.txt so it never ships in the production image.
+
+# Web Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+python-multipart==0.0.6
+orjson==3.9.12
+
+# Database
+sqlalchemy==2.0.25
+alembic==1.13.1
+psycopg2-binary==2.9.9
+
+# Network Automation
+netmiko==4.3.0
+paramiko==3.4.0
+
+# Task Queue
+celery==5.3.6
+redis==5.0.1
+flower==2.0.1
+
+# Security
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+cryptography==42.0.2
+pydantic[email]==2.5.3
+pydantic-settings==2.1.0
+
+# Utilities
+python-dotenv==1.0.0
+croniter==2.0.1
+
+# Removed: pandas (and its numpy dependency) and aiofiles were declared but
+# imported nowhere in the codebase - CSV handling uses the standard library
+# csv module. Dropping pandas takes roughly 150 MB of wheels and the numpy
+# runtime out of every backend, worker, beat and flower container.

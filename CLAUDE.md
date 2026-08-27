@@ -32,8 +32,11 @@ docker-compose up -d --build backend
 ```bash
 cd backend
 
-# Install dependencies
+# Install dependencies (runtime only)
 pip install -r requirements.txt
+
+# Install with test and lint tooling
+pip install -r requirements-dev.txt
 
 # Run database migrations
 alembic upgrade head
@@ -228,6 +231,48 @@ Organization (1) ←→ (many) BackupJobs
 
 **Retention**: Configurable via `DEFAULT_RETENTION_DAYS` (default 90). Applied per-device by `apply_retention_policy()`.
 
+## Performance Conventions
+
+These exist because the obvious version of each was measurably worse. Keep
+them in mind when extending the corresponding layer.
+
+**Sessions**: `SessionLocal` sets `expire_on_commit=False` and the declarative
+base sets `eager_defaults`. A `create()` is therefore one
+`INSERT ... RETURNING` - do not add a `refresh()` after it, and do not rely on
+attributes being reloaded from the database after a commit.
+
+**Batched writes**: repository `create`/`create_many`/`update` and
+`audit_repo.log_action` all take `commit=False`. When a request or task writes
+several rows, pass `commit=False` and commit once at the end rather than
+per row.
+
+**Counting**: use `select(func.count(Model.id))`, not `Query.count()`, which
+wraps the entity SELECT in a subquery.
+
+**Relationships in lists**: a listing that reads `row.related.field` must
+eager-load it (`contains_eager` when the join already exists, otherwise
+`selectinload`), or select the specific columns. Reading a lazy relationship
+inside a loop is one extra query per row.
+
+**Aggregates**: prefer one query with `func.count(...).filter(...)` /
+`func.sum(...)` over several counting queries. Never use `func.case(...)` -
+that emits a call to a SQL function named "case", which does not exist. Import
+`case` from `sqlalchemy` instead.
+
+**Diffing**: `ConfigurationComparison` computes one `SequenceMatcher` per
+comparison and derives the unified diff, the structured diff and the
+statistics from its cached opcodes. Do not call `difflib.unified_diff` or
+build a second matcher alongside it. `HtmlDiff` is expensive and only rendered
+when `include_html=True`.
+
+**Backups**: retrieval happens off the database session (see
+`_fetch_and_store`), which is what makes concurrent bulk backups safe. Keep
+network and disk work there, and all ORM work in `_persist`.
+
+**Indexes**: hot query paths are backed by composite indexes in migration
+`0002`. A new frequently-run query that filters and orders on different
+columns probably needs one too.
+
 ## API Design Patterns
 
 **All list endpoints**:
@@ -305,7 +350,9 @@ alembic upgrade head
 
 **Backend**: API endpoint tests connect to real database and Redis (use test fixtures to create/cleanup test data). Mock Netmiko connections for device tests.
 
-**Frontend**: Not yet implemented (placeholder pages exist for Devices, Backups, Jobs, Compare).
+**Frontend**: No test suite yet. `npm run build` runs `tsc` first, so type
+errors fail the build - treat that as the type-checking gate. There is no
+ESLint configuration file, so `npm run lint` does not currently run.
 
 ## Deployment
 
@@ -318,23 +365,68 @@ alembic upgrade head
 6. Configure firewall rules
 7. Monitor Celery queues with Flower
 
-**Docker services**: postgres, redis, backend, celery_worker, celery_beat, flower, frontend, nginx (8 total)
+**Docker services** (6 by default): postgres, redis, backend, celery_worker,
+celery_beat, frontend.
 
-## Current Status (75% Complete)
+Two more are behind profiles so they cost nothing unless asked for:
+- `--profile monitoring` adds flower (task monitor, :5555)
+- `--profile proxy` adds nginx (single-origin TLS termination, :80/:443)
+
+The frontend image builds the bundle and serves it from nginx; it is not the
+Vite dev server. The backend runs uvicorn workers, not `--reload`. Neither
+mounts host source, so a container runs the code it was built with - use
+`docker-compose.override.yml` for a live-reload dev loop.
+
+**Install**: `./install.sh` (or `curl -fsSL <raw install.sh URL> | bash`)
+generates `.env` with random secrets, builds, waits for `/api/v1/health`,
+migrates, and creates the admin user with the temporary password `changeme`.
+Re-running keeps existing secrets. `deploy.sh` now just delegates to it.
+
+### LXC / systemd deployment (`lxc/`)
+
+A second, Docker-free deployment installs the same code natively:
+`lxc/install.sh` runs inside a Debian/Ubuntu container or host,
+`lxc/proxmox-create-lxc.sh` runs on a Proxmox host and creates the container
+first. See `lxc/README.md`.
+
+Things to know before changing it:
+- Config lives at `/etc/netconfig-backup/netconfig.env`, **not**
+  `/etc/netconfig` - that path is a regular file on every Debian/Ubuntu system
+  (`libtirpc-common`, see `netconfig(5)`), so a directory cannot be created
+  there.
+- That file is a systemd `EnvironmentFile`: bare `KEY=value`, no shell
+  quoting. Never `source` it from a shell - `ADMIN_ORG_NAME=Default
+  Organization` would execute `Organization` as a command. `run_as_service`
+  parses it literally the way systemd does.
+- The unit files in `lxc/systemd/` are templates; `@APP_DIR@`, `@DATA_DIR@`,
+  `@CONFIG_FILE@` and `@USER@` are substituted at install time. Same for
+  `@HTTP_PORT@`, `@API_PORT@` and `@LISTEN6@` in `lxc/nginx/netconfig.conf`.
+- The IPv6 listener is added only when `/proc/net/if_inet6` exists; a
+  hard-coded `listen [::]:80` makes nginx fail to start on IPv4-only hosts.
+- `$APP_DIR` is deliberately not world-readable. nginx runs as `www-data`, so
+  only traversal on `$APP_DIR` and `$APP_DIR/frontend` plus read on
+  `frontend/dist` is granted (`publish_bundle`).
+- The LXC build sets `VITE_API_URL=/api/v1`, so nginx serves the UI and proxies
+  the API on one origin and CORS is not involved. The Docker build bakes in an
+  absolute URL because the API is published on a separate port there.
+
+## Current Status
 
 **Complete**:
 - Backend API (35 endpoints)
 - Authentication system
 - Device management
-- Backup system (manual + scheduled)
+- Backup system (manual + scheduled, concurrent)
 - Configuration comparison
 - Dashboard statistics API
-- Frontend foundation (auth + dashboard)
+- Frontend pages and dashboard charts
+- One-line installer
 
 **Incomplete**:
-- Frontend UI pages (Devices, Backups, Jobs, Compare) - placeholders exist
-- Charts on dashboard
-- Integration tests
+- Automated test suite (no tests committed under `backend/tests/`)
+- Frontend tests and an ESLint configuration
+- Per-job device filtering: `BackupJob.device_filter` is stored but ignored;
+  a scheduled job always backs up every active device in the organization
 - User documentation
 
 ## Key Files to Reference

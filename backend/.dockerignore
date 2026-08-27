@@ -1,0 +1,17 @@
+# Keep the build context small: everything here would otherwise be copied
+# into the image layer by `COPY . .`
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+tests/
+.env
+.env.*
+venv/
+.venv/
+*.md
+requirements-dev.txt

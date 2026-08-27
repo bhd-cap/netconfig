@@ -1,0 +1,41 @@
+[Unit]
+Description=NetConfig Backup scheduler (Celery beat)
+Documentation=https://github.com/bhd-cap/netconfig
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP_DIR@/backend
+EnvironmentFile=@CONFIG_FILE@
+
+# Beat only publishes messages onto the queue; the worker does the work. Its
+# schedule state lives under the data directory so it survives restarts.
+ExecStart=@APP_DIR@/venv/bin/celery -A app.celery_app beat \
+    --loglevel=${LOG_LEVEL} \
+    --schedule=@DATA_DIR@/celerybeat-schedule
+
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+MemoryHigh=192M
+MemoryMax=256M
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=@DATA_DIR@
+
+[Install]
+WantedBy=multi-user.target

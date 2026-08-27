@@ -1,73 +1,108 @@
-╔══════════════════════════════════════════════════════════════════════╗
-║                    QUICK START AFTER RESTART                         ║
-╚══════════════════════════════════════════════════════════════════════╝
+=======================================================================
+                          QUICK START
+=======================================================================
 
-📍 PROJECT LOCATION:
-   cd /home/jcaparoso/projects/code/config-backup
+ONE LINE INSTALL
 
-🔧 SETUP STEPS (Run these in order):
+   curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/install.sh | bash
 
-1. Test Docker:
-   docker ps
+Or, from inside a checkout of this repository:
 
-2. Create frontend .env:
-   echo "VITE_API_URL=http://localhost:8000/api/v1" > frontend/.env
+   ./install.sh
 
-3. Build images (5-10 min):
-   docker-compose build
+The installer does everything: checks Docker, generates secrets, builds
+the images, starts the stack, waits for the API to report healthy, runs
+migrations and creates the admin user.
 
-4. Start services:
-   docker-compose up -d
+-----------------------------------------------------------------------
 
-5. Wait 60 seconds, then initialize:
-   docker-compose exec backend alembic upgrade head
-   docker-compose exec backend python init_db.py
+NO DOCKER? LXC / systemd INSTALL
 
-6. Open in browser:
-   http://localhost:3000
+Installs natively instead: PostgreSQL, Redis, nginx and the application
+as ordinary systemd services, all on port 80.
 
-7. Login:
-   Username: admin
-   Password: admin123
+   On a Proxmox host (creates the container for you):
 
-✅ YOU'RE DONE! Dashboard should show statistics.
+      bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/proxmox-create-lxc.sh)"
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   Inside an existing Debian/Ubuntu container or server:
 
-📚 HELPFUL COMMANDS:
+      bash -c "$(curl -fsSL https://raw.githubusercontent.com/bhd-cap/netconfig/main/lxc/install.sh)"
 
-View logs:          docker-compose logs -f
-Check status:       docker-compose ps
-Restart:            docker-compose restart
-Stop all:           docker-compose down
-Database access:    docker-compose exec postgres psql -U netbackup -d netconfig_backup
+   Manage with:  systemctl status netconfig-api
+                 journalctl -u netconfig-worker -f
+   Details:      lxc/README.md
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-----------------------------------------------------------------------
 
-🌐 SERVICE URLS:
+OPEN
 
-Frontend:        http://localhost:3000
-Backend API:     http://localhost:8000
-API Docs:        http://localhost:8000/docs
-Task Monitor:    http://localhost:5555
+   Web UI      http://localhost:3000
+   API docs    http://localhost:8000/docs
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LOG IN
 
-📖 READ FOR DETAILS:
-   - CHECKPOINT.md (complete resume point)
-   - DOCKER_TESTING_GUIDE.md (troubleshooting)
-   - BACKEND_SUMMARY.md (backend features)
-   - API_REFERENCE.md (API endpoints)
+   Username    admin
+   Password    changeme      <- temporary, change after first login
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+-----------------------------------------------------------------------
 
-⚠️  IF DOCKER PS FAILS:
-   1. Start Docker Desktop on Windows
-   2. Wait for green "running" indicator
-   3. Enable WSL Integration in Settings
-   4. Try 'docker ps' again
+KEEP A COPY OF .env
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ENCRYPTION_KEY in .env decrypts every stored device password. If it is
+   lost, saved credentials cannot be recovered.
 
-Progress: 75% Complete ✅
-Backend: 100% | Frontend Foundation: 100% | UI Pages: 0%
+-----------------------------------------------------------------------
+
+INSTALLER OPTIONS
+
+   INSTALL_DIR=/opt/netconfig    where to install (default ./netconfig)
+   ADMIN_PASSWORD=...            admin password (default changeme)
+   FRONTEND_PORT=3000            published UI port
+   BACKEND_PORT=8000             published API port
+   WITH_MONITORING=true          also start Flower on :5555
+   SKIP_BUILD=true               reuse existing images
+
+   Example:
+      INSTALL_DIR=/opt/netconfig WITH_MONITORING=true ./install.sh
+
+-----------------------------------------------------------------------
+
+MANAGING THE STACK
+
+   Status              docker compose ps
+   Follow logs         docker compose logs -f
+   Follow one service  docker compose logs -f backend
+   Restart a service   docker compose restart backend
+   Stop everything     docker compose down
+   Stop and wipe data  docker compose down -v      (deletes backups!)
+
+   Task monitor        docker compose --profile monitoring up -d
+   TLS proxy on :80    docker compose --profile proxy up -d
+
+-----------------------------------------------------------------------
+
+RE-RUNNING THE INSTALLER
+
+   Safe. It keeps the existing .env and its secrets, rebuilds, and resets
+   the admin password back to ADMIN_PASSWORD.
+
+-----------------------------------------------------------------------
+
+IF SOMETHING IS WRONG
+
+   Docker not reachable
+      Start Docker Desktop. In WSL, enable integration for the distro
+      under Settings -> Resources -> WSL Integration.
+
+   Port already in use
+      FRONTEND_PORT=3100 BACKEND_PORT=8100 ./install.sh
+
+   API never becomes healthy
+      docker compose logs backend
+      docker compose ps
+
+   Forgot the admin password
+      docker compose exec backend python init_db.py --reset-admin-password
+
+=======================================================================

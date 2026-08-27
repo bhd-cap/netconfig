@@ -1,0 +1,51 @@
+[Unit]
+Description=NetConfig Backup worker (Celery)
+Documentation=https://github.com/bhd-cap/netconfig
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+Requires=postgresql.service redis-server.service
+
+[Service]
+Type=exec
+User=@USER@
+Group=@USER@
+WorkingDirectory=@APP_DIR@/backend
+EnvironmentFile=@CONFIG_FILE@
+
+# A backup task is almost entirely SSH wait, and each task already opens
+# several sessions in parallel internally (MAX_CONCURRENT_BACKUPS), so a small
+# pool of processes is enough. -Ofair keeps a slow task from blocking work
+# already prefetched behind it.
+ExecStart=@APP_DIR@/venv/bin/celery -A app.celery_app worker \
+    --loglevel=${LOG_LEVEL} \
+    --concurrency=${CELERY_CONCURRENCY} \
+    -Ofair \
+    --max-tasks-per-child=200 \
+    --without-gossip --without-mingle
+
+Restart=always
+RestartSec=5s
+
+# Long enough for an in-flight device backup to finish rather than be killed
+# part way through writing a configuration.
+TimeoutStopSec=300s
+KillSignal=SIGTERM
+
+Environment=MALLOC_ARENA_MAX=2
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+MemoryHigh=768M
+MemoryMax=1G
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=@DATA_DIR@
+
+[Install]
+WantedBy=multi-user.target
