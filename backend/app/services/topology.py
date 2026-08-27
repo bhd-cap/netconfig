@@ -13,6 +13,7 @@ may be a managed device (device:12) or a neighbour we only know by name
 positions still attach to the right node.
 """
 import logging
+import re
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import select
@@ -75,6 +76,125 @@ def _link_key(source: str, target: str, source_port: str, target_port: str) -> s
     """
     ends = sorted([f"{source}|{source_port or ''}", f"{target}|{target_port or ''}"])
     return "::".join(ends)
+
+
+# --------------------------------------------------------------------------
+# What kind of thing a node is, for the icon on the diagram
+# --------------------------------------------------------------------------
+
+KIND_ROUTER = "router"
+KIND_SWITCH = "switch"
+KIND_FIREWALL = "firewall"
+KIND_WIRELESS = "wireless"
+KIND_SERVER = "server"
+KIND_PHONE = "phone"
+KIND_PRINTER = "printer"
+KIND_HOST = "host"
+KIND_UNKNOWN = "unknown"
+
+# Matched against the platform string, model, and system description, most
+# specific first. A firewall that says "Cisco ASA" must not be read as a
+# router by the "cisco" rule further down.
+_KIND_PATTERNS = (
+    (r"firewall|fortigate|fortiwifi|palo ?alto|\basa\d*\b|adaptive security|"
+     r"\bsrx\d*\b|checkpoint|check point|sonicwall|pfsense|\bfgt\d*\b",
+     KIND_FIREWALL),
+    # AIR- is Cisco's wireless part-number prefix, and a CDP platform string
+    # is often nothing but a part number.
+    (r"wireless|wlan|access point|\bap\d*\b|aironet|airwave|meraki mr|"
+     r"unifi ap|\bwap\d*\b|\bair-", KIND_WIRELESS),
+    (r"\brouter\b|\bisr\d*\b|\basr\d*\b|\bmx\d|\bcsr\d*\b|gateway",
+     KIND_ROUTER),
+    # ws-c and c<four digits> are Catalyst part numbers, j####a is ProCurve's:
+    # a neighbour frequently advertises only that.
+    (r"switch|catalyst|nexus|\bex\d|procurve|comware|aruba \d|\bsw\d|"
+     r"\bws-c\d|\bc\d{4}|\bj\d{4}a\b", KIND_SWITCH),
+    (r"printer|laserjet|officejet|\bmfp\b", KIND_PRINTER),
+    (r"\bphone\b|telephone|voip|polycom|yealink|\bcp-\d", KIND_PHONE),
+    (r"server|\besxi\b|vmware|windows|linux|ubuntu|\bnas\b|storage",
+     KIND_SERVER),
+)
+
+# The capability letters LLDP and CDP advertise, which are more reliable than
+# a model string because they say what the device does rather than what it is
+# called.
+_CAPABILITY_KINDS = (
+    ("phone", KIND_PHONE),
+    ("telephone", KIND_PHONE),
+    ("wlan", KIND_WIRELESS),
+    ("wireless", KIND_WIRELESS),
+    ("access point", KIND_WIRELESS),
+    ("router", KIND_ROUTER),
+    ("l3", KIND_ROUTER),
+    ("bridge", KIND_SWITCH),
+    ("switch", KIND_SWITCH),
+    ("l2", KIND_SWITCH),
+    ("station", KIND_HOST),
+    ("host", KIND_HOST),
+)
+
+# What each managed platform is, when nothing more specific is known. These
+# are the safe reading of the device type alone: a Catalyst is a switch, a
+# FortiGate is a firewall, and an IOS box could be either so it stays a
+# switch unless its model or description says otherwise.
+_DEVICE_TYPE_KINDS = {
+    "cisco_ios": KIND_SWITCH,
+    "cisco_ios_xe": KIND_ROUTER,
+    "cisco_nxos": KIND_SWITCH,
+    "arista_eos": KIND_SWITCH,
+    "fortinet": KIND_FIREWALL,
+    "juniper_junos": KIND_ROUTER,
+    "aruba_os": KIND_SWITCH,
+    "hp_comware": KIND_SWITCH,
+    "hp_procurve": KIND_SWITCH,
+}
+
+
+def classify_kind(
+    device_type: Optional[str] = None,
+    capabilities: Optional[str] = None,
+    platform: Optional[str] = None,
+    model: Optional[str] = None,
+    sysdescr: Optional[str] = None,
+) -> str:
+    """
+    What kind of device this is, for the icon the diagram draws
+
+    Evidence in order of how much it is worth. A model or description names
+    the product outright ("FortiGate-60E", "Catalyst 9300"), which beats the
+    advertised capabilities, which in turn beat the platform type - a device
+    type of cisco_ios covers switches and routers alike, so on its own it is
+    only a default.
+
+    Args:
+        device_type: The managed platform, if any
+        capabilities: LLDP/CDP capability string
+        platform: The platform string a neighbour advertised
+        model: The model, from SNMP or a version command
+        sysdescr: The SNMP system description
+
+    Returns:
+        One of the KIND_* constants; KIND_UNKNOWN when nothing said anything
+    """
+    described = " ".join(
+        part for part in (model, sysdescr, platform) if part
+    ).lower()
+
+    if described:
+        for pattern, kind in _KIND_PATTERNS:
+            if re.search(pattern, described):
+                return kind
+
+    if capabilities:
+        lowered = capabilities.lower()
+        for word, kind in _CAPABILITY_KINDS:
+            if word in lowered:
+                return kind
+
+    if device_type and device_type in _DEVICE_TYPE_KINDS:
+        return _DEVICE_TYPE_KINDS[device_type]
+
+    return KIND_UNKNOWN
 
 
 def classify_unmanaged(capabilities: Optional[str], platform: Optional[str]) -> str:
@@ -201,6 +321,11 @@ def build_graph(
             Device.is_active,
             Device.discovered,
             Device.last_backup_status,
+            # For the icon: a model or system description names the product,
+            # which a device type alone cannot.
+            Device.model,
+            Device.snmp_sysdescr,
+            Device.last_auth_status,
         ).where(Device.organization_id == organization_id)
     ).all()
 
@@ -218,6 +343,13 @@ def build_graph(
             "is_active": device.is_active,
             "discovered": bool(device.discovered),
             "last_backup_status": device.last_backup_status,
+            "last_auth_status": device.last_auth_status,
+            "model": device.model,
+            "kind": classify_kind(
+                device_type=device.device_type,
+                model=device.model,
+                sysdescr=device.snmp_sysdescr,
+            ),
             "link_count": 0,
         }
 
@@ -258,6 +390,10 @@ def build_graph(
                     "is_active": True,
                     "discovered": True,
                     "link_count": 0,
+                    "kind": classify_kind(
+                        capabilities=adjacency.capabilities,
+                        platform=adjacency.remote_platform,
+                    ),
                     "tier": classify_unmanaged(
                         adjacency.capabilities, adjacency.remote_platform
                     ),

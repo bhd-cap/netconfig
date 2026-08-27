@@ -452,6 +452,15 @@ export interface TopologyNode {
   is_active: boolean;
   discovered: boolean;
   last_backup_status?: string | null;
+  last_auth_status?: string | null;
+  model?: string | null;
+  /**
+   * What sort of device this is, for the icon the diagram draws: router,
+   * switch, firewall, wireless, server, phone, printer, host or unknown.
+   * Worked out by the API from the model, description, advertised
+   * capabilities and platform, in that order of trust.
+   */
+  kind?: string | null;
   link_count: number;
   x?: number;
   y?: number;

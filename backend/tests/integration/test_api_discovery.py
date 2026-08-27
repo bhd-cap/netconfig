@@ -1349,3 +1349,70 @@ def test_reports_are_tenant_scoped(client, db, operator):
         "/api/v1/inventory/reports/summary"
     ).json()["total_entries"] == 0
     assert session.get("/api/v1/inventory/reports/export").text.count("\n") == 1
+
+
+# --------------------------------------------------------------------------
+# What kind of device a node is, for the icon the diagram draws
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kwargs,expected",
+    [
+        # A model or description names the product outright.
+        ({"model": "FortiGate-60E"}, "firewall"),
+        ({"model": "SRX340"}, "firewall"),
+        ({"model": "ASA5516-X"}, "firewall"),
+        ({"sysdescr": "Cisco Adaptive Security Appliance"}, "firewall"),
+        ({"model": "ASR1001-X"}, "router"),
+        ({"model": "ISR4331"}, "router"),
+        ({"model": "Catalyst 9300-48P"}, "switch"),
+        ({"platform": "WS-C2960X-48FPS-L"}, "switch"),
+        ({"platform": "AIR-AP2802I"}, "wireless"),
+        ({"platform": "HP LaserJet 4200"}, "printer"),
+        ({"sysdescr": "VMware ESXi 7.0.3"}, "server"),
+        # ...and beats the device type, which is only a default.
+        ({"device_type": "cisco_ios", "model": "ASA5516-X"}, "firewall"),
+        # Capabilities beat the device type too, and say what a thing does.
+        ({"capabilities": "Router; Bridge"}, "router"),
+        ({"capabilities": "Bridge"}, "switch"),
+        ({"capabilities": "WLAN Access Point"}, "wireless"),
+        ({"capabilities": "Station Only"}, "host"),
+        # A phone advertises Bridge as well, because it has a PC port.
+        ({"capabilities": "Telephone; Bridge"}, "phone"),
+        # The platform alone, when that is all there is.
+        ({"device_type": "cisco_ios"}, "switch"),
+        ({"device_type": "cisco_ios_xe"}, "router"),
+        ({"device_type": "fortinet"}, "firewall"),
+        ({"device_type": "juniper_junos"}, "router"),
+        # Nothing said anything, and guessing would put the wrong icon on the
+        # diagram with no way for anyone to tell.
+        ({}, "unknown"),
+        ({"device_type": "something_new"}, "unknown"),
+    ],
+)
+def test_classify_kind(kwargs, expected):
+    from app.services.topology import classify_kind
+
+    assert classify_kind(**kwargs) == expected
+
+
+def test_graph_nodes_carry_a_kind(client, db, org, operator, switches):
+    """The diagram needs it per node, without a second request per icon"""
+    switches[0].model = "Catalyst 9300-48P"
+    db.commit()
+
+    add_neighbor(
+        db, org, switches[0], "fw-edge-01",
+        remote_platform="FortiGate-100F", capabilities="Router",
+    )
+
+    body = as_user(client, operator).get(
+        "/api/v1/discovery/topology", params={"include_unmanaged": True}
+    ).json()
+
+    kinds = {node["label"]: node.get("kind") for node in body["nodes"]}
+
+    assert kinds[switches[0].hostname] == "switch"
+    # The model beat the advertised capability, which said only "Router".
+    assert kinds["fw-edge-01"] == "firewall"
