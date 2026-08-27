@@ -28,8 +28,11 @@ class Device(Base):
     ip_address = Column(String(45), nullable=False, index=True)  # Supports IPv4 and IPv6
     device_type = Column(String(50), nullable=False, index=True)  # cisco_ios, arista_eos, etc.
     port = Column(Integer, default=22, nullable=False)
-    username = Column(String(100), nullable=False)
-    encrypted_password = Column(Text, nullable=False)  # Fernet encrypted
+    # Nullable because a device can draw its login from the credential
+    # vault instead of holding one (see credential_id below), and an
+    # SNMP-only device is never logged into at all.
+    username = Column(String(100), nullable=True)
+    encrypted_password = Column(Text, nullable=True)  # Fernet encrypted
     enable_secret = Column(Text, nullable=True)  # For Cisco devices (Fernet encrypted)
     ssh_key_path = Column(Text, nullable=True)  # Optional SSH key path
     description = Column(Text, nullable=True)
@@ -71,9 +74,21 @@ class Device(Base):
     last_auth_at = Column(DateTime(timezone=True), nullable=True)
     auth_error = Column(Text, nullable=True)
 
-    # The vault credential that last worked, so the next run tries it first
-    # instead of walking the whole list again.
+    # The vault credential this device logs in with.
+    #
+    # Set two ways: discovery records whichever CLI login worked, so the next
+    # run tries it first instead of walking the whole list again; and a person
+    # can choose one when editing the device, instead of typing a username and
+    # password that then have to be changed here as well at every rotation.
+    # Null means the device uses the username and password stored on itself.
     credential_id = Column(
+        Integer, ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # The same, for SNMP. Separate from credential_id because a device commonly
+    # needs both at once - SSH to back up the configuration, SNMP to poll
+    # inventory - and the vault keeps its cli and snmp entries apart.
+    snmp_credential_id = Column(
         Integer, ForeignKey("credentials.id", ondelete="SET NULL"), nullable=True
     )
 

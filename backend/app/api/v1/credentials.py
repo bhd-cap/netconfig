@@ -446,6 +446,9 @@ def reorder_credentials(
 def delete_credential(
     credential_id: int,
     request: Request,
+    force: bool = Query(
+        False, description="Delete even while devices are logging in with it"
+    ),
     db: Session = Depends(get_db),
     organization_id: int = Depends(get_organization_id),
     current_user: User = Depends(require_permission("credentials:delete")),
@@ -453,12 +456,32 @@ def delete_credential(
     """
     Delete a credential set
 
-    Devices that authenticated with it keep working - they hold their own copy
-    of the credentials that succeeded - but they lose the hint that made the
-    next crawl try this one first.
+    Refused while a device logs in with it. A device that names a vault
+    credential holds no login of its own, so deleting it out from under one
+    would break that device's backups at the next run with nothing on screen
+    to explain why - the reference would simply have become null. Pass
+    force=true to delete anyway; those devices then fall back to whatever is
+    stored on themselves, which for most is nothing.
+
+    A credential that merely recorded a past success blocks nothing: discovery
+    keeps its own copy of what worked.
     """
     credential = _get_or_404(db, credential_id, organization_id)
     name = credential.name
+
+    in_use = vault.devices_using(db, credential_id)
+    if in_use and not force:
+        shown = ", ".join(in_use[:10])
+        if len(in_use) > 10:
+            shown += f" and {len(in_use) - 10} more"
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"'{name}' is used by {len(in_use)} device(s): {shown}. "
+                f"Point them at another credential first, or delete with "
+                f"force=true to leave them without one."
+            ),
+        )
 
     db.delete(credential)
     db.commit()
@@ -468,7 +491,7 @@ def delete_credential(
         action="delete_credential",
         resource_type="credential",
         resource_id=credential_id,
-        details={"name": name},
+        details={"name": name, "devices_left_without_it": in_use},
         ip_address=_client_ip(request),
     )
 

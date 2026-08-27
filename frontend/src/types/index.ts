@@ -41,7 +41,8 @@ export interface Device extends DeviceSnmpFields {
   ip_address: string;
   device_type: string;
   port: number;
-  username: string;
+  // Null when the device logs in with a vault credential instead of its own.
+  username: string | null;
   is_active: boolean;
   enable_secret?: string;
   ssh_key_path?: string;
@@ -63,6 +64,13 @@ export interface Device extends DeviceSnmpFields {
   model?: string | null;
   serial_number?: string | null;
   os_version?: string | null;
+  // The vault entries this device uses, if any: one for the CLI login, one
+  // for SNMP, because a device commonly needs both at once. The names are
+  // filled in by the API so a row can say which without a second request.
+  credential_id?: number | null;
+  credential_name?: string | null;
+  snmp_credential_id?: number | null;
+  snmp_credential_name?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -71,25 +79,33 @@ export interface DeviceCreate extends DeviceSnmpFields {
   hostname: string;
   ip_address: string;
   device_type: string;
-  username: string;
-  password: string;
+  // Either these, or a vault credential_id: the API refuses a device with
+  // neither rather than creating one nothing can log into.
+  username?: string | null;
+  password?: string | null;
   port?: number;
   enable_secret?: string;
   ssh_key_path?: string;
   tags?: Record<string, any>;
   is_active?: boolean;
+  credential_id?: number | null;
+  snmp_credential_id?: number | null;
 }
 
 export interface DeviceUpdate extends DeviceSnmpFields {
   hostname?: string;
   ip_address?: string;
   device_type?: string;
-  username?: string;
-  password?: string;
+  username?: string | null;
+  password?: string | null;
   port?: number;
   enable_secret?: string;
   is_active?: boolean;
   tags?: Record<string, any>;
+  // Null clears the reference and returns the device to its own credentials;
+  // leaving the key out keeps whatever it has.
+  credential_id?: number | null;
+  snmp_credential_id?: number | null;
 }
 
 export interface ConnectivityTestResult {
@@ -840,6 +856,8 @@ export interface DeviceDetail {
     error?: string | null;
     credential_id?: number | null;
     credential_name?: string | null;
+    snmp_credential_id?: number | null;
+    snmp_credential_name?: string | null;
     backup_eligible: boolean;
   };
   facts: {

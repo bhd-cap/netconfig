@@ -178,11 +178,20 @@ export const DeviceDetailPanel: React.FC<Props> = ({ deviceId, onClose }) => {
 
                   <p className="text-xs mt-1 text-gray-600">
                     {data.authentication.credential_name
-                      ? `Authenticated with '${data.authentication.credential_name}'`
-                      : 'No credential has worked yet'}
+                      ? data.authentication.status === 'success'
+                        ? `Authenticated with '${data.authentication.credential_name}'`
+                        : `Set to use '${data.authentication.credential_name}' from the vault`
+                      : 'Logs in with the credentials stored on the device'}
                     {data.authentication.at &&
                       ` · last tried ${relative(data.authentication.at)}`}
                   </p>
+
+                  {data.authentication.snmp_credential_name && (
+                    <p className="text-xs mt-1 text-gray-600">
+                      Polls SNMP with '{data.authentication.snmp_credential_name}'
+                      {' '}from the vault
+                    </p>
+                  )}
 
                   {data.authentication.error && (
                     <pre className="mt-2 text-xs text-amber-900 whitespace-pre-wrap break-words font-mono">

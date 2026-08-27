@@ -15,6 +15,7 @@ from app.models.device import Device
 from app.repositories.device import DeviceRepository
 from app.repositories.configuration import ConfigurationRepository
 from app.repositories.audit_log import AuditLogRepository
+from app.services.credentials import ResolvedLogin, resolve_for_device
 from app.services.device_connector import DeviceConnector, DeviceConnectionError, DeviceCommandError
 from app.services.storage import storage_service
 
@@ -41,21 +42,42 @@ class DeviceSnapshot:
     enable_secret: Optional[str]
     ssh_key_path: Optional[str]
     transport: str = "ssh"
+    # Which credentials these are, for the log line: 'device', or the name of
+    # the vault entry they came from.
+    credential_source: str = "device"
 
     @classmethod
-    def from_device(cls, device: Device) -> "DeviceSnapshot":
+    def from_device(cls, device: Device, login: ResolvedLogin) -> "DeviceSnapshot":
+        """
+        Copy the fields a backup needs, logging in as `login` says to
+
+        The resolved login is a required argument rather than something this
+        looks up, because the snapshot exists to be carried onto a worker
+        thread with no session. Requiring it also means no call site can reach
+        a device with the credentials stored on the row while ignoring the vault
+        entry it was told to use - which would make choosing one in the UI look
+        like it worked and change nothing.
+
+        Args:
+            device: The device row
+            login: Credentials resolved by credentials.resolve_for_device
+
+        Returns:
+            DeviceSnapshot
+        """
         return cls(
             id=device.id,
             organization_id=device.organization_id,
             hostname=device.hostname,
             ip_address=device.ip_address,
             device_type=device.device_type,
-            username=device.username,
-            encrypted_password=device.encrypted_password,
+            username=login.username,
+            encrypted_password=login.encrypted_password,
             port=device.port,
-            enable_secret=device.enable_secret,
-            ssh_key_path=device.ssh_key_path,
+            enable_secret=login.enable_secret,
+            ssh_key_path=login.ssh_key_path,
             transport=device.transport or "ssh",
+            credential_source=login.cli_source,
         )
 
 
@@ -375,7 +397,9 @@ class ConfigurationRetriever:
                 "file_size": 0,
             }
 
-        snapshot = DeviceSnapshot.from_device(device)
+        snapshot = DeviceSnapshot.from_device(
+            device, resolve_for_device(self.db, device)
+        )
         logger.info(f"Starting backup for device: {snapshot.hostname} (ID: {device_id})")
 
         previous_hash = (
@@ -439,7 +463,9 @@ class ConfigurationRetriever:
         # One query for the devices, one for their previous hashes.
         devices = {d.id: d for d in self.device_repo.get_many(device_ids)}
         snapshots = [
-            DeviceSnapshot.from_device(devices[device_id])
+            DeviceSnapshot.from_device(
+                devices[device_id], resolve_for_device(self.db, devices[device_id])
+            )
             for device_id in device_ids
             if device_id in devices
         ]

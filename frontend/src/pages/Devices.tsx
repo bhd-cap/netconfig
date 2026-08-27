@@ -40,6 +40,7 @@ import {
 import {
   AuthStatus,
   BulkDeviceUpdate,
+  Credential,
   Device,
   DeviceCreate,
   DeviceUpdate,
@@ -479,7 +480,12 @@ export const Devices: React.FC = () => {
                             {device.hostname}
                           </button>
                           <div className="text-sm text-gray-500">
-                            {device.model ? device.model : `User: ${device.username}`}
+                            {device.model ||
+                              (device.credential_name
+                                ? `Vault: ${device.credential_name}`
+                                : device.username
+                                ? `User: ${device.username}`
+                                : 'No login set')}
                           </div>
                         </div>
                       </div>
@@ -837,6 +843,72 @@ const BulkEditModal: React.FC<BulkEditModalProps> = ({
 };
 
 // Device Add/Edit Modal Component
+type CredentialSource = 'device' | 'vault';
+
+/**
+ * Choose between a vault credential and one typed in here
+ *
+ * Radio buttons rather than a checkbox: the two are alternatives, and which
+ * one is in force decides what the rest of the section asks for. A device that
+ * appeared to have both would raise the obvious question of which one wins.
+ */
+const SourceToggle: React.FC<{
+  legend: string;
+  value: CredentialSource;
+  onChange: (value: CredentialSource) => void;
+  testId: string;
+  vaultLabel: string;
+  deviceLabel: string;
+  vaultDisabled?: boolean;
+  vaultDisabledHint?: string;
+}> = ({
+  legend,
+  value,
+  onChange,
+  testId,
+  vaultLabel,
+  deviceLabel,
+  vaultDisabled,
+  vaultDisabledHint,
+}) => (
+  <fieldset data-testid={testId}>
+    <legend className="text-sm font-medium text-gray-700 mb-2">{legend}</legend>
+    <div className="flex flex-wrap gap-4 text-sm">
+      <label
+        className={`inline-flex items-center gap-2 ${
+          vaultDisabled ? 'text-gray-400' : 'cursor-pointer'
+        }`}
+        title={vaultDisabled ? vaultDisabledHint : undefined}
+      >
+        <input
+          type="radio"
+          name={testId}
+          checked={value === 'vault'}
+          disabled={vaultDisabled}
+          onChange={() => onChange('vault')}
+          data-testid={`${testId}-vault`}
+        />
+        {vaultLabel}
+      </label>
+      <label className="inline-flex items-center gap-2 cursor-pointer">
+        <input
+          type="radio"
+          name={testId}
+          checked={value === 'device'}
+          onChange={() => onChange('device')}
+          data-testid={`${testId}-device`}
+        />
+        {deviceLabel}
+      </label>
+    </div>
+    {vaultDisabled && vaultDisabledHint && (
+      <p className="text-xs text-gray-500 mt-1">
+        {vaultDisabledHint} — add one under Settings → Credentials.
+      </p>
+    )}
+  </fieldset>
+);
+
 interface DeviceModalProps {
   device?: Device | null;
   onClose: () => void;
@@ -844,6 +916,25 @@ interface DeviceModalProps {
 }
 
 const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess }) => {
+  // Where the login comes from. A device either holds its own or points at a
+  // vault entry, and the two are mutually exclusive: keeping a stale local
+  // password behind a vault reference is how a device carries on working with
+  // credentials nobody remembers setting.
+  const [cliSource, setCliSource] = useState<CredentialSource>(
+    device?.credential_id ? 'vault' : 'device'
+  );
+  const [snmpSource, setSnmpSource] = useState<CredentialSource>(
+    device?.snmp_credential_id ? 'vault' : 'device'
+  );
+
+  const { data: vault } = useQuery<Credential[]>({
+    queryKey: ['credentials', 'for-device-form'],
+    queryFn: async () => (await api.get('/credentials')).data,
+  });
+
+  const cliCredentials = (vault ?? []).filter((entry) => entry.kind === 'cli');
+  const snmpCredentials = (vault ?? []).filter((entry) => entry.kind === 'snmp');
+
   const [formData, setFormData] = useState<DeviceCreate>({
     hostname: device?.hostname || '',
     ip_address: device?.ip_address || '',
@@ -863,6 +954,8 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
     snmp_community: '',
     snmp_v3_auth_key: '',
     snmp_v3_priv_key: '',
+    credential_id: device?.credential_id ?? null,
+    snmp_credential_id: device?.snmp_credential_id ?? null,
   });
 
   const saveMutation = useMutation({
@@ -877,6 +970,24 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
         'snmp_v3_priv_key',
       ]) {
         if (!payload[secret]) delete payload[secret];
+      }
+
+      // One source per protocol. An explicit null clears a reference the
+      // device used to have; omitting the key would leave it in place.
+      if (cliSource === 'vault') {
+        delete payload.username;
+        delete payload.password;
+        delete payload.enable_secret;
+      } else {
+        payload.credential_id = null;
+      }
+
+      if (snmpSource === 'vault') {
+        delete payload.snmp_community;
+        delete payload.snmp_v3_auth_key;
+        delete payload.snmp_v3_priv_key;
+      } else {
+        payload.snmp_credential_id = null;
       }
 
       if (device) {
@@ -1020,55 +1131,150 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                 />
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Username *
-                </label>
-                <input
-                  type="text"
-                  name="username"
-                  required
-                  value={formData.username}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="admin"
+              <div className="md:col-span-2 border-t pt-4">
+                <SourceToggle
+                  legend="Login credentials"
+                  value={cliSource}
+                  onChange={setCliSource}
+                  testId="cli-source"
+                  vaultLabel="Use a credential from the vault"
+                  deviceLabel="Enter credentials for this device"
+                  vaultDisabled={!cliCredentials.length}
+                  vaultDisabledHint="No CLI credentials in the vault yet"
                 />
-              </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Password {device ? '' : '*'}
-                </label>
-                <input
-                  type="password"
-                  name="password"
-                  required={!device}
-                  value={formData.password}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder={device ? 'Leave blank to keep current' : '••••••••'}
-                />
-              </div>
+                {cliSource === 'vault' ? (
+                  <div className="mt-3">
+                    <select
+                      value={formData.credential_id ?? ''}
+                      onChange={(event) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          credential_id: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        }))
+                      }
+                      data-testid="cli-credential"
+                      required
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Choose a credential…</option>
+                      {cliCredentials.map((entry) => (
+                        <option key={entry.id} value={entry.id}>
+                          {entry.name}
+                          {entry.username ? ` — ${entry.username}` : ''}
+                          {entry.is_enabled ? '' : ' (disabled)'}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      The password is held once in the vault, so rotating it
+                      there covers every device using it. This device stores no
+                      login of its own.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-3">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Username *
+                      </label>
+                      <input
+                        type="text"
+                        name="username"
+                        required
+                        value={formData.username ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="admin"
+                      />
+                    </div>
 
-              <div className="md:col-span-2">
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Enable Secret (optional)
-                </label>
-                <input
-                  type="password"
-                  name="enable_secret"
-                  value={formData.enable_secret}
-                  onChange={handleChange}
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                  placeholder="For Cisco devices requiring enable mode"
-                />
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Password {device && !device.credential_id ? '' : '*'}
+                      </label>
+                      <input
+                        type="password"
+                        name="password"
+                        required={!device || !!device.credential_id}
+                        value={formData.password ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder={
+                          device && !device.credential_id
+                            ? 'Leave blank to keep current'
+                            : '••••••••'
+                        }
+                      />
+                    </div>
+
+                    <div className="md:col-span-2">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Enable Secret (optional)
+                      </label>
+                      <input
+                        type="password"
+                        name="enable_secret"
+                        value={formData.enable_secret ?? ''}
+                        onChange={handleChange}
+                        className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                        placeholder="For Cisco devices requiring enable mode"
+                      />
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* SNMP is also useful alongside the CLI for discovery, so these
                   are offered whenever a version is picked, not only when the
                   transport itself is SNMP. */}
               <div className="md:col-span-2 border-t pt-4">
+                <SourceToggle
+                  legend="SNMP credentials"
+                  value={snmpSource}
+                  onChange={setSnmpSource}
+                  testId="snmp-source"
+                  vaultLabel="Use a community from the vault"
+                  deviceLabel="Enter SNMP details for this device"
+                  vaultDisabled={!snmpCredentials.length}
+                  vaultDisabledHint="No SNMP credentials in the vault yet"
+                />
+
+                {snmpSource === 'vault' && (
+                  <div className="mt-3 mb-4">
+                    <select
+                      value={formData.snmp_credential_id ?? ''}
+                      onChange={(event) =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          snmp_credential_id: event.target.value
+                            ? Number(event.target.value)
+                            : null,
+                        }))
+                      }
+                      data-testid="snmp-credential"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="">Choose a community…</option>
+                      {snmpCredentials.map((entry) => (
+                        <option key={entry.id} value={entry.id}>
+                          {entry.name}
+                          {entry.snmp_version ? ` — v${entry.snmp_version}` : ''}
+                          {entry.is_enabled ? '' : ' (disabled)'}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-xs text-gray-500 mt-1">
+                      The version comes from the vault entry. The port below
+                      stays with the device.
+                    </p>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {snmpSource === 'device' && (
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
                       SNMP Version
@@ -1094,6 +1300,7 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                       <option value="3">v3</option>
                     </select>
                   </div>
+                  )}
 
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -1109,8 +1316,9 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                     />
                   </div>
 
-                  {(formData.snmp_version === '1' ||
-                    formData.snmp_version === '2c') && (
+                  {snmpSource === 'device' &&
+                    (formData.snmp_version === '1' ||
+                      formData.snmp_version === '2c') && (
                     <div className="md:col-span-2">
                       <label className="block text-sm font-medium text-gray-700 mb-1">
                         Community
@@ -1126,7 +1334,7 @@ const DeviceModal: React.FC<DeviceModalProps> = ({ device, onClose, onSuccess })
                     </div>
                   )}
 
-                  {formData.snmp_version === '3' && (
+                  {snmpSource === 'device' && formData.snmp_version === '3' && (
                     <>
                       <div>
                         <label className="block text-sm font-medium text-gray-700 mb-1">

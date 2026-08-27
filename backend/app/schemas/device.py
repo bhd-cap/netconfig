@@ -3,7 +3,7 @@ Device schemas for request/response validation
 """
 from datetime import datetime
 from typing import Dict, Any, Literal
-from pydantic import BaseModel, Field, IPvAnyAddress
+from pydantic import BaseModel, Field, IPvAnyAddress, model_validator
 
 # Supported device types
 DeviceType = Literal[
@@ -33,7 +33,12 @@ class DeviceBase(BaseModel):
     ip_address: str = Field(..., description="Device IP address (IPv4 or IPv6)")
     device_type: DeviceType = Field(..., description="Device OS type")
     port: int = Field(default=22, ge=1, le=65535, description="SSH or telnet port")
-    username: str = Field(..., min_length=1, max_length=100, description="Login username")
+    username: str | None = Field(
+        None,
+        min_length=1,
+        max_length=100,
+        description="Login username; omit when using a vault credential",
+    )
     description: str | None = Field(None, description="Device description")
     location: str | None = Field(None, max_length=255, description="Physical location")
     tags: Dict[str, Any] | None = Field(default=None, description="Custom tags/metadata")
@@ -46,6 +51,16 @@ class DeviceBase(BaseModel):
     snmp_v3_user: str | None = Field(None, max_length=100)
     snmp_v3_auth_protocol: str | None = Field(None, max_length=20)
     snmp_v3_priv_protocol: str | None = Field(None, max_length=20)
+
+    # Vault credentials, instead of storing a login on the device itself. Two
+    # references because a device commonly needs both at once: SSH to back the
+    # configuration up, SNMP to poll inventory.
+    credential_id: int | None = Field(
+        None, description="Vault CLI credential to log in with"
+    )
+    snmp_credential_id: int | None = Field(
+        None, description="Vault SNMP credential to poll with"
+    )
 
 
 class SnmpCredentials(BaseModel):
@@ -62,9 +77,37 @@ class SnmpCredentials(BaseModel):
 
 class DeviceCreate(DeviceBase, SnmpCredentials):
     """Schema for creating a device"""
-    password: str = Field(..., min_length=1, description="Login password (will be encrypted)")
+    password: str | None = Field(
+        None,
+        min_length=1,
+        description="Login password; omit when using a vault credential",
+    )
     enable_secret: str | None = Field(None, description="Enable secret for Cisco devices")
     ssh_key_path: str | None = Field(None, description="Path to SSH private key")
+
+    @model_validator(mode="after")
+    def credentials_come_from_somewhere(self) -> "DeviceCreate":
+        """
+        A device needs a login: its own, or one from the vault
+
+        Refused here rather than at connection time, where the failure would
+        be an authentication error against a real device and would look like a
+        wrong password. An SNMP-only device is exempt: it is never logged into.
+        """
+        if self.credential_id or self.transport == "snmp":
+            return self
+
+        missing = [
+            name
+            for name, value in (("username", self.username), ("password", self.password))
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"{' and '.join(missing)} required, or choose a vault credential"
+            )
+
+        return self
 
 
 class DeviceUpdate(SnmpCredentials):
@@ -89,6 +132,11 @@ class DeviceUpdate(SnmpCredentials):
     snmp_v3_auth_protocol: str | None = Field(None, max_length=20)
     snmp_v3_priv_protocol: str | None = Field(None, max_length=20)
 
+    # Passing null clears the reference and returns the device to the
+    # credentials stored on itself; omitting the field leaves it alone.
+    credential_id: int | None = None
+    snmp_credential_id: int | None = None
+
 
 class DeviceInDB(DeviceBase):
     """Schema for device in database"""
@@ -111,7 +159,11 @@ class DeviceInDB(DeviceBase):
 
 class DeviceResponse(DeviceInDB):
     """Schema for device API response (excludes encrypted credentials)"""
-    pass
+
+    # Filled in by the endpoint so the UI can show which vault entry a device
+    # uses without a second request per row.
+    credential_name: str | None = None
+    snmp_credential_name: str | None = None
 
 
 class DeviceWithBackupCount(DeviceResponse):
