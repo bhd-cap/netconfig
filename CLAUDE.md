@@ -328,6 +328,15 @@ code by building a fresh event loop and `SnmpEngine` per call, because an
 engine cannot outlive the loop it was created on. Do not hoist the engine into
 a module-level singleton.
 
+**An SNMP value is bytes, and `SnmpClient._text` decides what they mean.** Two
+shapes arrive and they need opposite treatment: text padded with NUL (LLDP
+names, ENTITY-MIB serials - the padding is not part of the name) and values
+that are not text at all (an LLDP chassis ID or port ID of the MAC-address
+subtype is six raw bytes, and so is `ipNetToMediaPhysAddress`). A control
+character surviving after the NULs are ignored is what tells them apart;
+binary is rendered as `0x001a2b3c4d5e`, which is a MAC `normalize_mac`
+recognises, and `normalize_mac` strips that `0x` for the same reason.
+
 **Parsing**: `app/services/parsers.py` anchors on the MAC address rather than
 on column positions, because every vendor's table is laid out differently and
 several change layout between releases. `parse()` never raises - a device that
@@ -556,6 +565,31 @@ typo'd password. Deleting a credential a device logs in with is refused with a
 409 naming the devices, since the foreign key would otherwise null the
 reference and leave them with nothing.
 
+## Text From a Device
+
+PostgreSQL holds every character except **NUL**, in `text` and JSONB alike,
+and psycopg2 refuses the whole parameter rather than the character:
+`A string literal cannot contain NUL (0x00) characters`. **Lone surrogates**
+(from bytes decoded with `errors="surrogateescape"`) fail the same way with a
+`UnicodeEncodeError`. Devices send both - telnet encodes a bare CR as CR NUL
+(RFC 854), SNMP pads strings to a fixed width, and Netmiko puts the raw read
+buffer into the text of a timeout.
+
+`app/utils/text.py` has `scrub()`, and it is applied **where device text
+enters the application**, not on the way to the database: at `SnmpClient`, at
+`DeviceConnector.send_command`, on the exception messages the connector
+raises, and on the SSH banner and version output in `discovery_probe`. That
+placement is not incidental - a neighbour name is an upsert key and is matched
+against managed devices, so cleaning it only at the database would store
+`dist-01` while still comparing `dist-01\0\0`, and every run would report the
+same switch as an unmanaged neighbour and insert a twin.
+
+A `before_cursor_execute` hook in `app/core/database.py` is the net under
+that, because a single unstorable byte does not fail one column: it fails the
+statement, and `DiscoveryService.crawl` turns a failed statement into a failed
+run. It costs about 1 µs on a typical statement against a ~230 µs round trip,
+and returns the parameters untouched when there is nothing to do.
+
 ## Secrets
 
 Device passwords, enable secrets, SNMP communities and v3 keys, vault
@@ -741,7 +775,7 @@ Things to know before changing it:
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (540 tests), installer update checks, and browser
+- Backend test suite (565 tests), installer update checks, and browser
   smoke tests
 - One-line installer
 

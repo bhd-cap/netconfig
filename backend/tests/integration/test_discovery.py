@@ -652,6 +652,147 @@ def test_crawl_does_not_revisit_devices(db, org, devices, service):
 
 
 # --------------------------------------------------------------------------
+# Text a device sends that PostgreSQL cannot store
+# --------------------------------------------------------------------------
+
+
+def _octets(raw: bytes):
+    """
+    An SNMP OctetString holding exactly these bytes
+
+    pyasn1's own type, not a stand-in: how it renders bytes as `str` and as
+    `prettyPrint` is the thing under test.
+    """
+    from pyasn1.type.univ import OctetString
+
+    return OctetString(raw)
+
+
+def test_a_nul_from_a_device_does_not_fail_the_crawl(db, org, devices, service):
+    """
+    One NUL used to take down the whole run
+
+    Telnet encodes a bare CR as CR NUL (RFC 854) and SNMP pads LLDP names to a
+    fixed width, so a NUL arrives in the middle of an ordinary neighbour table.
+    psycopg2 refuses the parameter rather than the character, the INSERT fails,
+    and `crawl` records a failed run - which is how this reached a user as
+    "A string literal cannot contain NUL (0x00) characters" on the Discovery
+    page with nothing discovered.
+    """
+    topology = {
+        "core-01": {
+            "neighbors": [
+                parsers.Neighbor(
+                    local_interface="Gi1/0/1\r\x00",
+                    remote_hostname="dist-01\x00\x00",
+                    protocol="lldp",
+                    remote_interface="Gi1/0/24\x00",
+                    remote_mgmt_ip="10.0.0.2",
+                    remote_platform="cisco WS-C3850\x00",
+                )
+            ],
+            "macs": [
+                parsers.MacEntry(
+                    mac="00:11:22:33:44:55", interface="Gi1/0/1\x00", vlan=10
+                )
+            ],
+        },
+        "dist-01": {},
+    }
+
+    with mock.patch.object(
+        DiscoveryService, "probe", staticmethod(_probe_returning(topology))
+    ):
+        summary = service.crawl(org.id, devices[0].id, max_hops=1, max_workers=2)
+
+    run = db.get(DiscoveryRun, summary.run_id)
+    assert run.status == "success", run.error_message
+    assert summary.neighbors_found == 1
+
+    stored = db.execute(select(Neighbor)).scalars().one()
+    assert "\x00" not in stored.remote_hostname
+    assert "\x00" not in stored.local_interface
+    assert "\x00" not in stored.remote_interface
+
+    host = db.execute(select(HostInventory)).scalars().one()
+    assert "\x00" not in host.interface
+
+
+def test_a_padded_snmp_name_matches_the_device_it_names(db, org, devices, service):
+    """
+    Cleaning at the transport, not at the database
+
+    The value has to be right and not merely storable. A neighbour name is an
+    upsert key and is matched against managed devices, so a name still carrying
+    its SNMP padding would be compared as the padded string: the link would
+    never resolve to dist-01, every run would report it as an unmanaged
+    neighbour, and the next sweep would insert a twin rather than update the
+    row. Cleaning it at the database - which is where the last-resort guard
+    does it - would store "dist-01" and still have compared "dist-01\\x00\\x00".
+    """
+    from app.services.snmp_client import SnmpClient
+
+    # An LLDP system name as an agent sends it, padded to a fixed width.
+    padded = _octets(b"dist-01\x00\x00")
+
+    neighbors = [
+        parsers.Neighbor(
+            local_interface="Gi1/0/1",
+            remote_hostname=SnmpClient._text(padded),
+            protocol="lldp",
+            remote_interface="Gi1/0/24",
+        )
+    ]
+
+    service.save_neighbors(org.id, devices[0].id, neighbors)
+    db.commit()
+
+    assert service.match_neighbors_to_devices(org.id) == 1
+    db.commit()
+
+    stored = db.execute(select(Neighbor)).scalars().one()
+    assert stored.remote_hostname == "dist-01"
+    assert stored.remote_device_id == devices[1].id
+
+    service.save_neighbors(org.id, devices[0].id, neighbors)
+    db.commit()
+    assert len(db.execute(select(Neighbor)).scalars().all()) == 1
+
+
+def test_a_binary_chassis_id_becomes_the_mac_it_is(db, org, devices, service):
+    """
+    An LLDP chassis ID of the MAC-address subtype is six raw bytes
+
+    Discovery reads lldpRemChassisId precisely so a neighbour can be matched by
+    MAC, and `_probe_snmp` falls back to the raw value when normalize_mac does
+    not recognise one. Decoded as characters those bytes are mojibake with a
+    NUL in them, which is both unstorable and useless; rendered as hex they are
+    the MAC the object was asked for.
+    """
+    from app.services.snmp_client import SnmpClient
+
+    chassis = SnmpClient._text(_octets(b"\x00\x1a\x2b\x3c\x4d\x5e"))
+    assert parsers.normalize_mac(chassis) == "00:1a:2b:3c:4d:5e"
+
+    neighbors = [
+        parsers.Neighbor(
+            local_interface="Gi1/0/1",
+            remote_hostname="unmanaged-ap",
+            protocol="lldp",
+            remote_chassis_id=parsers.normalize_mac(chassis) or chassis,
+        )
+    ]
+
+    service.save_neighbors(org.id, devices[0].id, neighbors)
+    db.commit()
+
+    assert (
+        db.execute(select(Neighbor)).scalars().one().remote_chassis_id
+        == "00:1a:2b:3c:4d:5e"
+    )
+
+
+# --------------------------------------------------------------------------
 # Device type guessing
 # --------------------------------------------------------------------------
 

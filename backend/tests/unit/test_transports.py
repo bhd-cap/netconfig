@@ -102,6 +102,49 @@ def test_all_transports_declared():
     assert SUPPORTED_TRANSPORTS == ("ssh", "telnet", "snmp")
 
 
+def test_an_error_carrying_a_read_buffer_is_storable(encrypted_password):
+    """
+    Netmiko puts the channel buffer into the text of a timeout
+
+    That message is not only logged: it becomes the device's auth_error, a row
+    in device_probes and a discovery run's error_message. A telnet buffer is
+    full of the NULs RFC 854 pairs with a bare CR, and PostgreSQL holds none
+    of them.
+    """
+    from unittest import mock
+
+    from app.services.device_connector import DeviceCommandError
+
+    connector = DeviceConnector(
+        "sw1", "10.0.0.1", "cisco_ios", "admin", encrypted_password,
+        transport="telnet",
+    )
+    connector.connection = mock.Mock()
+    connector.connection.send_command.side_effect = OSError(
+        "Search pattern never detected: \r\x00sw1>\r\x00"
+    )
+
+    with pytest.raises(DeviceCommandError) as raised:
+        connector.send_command("show lldp neighbors detail")
+
+    assert "\x00" not in str(raised.value)
+    assert "Search pattern never detected" in str(raised.value)
+
+
+def test_command_output_is_cleaned_on_the_way_out(encrypted_password):
+    """The other half: what the command returned, not what the error said"""
+    from unittest import mock
+
+    connector = DeviceConnector(
+        "sw1", "10.0.0.1", "cisco_ios", "admin", encrypted_password,
+        transport="telnet",
+    )
+    connector.connection = mock.Mock()
+    connector.connection.send_command.return_value = "Port: Gi1/0/24\r\x00\n"
+
+    assert connector.send_command("show lldp neighbors") == "Port: Gi1/0/24\r\n"
+
+
 # --------------------------------------------------------------------------
 # Discovery command matrix
 # --------------------------------------------------------------------------
@@ -124,6 +167,71 @@ def test_cisco_platforms_also_have_cdp():
 def test_unknown_capability_returns_none():
     assert get_discovery_command("cisco_ios", "teleportation") is None
     assert get_discovery_command("no_such_device", "lldp") is None
+
+
+# --------------------------------------------------------------------------
+# Rendering one SNMP value
+#
+# An OctetString holds bytes. What str() makes of them decides whether the
+# value is storable at all - PostgreSQL holds no NUL - and whether it is
+# usable, which for a chassis ID means being recognisable as a MAC.
+# --------------------------------------------------------------------------
+
+
+def _octets(raw: bytes):
+    from pyasn1.type.univ import OctetString
+
+    return OctetString(raw)
+
+
+def test_a_padded_name_is_the_name():
+    """Agents pad text to a fixed width; the padding is not part of the name"""
+    assert SnmpClient._text(_octets(b"sw-core-01\x00\x00\x00")) == "sw-core-01"
+    assert SnmpClient._text(_octets(b"\x00FOC2137L0AB")) == "FOC2137L0AB"
+
+
+def test_descriptive_text_survives_intact():
+    """A sysDescr is multi-line free text and must come back unchanged"""
+    descr = b"Cisco IOS Software, C3850\nVersion 17.9\tRELEASE"
+    assert SnmpClient._text(_octets(descr)) == descr.decode()
+
+
+def test_binary_bytes_are_rendered_as_hex():
+    """
+    An LLDP chassis ID of the MAC-address subtype is six raw bytes
+
+    Decoded as characters that is mojibake with a NUL in it - unstorable and
+    useless. As hex it is the MAC the object was read for.
+    """
+    from app.services.parsers import normalize_mac
+
+    rendered = SnmpClient._text(_octets(b"\x00\x1a\x2b\x3c\x4d\x5e"))
+
+    assert rendered == "0x001a2b3c4d5e"
+    assert normalize_mac(rendered) == "00:1a:2b:3c:4d:5e"
+
+
+def test_a_value_that_is_neither_pads_nor_binary_is_left_alone():
+    assert SnmpClient._text(_octets(b"GigabitEthernet1/0/24")) == (
+        "GigabitEthernet1/0/24"
+    )
+    # Non-OctetString values render as themselves.
+    assert SnmpClient._text(42) == "42"
+
+
+def test_nothing_unstorable_survives_whatever_the_shape():
+    """The property that matters, over every shape an agent can send"""
+    for raw in (
+        b"sw\x00-01",
+        b"\x00\x1a\x2b\x3c\x4d\x5e",
+        b"\xff\xfe binary junk \x00",
+        b"plain",
+        b"",
+    ):
+        rendered = SnmpClient._text(_octets(raw))
+        assert "\x00" not in rendered
+        # And it can actually be sent to PostgreSQL.
+        rendered.encode("utf-8")
 
 
 # --------------------------------------------------------------------------

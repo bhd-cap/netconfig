@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from app.config.device_types import DEVICE_TYPE_CONFIG
 from app.services.credentials import CLI, SNMP, CredentialAttempt
+from app.utils.text import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -461,8 +462,8 @@ def _identify_over_cli(connection, hint: Optional[str] = None) -> Dict[str, Any]
 
     for command in _VERSION_COMMANDS:
         try:
-            output = connection.send_command(
-                command, read_timeout=15, expect_string=None
+            output = scrub(
+                connection.send_command(command, read_timeout=15, expect_string=None)
             )
         except Exception:  # noqa: BLE001 - the next command may be the right one
             continue
@@ -566,24 +567,28 @@ def ssh_identity(connection) -> Dict[str, str]:
         except Exception:  # noqa: BLE001
             transport = None
 
+    # Every one of these is stored on the device row and shown in its detail
+    # view, and all three come straight off the wire from an arbitrary vendor,
+    # so they are cleaned of what PostgreSQL cannot hold before anything else
+    # touches them.
     if transport is not None:
         remote_version = getattr(transport, "remote_version", None)
         if remote_version:
-            identity["ssh_version"] = str(remote_version)[:200]
+            identity["ssh_version"] = scrub(str(remote_version))[:200]
 
         try:
             banner = transport.get_banner()
         except Exception:  # noqa: BLE001
             banner = None
         if banner:
-            identity["banner"] = str(banner)[:1000]
+            identity["banner"] = scrub(str(banner))[:1000]
 
     try:
         prompt = connection.find_prompt()
     except Exception:  # noqa: BLE001
         prompt = None
     if prompt:
-        identity["prompt"] = str(prompt).strip()[:100]
+        identity["prompt"] = scrub(str(prompt)).strip()[:100]
 
     return identity
 
@@ -625,7 +630,7 @@ def identify_by_collection(connection, prefer: Optional[str] = None) -> Dict[str
             tried.append(f"{command}: {type(e).__name__}")
             continue
 
-        text = (output or "").strip()
+        text = scrub(output or "").strip()
         tried.append(f"{command}: {len(text)} bytes")
 
         if not text or _REJECTION.search(text):
