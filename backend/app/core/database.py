@@ -1,9 +1,14 @@
 """
 Database connection and session management
 """
-from sqlalchemy import create_engine
+import logging
+
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 from app.core.config import settings
+from app.utils.text import scrub_parameters
+
+logger = logging.getLogger(__name__)
 
 # Connection arguments, kept as a module constant so the encoding setting
 # below is visible to tests rather than buried in a call.
@@ -55,6 +60,37 @@ engine = create_engine(
     query_cache_size=1200,
     connect_args=CONNECT_ARGS,
 )
+
+
+@event.listens_for(engine, "before_cursor_execute", retval=True)
+def _drop_unstorable_text(conn, cursor, statement, parameters, context, executemany):
+    """
+    Last line against text PostgreSQL cannot hold
+
+    NUL and lone surrogates come off network devices - telnet encodes a bare
+    CR as CR NUL, and SNMP pads LLDP names and serial numbers with NUL - and
+    psycopg2 refuses the parameter rather than the character, so one such byte
+    fails the whole statement. Discovery turns a failed statement into a failed
+    run, which is how a single switch used to take down the crawl of an estate
+    with "A string literal cannot contain NUL (0x00) characters".
+
+    Device text is already cleaned where it enters the application, and it has
+    to be: the value is used as an upsert key and matched against existing
+    rows, so it must be right rather than merely storable. This is the net for
+    a path nobody thought of - an exception message carrying a raw read buffer,
+    a field added later - and it costs one scan of the bind parameters, which
+    are almost never strings that need anything doing to them.
+    """
+    cleaned = scrub_parameters(parameters)
+
+    if cleaned is not parameters:
+        logger.warning(
+            "Dropped characters PostgreSQL cannot store (NUL or lone "
+            f"surrogates) from parameters of: {statement.split(chr(10))[0][:120]}"
+        )
+
+    return statement, cleaned
+
 
 # Create session factory.
 #

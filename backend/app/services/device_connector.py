@@ -20,6 +20,7 @@ from app.config.discovery_commands import (
     get_telnet_device_type,
 )
 from app.utils.encryption import encryption_service
+from app.utils.text import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -50,17 +51,33 @@ def snmp_params(device) -> Dict[str, Any]:
     }
 
 
-class DeviceConnectionError(Exception):
+class DeviceError(Exception):
+    """
+    Base for the connector's errors, holding a message safe to store
+
+    Netmiko puts the read buffer into the text of a timeout, so an error from
+    a telnet session routinely carries the NULs that RFC 854 pairs with a bare
+    CR. That message is not just logged: it becomes a device's auth_error, a
+    row in device_probes and a discovery run's error_message, and PostgreSQL
+    cannot store a NUL. Cleaning it at the point it is raised means no caller
+    has to remember.
+    """
+
+    def __init__(self, message: str = "", *args):
+        super().__init__(scrub(str(message)), *args)
+
+
+class DeviceConnectionError(DeviceError):
     """Exception raised for device connection errors"""
     pass
 
 
-class DeviceAuthenticationError(Exception):
+class DeviceAuthenticationError(DeviceError):
     """Exception raised for device authentication errors"""
     pass
 
 
-class DeviceCommandError(Exception):
+class DeviceCommandError(DeviceError):
     """Exception raised for command execution errors"""
     pass
 
@@ -422,8 +439,16 @@ class DeviceConnector:
             return ""
 
         try:
-            return self.connection.send_command(
-                command, read_timeout=read_timeout or self.timeout
+            # Cleaned on the way out, not on the way to the database. Telnet
+            # encodes a bare CR as CR NUL (RFC 854), so a NUL lands in the
+            # middle of a neighbour table often enough to matter, and the
+            # parsed hostname is used as an upsert key and matched against
+            # existing devices - it has to be the name, not the name plus a
+            # byte PostgreSQL will not hold.
+            return scrub(
+                self.connection.send_command(
+                    command, read_timeout=read_timeout or self.timeout
+                )
             )
         except Exception as e:
             raise DeviceCommandError(

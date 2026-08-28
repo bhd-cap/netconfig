@@ -17,7 +17,10 @@ retrieve a full running configuration, so backups still need SSH or telnet.
 """
 import asyncio
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
+
+from app.utils.text import scrub
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,11 @@ _NO_VALUE = (
     "No Such Instance currently exists at this OID",
     "No more variables left in this MIB View",
 )
+
+# Control characters that mark an OctetString as bytes rather than a string.
+# NUL is deliberately not among them: every vendor pads text with it, and a
+# padded name is still a name.
+_BINARY = re.compile(r"[\x01-\x08\x0e-\x1f\x7f]")
 
 
 def _load_hlapi():
@@ -289,6 +297,47 @@ class SnmpClient:
         )
 
     @staticmethod
+    def _text(value) -> str:
+        """
+        One SNMP value as storable text
+
+        An OctetString holds bytes, not characters, and it arrives in two very
+        different shapes:
+
+        - **Text, padded.** LLDP system names, ENTITY-MIB serial numbers and
+          sysDescr are commonly NUL-terminated or NUL-padded to a fixed width.
+          PostgreSQL cannot store a NUL at all, and cleaning here rather than
+          at the database keeps the value usable as well as storable -
+          "sw-core-01\\x00\\x00" has to match the existing row for sw-core-01
+          rather than create a second one.
+        - **Not text.** An LLDP chassis ID or port ID of the MAC-address
+          subtype is six raw bytes, and ipNetToMediaPhysAddress always is.
+          Decoded as characters that is mojibake with NULs in it; rendered as
+          hex it is a MAC address `normalize_mac` recognises, which is the
+          whole reason discovery reads those objects.
+
+        Which one it is comes from what remains after the padding is ignored:
+        a control character there means bytes, not a string.
+        """
+        text = str(value)
+
+        if _BINARY.search(text.replace("\x00", "")):
+            pretty = getattr(value, "prettyPrint", None)
+            if pretty is not None:
+                try:
+                    rendered = str(pretty())
+                    if rendered:
+                        return scrub(rendered).strip()
+                except Exception:  # noqa: BLE001 - fall through to the hex below
+                    pass
+            try:
+                return "0x" + text.encode("latin-1").hex()
+            except UnicodeEncodeError:
+                pass
+
+        return scrub(text).strip("\r\n")
+
+    @staticmethod
     def _usable(value: str) -> bool:
         """Whether a returned value represents a real object"""
         return bool(value) and value not in _NO_VALUE
@@ -327,7 +376,7 @@ class SnmpClient:
                     return None
 
                 for _, value in var_binds:
-                    text = str(value)
+                    text = self._text(value)
                     return text if self._usable(text) else None
 
                 return None
@@ -397,7 +446,7 @@ class SnmpClient:
 
                 values: Dict[str, Optional[str]] = {}
                 for name, (_, value) in zip(names, var_binds):
-                    text = str(value)
+                    text = self._text(value)
                     values[name] = text if self._usable(text) else None
 
                 return values
@@ -446,7 +495,7 @@ class SnmpClient:
                         break
 
                     for var_oid, value in var_binds:
-                        text = str(value)
+                        text = self._text(value)
                         if self._usable(text):
                             results.append((str(var_oid), text))
 

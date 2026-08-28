@@ -100,6 +100,12 @@ def normalize_mac(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
 
+    # An SNMP OctetString of raw address bytes renders as 0x001a2b3c4d5e, and
+    # the x is not a hex digit: without this the prefix makes it 13 characters
+    # and an LLDP chassis ID of the MAC-address subtype - the reason discovery
+    # reads that object at all - never resolves.
+    value = re.sub(r"^\s*0x", "", value, flags=re.IGNORECASE)
+
     digits = re.sub(r"[^0-9a-fA-F]", "", value)
     if len(digits) != 12:
         return None
