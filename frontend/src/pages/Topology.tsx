@@ -137,7 +137,11 @@ export const Topology: React.FC = () => {
   const observerRef = useRef<ResizeObserver | null>(null);
 
   const [diagramId, setDiagramId] = useState<number | null>(null);
-  const [includeUnmanaged, setIncludeUnmanaged] = useState(true);
+  // Managed devices only to begin with. An unmanaged neighbour is anything
+  // that answered LLDP or CDP - a phone, an AP, a contractor's laptop - and
+  // there are usually far more of them than of the network itself, so they
+  // are opt-in like the host tier rather than the first thing on screen.
+  const [includeUnmanaged, setIncludeUnmanaged] = useState(false);
   const [activeOnly, setActiveOnly] = useState(true);
   const [showHidden, setShowHidden] = useState(false);
   const [showControls, setShowControls] = useState(false);
@@ -1218,6 +1222,18 @@ export const Topology: React.FC = () => {
           <span>{graph?.stats.managed_nodes ?? 0} managed</span>
           <span>{graph?.stats.unmanaged_nodes ?? 0} unmanaged</span>
           <span>{visibleLinks.length} links</span>
+          {/* Say what is being held back rather than letting a switch vanish
+              without explanation. */}
+          {(graph?.stats.hidden_unmanaged ?? 0) > 0 && (
+            <button
+              onClick={() => setIncludeUnmanaged(true)}
+              data-testid="show-unmanaged"
+              className="text-amber-700 hover:underline"
+              title="Show neighbours this installation does not manage"
+            >
+              {graph?.stats.hidden_unmanaged} unmanaged hidden
+            </button>
+          )}
           {(graph?.stats.hidden_hosts ?? 0) > 0 && !showingHosts && (
             <span className="text-purple-700">
               {graph?.stats.hidden_hosts} hosts folded

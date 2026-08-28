@@ -577,7 +577,8 @@ Content-Type: application/json
   "config1_id": 10,
   "config2_id": 15,
   "context_lines": 3,
-  "include_html": false
+  "include_html": false,
+  "include_content": false
 }
 ```
 
@@ -602,9 +603,22 @@ Content-Type: application/json
     "removed_lines": 3,
     "changed_sections": 2,
     "total_changes": 8
-  }
+  },
+  "config1": { "label": "core-01 - 2026-08-28 06:20:03", "line_count": 136 },
+  "config2": { "label": "core-01 - 2026-08-28 12:00:03", "line_count": 136 }
 }
 ```
+
+**`include_content`** adds both configurations in full, under `config1.content`
+and `config2.content`. A viewer that lets the reader turn context back on
+needs the lines the diff left out, and a diff by definition does not have
+them; both files have already been read to produce it, so returning them costs
+nothing more. Off by default, so a caller that wants only statistics is not
+sent two whole configurations.
+
+A file past the inline limit comes back as `"content": null` with
+`"content_omitted": true` rather than a response no browser will render - show
+the unified diff and say so.
 
 ### Compare Latest vs Previous
 ```http
@@ -829,6 +843,25 @@ GET /discovery/topology?diagram_id=3&active_only=true&include_unmanaged=true
 The graph is always rebuilt from the current adjacencies. Passing a
 `diagram_id` applies that diagram's saved edits on top, so a device
 discovered since it was saved still appears.
+
+**The default is the network you manage.** Two filters are on, and they are
+independent axes - each has to be asked off separately:
+
+- `include_unmanaged` (default `false`) shows neighbours that are not managed
+  devices. An unmanaged neighbour is anything that answered LLDP or CDP, so a
+  site's phones and access points outnumber its switches.
+- `tiers` (default infrastructure only) controls how deep. The `edge` tier
+  holds managed and unmanaged devices alike, so naming it says nothing about
+  which - it does not imply `include_unmanaged`. The `host` tier is the
+  exception: nothing managed is ever in it, so asking for it is already the
+  request.
+- `expand` outranks both. It names specific nodes, and every end host is an
+  unmanaged neighbour.
+
+Nothing is silently dropped. `stats.hidden_hosts` and
+`stats.hidden_unmanaged` count what the filters are holding back, so the UI
+can say "18 hosts folded, 1 unmanaged hidden" rather than letting a switch
+vanish unexplained.
 
 **Tiers.** Every node is placed in a tier and only infrastructure is returned
 by default, because a switch with 200 MACs behind it makes a diagram nobody

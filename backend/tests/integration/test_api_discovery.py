@@ -372,12 +372,14 @@ def test_both_ends_of_a_link_collapse_into_one_edge(
     assert graph["links"][0]["confirmed_both_ends"] is True
 
 
-def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switches):
+def test_unmanaged_neighbours_are_opt_in(client, db, org, operator, switches):
     """
-    An unmanaged neighbour advertising Bridge is infrastructure
+    The default view is the network this installation manages
 
-    It shows in the default view; an end host does not. That distinction is
-    the point of the tiered graph.
+    An unmanaged neighbour is anything that answered LLDP or CDP, so a site's
+    phones and access points outnumber its switches; showing them all before
+    anyone asked buried the network in its own peripherals. Asking for them
+    brings them back, classified.
     """
     add_neighbor(
         db, org, switches[0], "unmanaged-sw",
@@ -386,27 +388,35 @@ def test_unmanaged_neighbours_can_be_excluded(client, db, org, operator, switche
 
     session = as_user(client, operator)
 
-    included = session.get("/api/v1/discovery/topology").json()
+    default = session.get("/api/v1/discovery/topology").json()
+    assert default["stats"]["unmanaged_nodes"] == 0
+    assert default["stats"]["links"] == 0
+    assert all(node["managed"] for node in default["nodes"])
+    # Counted, not silently dropped: the diagram says one is being held back
+    # so a switch does not simply vanish.
+    assert default["stats"]["hidden_unmanaged"] == 1
+
+    included = session.get(
+        "/api/v1/discovery/topology", params={"include_unmanaged": True}
+    ).json()
     assert included["stats"]["unmanaged_nodes"] == 1
     unmanaged = next(n for n in included["nodes"] if not n["managed"])
     assert unmanaged["label"] == "unmanaged-sw"
     assert unmanaged["ip_address"] == "10.9.9.9"
     assert unmanaged["tier"] == "edge"
 
-    excluded = session.get(
-        "/api/v1/discovery/topology", params={"include_unmanaged": False}
-    ).json()
-    assert excluded["stats"]["unmanaged_nodes"] == 0
-    assert excluded["stats"]["links"] == 0
-
 
 def test_end_hosts_are_hidden_from_the_default_view(client, db, org, operator, switches):
     """
     The reported problem: every connected host on one diagram
 
-    A phone or a PC is inventory, not topology. It is excluded by default and
-    counted, so the UI can offer a drill-down rather than silently omitting
-    it.
+    A phone or a PC is inventory, not topology. It is excluded and counted, so
+    the UI can offer a drill-down rather than silently omitting it - while an
+    unmanaged neighbour that is plainly infrastructure is shown.
+
+    Asked for with include_unmanaged, because that distinction is the subject
+    here; whether unmanaged neighbours appear at all is a separate axis and
+    has its own test.
     """
     add_neighbor(
         db, org, switches[0], "desk-phone-204",
@@ -422,7 +432,9 @@ def test_end_hosts_are_hidden_from_the_default_view(client, db, org, operator, s
     )
 
     session = as_user(client, operator)
-    body = session.get("/api/v1/discovery/topology").json()
+    body = session.get(
+        "/api/v1/discovery/topology", params={"include_unmanaged": True}
+    ).json()
 
     labels = {node["label"] for node in body["nodes"]}
     assert "idf-2-sw" in labels
@@ -461,6 +473,84 @@ def test_a_single_node_can_be_drilled_into(client, db, org, operator, switches):
     # Only the expanded switch's hosts appear, not the whole network's.
     assert "phone-a" in labels
     assert "phone-b" not in labels
+
+
+def test_the_tier_list_does_not_defeat_the_unmanaged_filter(
+    client, db, org, operator, switches
+):
+    """
+    Two independent axes, and naming tiers must not smuggle one past the other
+
+    The page sends its tier checkboxes on every request, so a first attempt
+    that let an explicitly named tier override include_unmanaged put the
+    unmanaged neighbours straight back on the default diagram - the flag was
+    sent and had no effect. The edge tier holds managed and unmanaged devices
+    alike, so naming it says nothing about which.
+    """
+    add_neighbor(
+        db, org, switches[0], "unmanaged-sw", capabilities="Bridge, Router",
+    )
+
+    body = as_user(client, operator).get(
+        "/api/v1/discovery/topology",
+        params={"tiers": "core,distribution,access,edge"},
+    ).json()
+
+    assert "unmanaged-sw" not in {node["label"] for node in body["nodes"]}
+    assert body["stats"]["unmanaged_nodes"] == 0
+
+
+def test_the_host_tier_needs_no_flag(client, db, org, operator, switches):
+    """
+    The one tier that is unambiguous
+
+    Nothing managed is ever in the host tier, so asking for it is already the
+    request - making the reader tick a second box would be asking the same
+    question twice.
+    """
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+
+    body = as_user(client, operator).get(
+        "/api/v1/discovery/topology",
+        params={"tiers": "core,distribution,access,host"},
+    ).json()
+
+    assert "phone-a" in {node["label"] for node in body["nodes"]}
+
+
+def test_a_drill_down_survives_unmanaged_being_off(
+    client, db, org, operator, switches
+):
+    """
+    Clicking a switch is an explicit request, and outranks the default
+
+    Every end host is an unmanaged neighbour, so excluding unmanaged
+    neighbours from the default view could easily have taken the drill-down
+    with it - leaving a button that does nothing. It also has to keep
+    counting: the switch still reports how many hosts are behind it, or the
+    UI has no reason to offer the drill-down in the first place.
+    """
+    add_neighbor(
+        db, org, switches[0], "phone-a",
+        local_interface="Gi1/0/4", capabilities="Telephone",
+    )
+
+    session = as_user(client, operator)
+    core_key = f"device:{switches[0].id}"
+
+    default = session.get("/api/v1/discovery/topology").json()
+    assert "phone-a" not in {node["label"] for node in default["nodes"]}
+    assert default["stats"]["hidden_hosts"] == 1
+    core = next(n for n in default["nodes"] if n["key"] == core_key)
+    assert core["host_count"] == 1
+
+    drilled = session.get(
+        "/api/v1/discovery/topology", params={"expand": core_key}
+    ).json()
+    assert "phone-a" in {node["label"] for node in drilled["nodes"]}
 
 
 def test_every_host_can_be_asked_for_explicitly(client, db, org, operator, switches):

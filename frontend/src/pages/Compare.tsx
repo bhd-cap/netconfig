@@ -25,6 +25,10 @@ export const Compare: React.FC = () => {
         config2_id: config2.id,
         context_lines: 3,
         include_html: false,
+        // Both configurations in full, because the viewer lets the reader
+        // turn "changes only" off - and unchanged lines are exactly what a
+        // diff leaves out.
+        include_content: true,
       });
       return response.data;
     },
@@ -81,11 +85,19 @@ export const Compare: React.FC = () => {
             isIdentical={compareResult.is_identical}
           />
 
-          {/* Diff Viewer */}
+          {/* Diff Viewer
+              The two configurations, not the diff of them. Passing the
+              unified diff as one side and "" as the other made every line of
+              it read as a deletion, and left the viewer with no unchanged
+              lines to reveal when "changes only" was turned off. */}
           {!compareResult.is_identical && (
             <DiffViewer
-              oldValue={compareResult.unified_diff}
-              newValue=""
+              oldValue={compareResult.config1.content ?? ''}
+              newValue={compareResult.config2.content ?? ''}
+              contentOmitted={Boolean(
+                compareResult.config1.content_omitted ||
+                  compareResult.config2.content_omitted
+              )}
               oldTitle={`${selectedConfigs.config1.device_hostname} - ${new Date(
                 selectedConfigs.config1.backed_up_at
               ).toLocaleString()}`}

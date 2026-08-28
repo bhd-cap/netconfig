@@ -192,110 +192,116 @@ export const Backups: React.FC = () => {
         </div>
       ) : backupsData && backupsData.items.length > 0 ? (
         <div className="bg-white rounded-lg shadow overflow-hidden">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Device
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Filename
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Status
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Backup Time
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Size
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Duration
-                </th>
-                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Actions
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {backupsData.items.map((backup) => (
-                <tr key={backup.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center">
-                      <Database className="h-5 w-5 text-gray-400 mr-3" />
-                      <div>
-                        <div className="text-sm font-medium text-gray-900">
-                          {backup.device_hostname || 'Unknown'}
-                        </div>
-                        {backup.device_ip && (
-                          <div className="text-sm text-gray-500">{backup.device_ip}</div>
-                        )}
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4">
-                    <div className="flex items-center">
-                      <FileText className="h-4 w-4 text-gray-400 mr-2" />
-                      <span className="text-sm text-gray-900 font-mono">{backup.filename}</span>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    {getStatusBadge(backup.status)}
-                    {backup.error_message && (
-                      <div className="text-xs text-red-600 mt-1" title={backup.error_message}>
-                        {backup.error_message.substring(0, 50)}
-                        {backup.error_message.length > 50 ? '...' : ''}
-                      </div>
-                    )}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center text-sm text-gray-900">
-                      <Calendar className="h-4 w-4 text-gray-400 mr-2" />
-                      <div>
-                        <div>{new Date(backup.backed_up_at).toLocaleDateString()}</div>
-                        <div className="text-xs text-gray-500">
-                          {new Date(backup.backed_up_at).toLocaleTimeString()}
-                        </div>
-                      </div>
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <div className="flex items-center text-sm text-gray-900">
-                      <HardDrive className="h-4 w-4 text-gray-400 mr-2" />
-                      {formatFileSize(backup.file_size)}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    <div className="flex items-center">
-                      <Clock className="h-4 w-4 text-gray-400 mr-2" />
-                      {formatDuration(backup.backup_duration)}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                    {backup.status === 'success' && (
-                      <div className="flex items-center justify-end space-x-3">
-                        <button
-                          onClick={() => handleView(backup)}
-                          className="inline-flex items-center text-green-600 hover:text-green-900"
-                          title="View Configuration"
-                        >
-                          <Eye className="h-5 w-5" />
-                        </button>
-                        <button
-                          onClick={() => handleDownload(backup)}
-                          className="inline-flex items-center text-blue-600 hover:text-blue-900"
-                          title="Download"
-                        >
-                          <Download className="h-5 w-5" />
-                        </button>
-                      </div>
-                    )}
-                  </td>
+          {/* The columns do not fit a laptop screen, and the card's rounded
+              corners need overflow-hidden - which clips rather than scrolls.
+              The table gets its own scroller so the page itself never scrolls
+              sideways. */}
+          <div className="overflow-x-auto">
+            <table className="min-w-full divide-y divide-gray-200">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Device
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Filename
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Backup Time
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Size
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Duration
+                  </th>
+                  <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Actions
+                  </th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="bg-white divide-y divide-gray-200">
+                {backupsData.items.map((backup) => (
+                  <tr key={backup.id} className="hover:bg-gray-50">
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center">
+                        <Database className="h-5 w-5 text-gray-400 mr-3" />
+                        <div>
+                          <div className="text-sm font-medium text-gray-900">
+                            {backup.device_hostname || 'Unknown'}
+                          </div>
+                          {backup.device_ip && (
+                            <div className="text-sm text-gray-500">{backup.device_ip}</div>
+                          )}
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div className="flex items-center">
+                        <FileText className="h-4 w-4 text-gray-400 mr-2" />
+                        <span className="text-sm text-gray-900 font-mono">{backup.filename}</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      {getStatusBadge(backup.status)}
+                      {backup.error_message && (
+                        <div className="text-xs text-red-600 mt-1" title={backup.error_message}>
+                          {backup.error_message.substring(0, 50)}
+                          {backup.error_message.length > 50 ? '...' : ''}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center text-sm text-gray-900">
+                        <Calendar className="h-4 w-4 text-gray-400 mr-2" />
+                        <div>
+                          <div>{new Date(backup.backed_up_at).toLocaleDateString()}</div>
+                          <div className="text-xs text-gray-500">
+                            {new Date(backup.backed_up_at).toLocaleTimeString()}
+                          </div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <div className="flex items-center text-sm text-gray-900">
+                        <HardDrive className="h-4 w-4 text-gray-400 mr-2" />
+                        {formatFileSize(backup.file_size)}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                      <div className="flex items-center">
+                        <Clock className="h-4 w-4 text-gray-400 mr-2" />
+                        {formatDuration(backup.backup_duration)}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      {backup.status === 'success' && (
+                        <div className="flex items-center justify-end space-x-3">
+                          <button
+                            onClick={() => handleView(backup)}
+                            className="inline-flex items-center text-green-600 hover:text-green-900"
+                            title="View Configuration"
+                          >
+                            <Eye className="h-5 w-5" />
+                          </button>
+                          <button
+                            onClick={() => handleDownload(backup)}
+                            className="inline-flex items-center text-blue-600 hover:text-blue-900"
+                            title="Download"
+                          >
+                            <Download className="h-5 w-5" />
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           {/* Pagination */}
           {backupsData.total_pages > 1 && (

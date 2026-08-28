@@ -166,6 +166,17 @@ All repositories extend `BaseRepository[ModelType]` with standard CRUD operation
 
 **API Client**: Configured axios instance in `lib/api.ts` with request/response interceptors.
 
+**Layout**: `MainLayout` keeps two sidebar states apart - `sidebarOpen` slides
+it in over a small screen, `collapsed` reduces it to a rail of icons on a
+large one and is remembered in localStorage. The rail is desktop-only: icons
+with no labels on a phone would be the worst of both. Each item's name becomes
+its `title` when collapsed, so nothing is unlabelled.
+
+**Wide tables** need their own `overflow-x-auto` wrapper *inside* the card. A
+card with rounded corners carries `overflow-hidden`, which clips rather than
+scrolls, and putting the scroller on the page instead makes the whole layout
+slide sideways.
+
 ### Celery Task Queue
 
 **Tasks** (`app/tasks/backup.py`):
@@ -315,6 +326,17 @@ devices) or paging through equal values repeats and skips rows.
 
 **Important**: Always verify both configs belong to same device before comparing.
 
+**The viewer diffs the two configurations, not the server's diff of them.**
+`include_content=true` returns both files in full alongside the unified diff,
+because turning "changes only" off means showing the lines a diff leaves out -
+and a diff, by definition, does not have them. Feeding the unified diff in as
+one side against an empty string made every line of it read as a deletion and
+left the switch with nothing to reveal. Content is withheld above
+`CONTENT_MAX_CHARS` with `content_omitted` saying so, and the viewer falls
+back to the unified diff rather than being handed a response no browser will
+render. The unified diff is still what the copy and download buttons hand
+over: that is the format anyone pasting it into a ticket wants.
+
 ## Discovery, Inventory and Topology
 
 **Transports**: `Device.transport` is `ssh`, `telnet` or `snmp`. SSH and telnet
@@ -371,6 +393,27 @@ network. Two details worth keeping:
   promoted to `edge` if it has two or more links regardless. Plenty of
   switches advertise nothing, and one cabled to two devices is forwarding
   between them whoever owns it.
+
+**`include_unmanaged` and `tiers` are independent axes, and both default to
+the network you manage.** An unmanaged neighbour is anything that answered
+LLDP or CDP, so a site's phones and access points outnumber its switches;
+both filters are therefore off by default and each has to be asked for
+separately. Three things this must keep doing:
+
+- **Filter at the end, not at the data.** `build_graph` builds every node and
+  link and only then drops what was not asked for, so `host_count`,
+  `hidden_hosts` and `hidden_unmanaged` stay honest and the status bar can say
+  "18 hosts folded, 1 unmanaged hidden" rather than letting a switch vanish
+  unexplained.
+- **A named tier must not smuggle one filter past the other.** The page sends
+  its tier checkboxes on every request, so making an explicit tier override
+  `include_unmanaged` silently disabled the flag. The `edge` tier holds
+  managed and unmanaged devices alike and says nothing about which. `host` is
+  the sole exception - nothing managed is ever in it, so asking for that tier
+  is already the request.
+- **`expand` outranks both.** A drill-down names one node, and every end host
+  is an unmanaged neighbour; without this, turning unmanaged off would leave a
+  button that does nothing.
 
 **Discovered devices are probed, not assumed.** `_register_discovered()` runs
 `discovery_probe.assess()` before writing the row: SNMP first (read-only and
@@ -775,7 +818,7 @@ Things to know before changing it:
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (565 tests), installer update checks, and browser
+- Backend test suite (574 tests), installer update checks, and browser
   smoke tests
 - One-line installer
 

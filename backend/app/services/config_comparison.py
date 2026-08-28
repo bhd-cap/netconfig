@@ -38,6 +38,13 @@ def _format_range(start: int, stop: int) -> str:
 class ConfigurationComparison:
     """Service for comparing device configurations"""
 
+    # Above this, `include_content` returns nothing for that side rather than
+    # a response no browser will render. Comfortably larger than any real
+    # device configuration - a 4 MB running-config is around 100,000 lines -
+    # and far below COMPARE_MAX_FILE_BYTES, which bounds what may be diffed at
+    # all rather than what may be sent to a viewer.
+    CONTENT_MAX_CHARS = 4 * 1024 * 1024
+
     @staticmethod
     def _build_matcher(
         lines1: Sequence[str], lines2: Sequence[str]
@@ -221,6 +228,7 @@ class ConfigurationComparison:
         config2_label: Optional[str] = None,
         context_lines: int = 3,
         include_html: bool = False,
+        include_content: bool = False,
     ) -> Dict[str, Any]:
         """
         Compare two configuration files and generate diff
@@ -235,6 +243,12 @@ class ConfigurationComparison:
                 far the most expensive part of a comparison (difflib compares
                 every changed line character by character and emits a full
                 HTML document), so it is only produced when asked for.
+            include_content: Also return both configurations in full. A viewer
+                that lets the reader turn context back on needs the lines the
+                diff left out, and both files have already been read here.
+                Withheld above CONTENT_MAX_BYTES, with `content_omitted` on
+                each side saying so, because a 30 MB configuration is a
+                response nobody can use.
 
         Returns:
             Dict containing diff results and statistics
@@ -294,6 +308,19 @@ class ConfigurationComparison:
                     "line_count": len(config2_lines),
                 },
             }
+
+            if include_content:
+                for key, lines in (
+                    ("config1", config1_lines),
+                    ("config2", config2_lines),
+                ):
+                    # Measured before joining, so an oversized configuration is
+                    # never built into a string only to be thrown away.
+                    too_big = (
+                        sum(len(line) for line in lines) > cls.CONTENT_MAX_CHARS
+                    )
+                    result[key]["content"] = None if too_big else "".join(lines)
+                    result[key]["content_omitted"] = too_big
 
             if include_html:
                 result["html_diff"] = difflib.HtmlDiff(wrapcolumn=80).make_file(

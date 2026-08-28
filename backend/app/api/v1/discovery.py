@@ -331,7 +331,13 @@ def get_topology(
     ),
     active_only: bool = Query(True),
     include_unmanaged: bool = Query(
-        True, description="Include neighbours that are not managed devices"
+        False,
+        description=(
+            "Include neighbours that are not managed devices. Off by default: "
+            "anything that answered LLDP or CDP counts, so a site's phones and "
+            "access points outnumber its network and fill the diagram before "
+            "anyone has asked for them."
+        ),
     ),
     tiers: Optional[str] = Query(
         None,
@@ -358,11 +364,12 @@ def get_topology(
     contributes only the user's edits on top of it, so newly discovered
     devices appear without discarding a hand-arranged layout.
 
-    By default only infrastructure is returned - core, distribution, access
-    and unmanaged edge devices. End hosts are excluded because a switch with
-    200 MACs behind it makes a diagram nobody can read; pass their parent's
-    key in `expand` to drill into one, or ask for the host tier to see them
-    all.
+    By default only managed infrastructure is returned - the core,
+    distribution and access devices this installation backs up. Two things are
+    opt-in because each one, on its own, turns a diagram into a hairball:
+    unmanaged neighbours (`include_unmanaged`) and end hosts (the host tier,
+    or one node at a time through `expand`). A switch with 200 MACs behind it
+    makes a picture nobody can read.
     """
     def split(value: Optional[str]) -> Optional[List[str]]:
         if not value:

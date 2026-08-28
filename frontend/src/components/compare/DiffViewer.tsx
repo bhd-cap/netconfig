@@ -1,10 +1,15 @@
 /**
  * DiffViewer Component
  * Displays configuration differences using react-diff-viewer-continued
+ *
+ * It is given the two configurations, not a diff of them, and computes the
+ * comparison itself - which is what makes "changes only" a real switch. The
+ * server's unified diff is still what the copy and download buttons hand
+ * over, because that is the format anyone pasting it into a ticket wants.
  */
 import React, { useState } from 'react';
 import ReactDiffViewer, { DiffMethod } from 'react-diff-viewer-continued';
-import { Download, Copy, Check } from 'lucide-react';
+import { Download, Copy, Check, AlertTriangle } from 'lucide-react';
 import { toast } from 'react-hot-toast';
 
 interface DiffViewerProps {
@@ -13,6 +18,8 @@ interface DiffViewerProps {
   oldTitle: string;
   newTitle: string;
   unifiedDiff: string;
+  /** The configuration was too large to send in full */
+  contentOmitted?: boolean;
 }
 
 export const DiffViewer: React.FC<DiffViewerProps> = ({
@@ -21,10 +28,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   oldTitle,
   newTitle,
   unifiedDiff,
+  contentOmitted = false,
 }) => {
   const [viewMode, setViewMode] = useState<'split' | 'unified'>('split');
   const [showChangesOnly, setShowChangesOnly] = useState(true);
   const [copied, setCopied] = useState(false);
+
+  // With no content there is nothing to show context from, so the viewer
+  // falls back to the unified diff the server produced and says so rather
+  // than offering a switch that cannot do anything.
+  const diffOnly = contentOmitted || (!oldValue && !newValue);
 
   const handleCopy = async () => {
     try {
@@ -63,8 +76,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           <div className="flex rounded-lg border border-gray-300 overflow-hidden">
             <button
               onClick={() => setViewMode('split')}
-              className={`px-3 py-1 text-sm ${
-                viewMode === 'split'
+              disabled={diffOnly}
+              className={`px-3 py-1 text-sm disabled:opacity-50 ${
+                !diffOnly && viewMode === 'split'
                   ? 'bg-blue-600 text-white'
                   : 'bg-white text-gray-700 hover:bg-gray-50'
               }`}
@@ -73,8 +87,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             </button>
             <button
               onClick={() => setViewMode('unified')}
-              className={`px-3 py-1 text-sm border-l border-gray-300 ${
-                viewMode === 'unified'
+              disabled={diffOnly}
+              className={`px-3 py-1 text-sm border-l border-gray-300 disabled:opacity-50 ${
+                diffOnly || viewMode === 'unified'
                   ? 'bg-blue-600 text-white'
                   : 'bg-white text-gray-700 hover:bg-gray-50'
               }`}
@@ -84,12 +99,23 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           </div>
 
           {/* Show Changes Only */}
-          <label className="flex items-center text-sm text-gray-700">
+          <label
+            className={`flex items-center text-sm ${
+              diffOnly ? 'text-gray-400 cursor-not-allowed' : 'text-gray-700'
+            }`}
+            title={
+              diffOnly
+                ? 'The configuration is too large to show in full; only the changes are available'
+                : undefined
+            }
+          >
             <input
               type="checkbox"
-              checked={showChangesOnly}
+              checked={showChangesOnly || diffOnly}
+              disabled={diffOnly}
               onChange={(e) => setShowChangesOnly(e.target.checked)}
-              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 mr-2"
+              data-testid="changes-only"
+              className="rounded border-gray-300 text-blue-600 focus:ring-blue-500 mr-2 disabled:opacity-50"
             />
             Changes only
           </label>
@@ -114,13 +140,23 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         </div>
       </div>
 
+      {diffOnly && (
+        <div className="px-4 py-3 bg-amber-50 border-b border-amber-200 flex items-start gap-2 text-sm text-amber-900">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <span>
+            This configuration is too large to send in full, so only the
+            changes are shown. Download either backup to read it whole.
+          </span>
+        </div>
+      )}
+
       {/* Diff Display */}
       <div className="diff-viewer-container">
         <ReactDiffViewer
-          oldValue={oldValue}
-          newValue={newValue}
-          splitView={viewMode === 'split'}
-          showDiffOnly={showChangesOnly}
+          oldValue={diffOnly ? unifiedDiff : oldValue}
+          newValue={diffOnly ? '' : newValue}
+          splitView={!diffOnly && viewMode === 'split'}
+          showDiffOnly={showChangesOnly || diffOnly}
           useDarkTheme={false}
           leftTitle={oldTitle}
           rightTitle={newTitle}

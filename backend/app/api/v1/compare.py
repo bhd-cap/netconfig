@@ -25,6 +25,10 @@ class CompareRequest(BaseModel):
     config2_id: int
     context_lines: int = 3
     include_html: bool = False
+    # A viewer that can turn context back on needs the lines the diff left
+    # out. Off by default so a caller that only wants statistics or the
+    # unified diff is not sent two whole configurations.
+    include_content: bool = False
 
 
 class CompareResponse(BaseModel):
@@ -106,6 +110,7 @@ def compare_configurations(
             config2_label=f"{device1.hostname} - {config2.backed_up_at.strftime('%Y-%m-%d %H:%M:%S')}",
             context_lines=compare_request.context_lines,
             include_html=compare_request.include_html,
+            include_content=compare_request.include_content,
         )
 
         # Log comparison
