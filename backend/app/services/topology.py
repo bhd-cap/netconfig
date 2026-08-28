@@ -288,7 +288,7 @@ def build_graph(
     db: Session,
     organization_id: int,
     active_only: bool = True,
-    include_unmanaged: bool = True,
+    include_unmanaged: bool = False,
     tiers: Optional[Sequence[str]] = None,
     expand: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
@@ -299,13 +299,23 @@ def build_graph(
         db: Database session
         organization_id: Tenant scope
         active_only: Only include adjacencies still being seen
-        include_unmanaged: Include neighbours that are not managed devices
+        include_unmanaged: Show neighbours that are not managed devices. Off
+            by default: an unmanaged neighbour is anything that answered LLDP
+            or CDP, so a site's phones and access points outnumber its
+            network. They are still built and counted - the filtering happens
+            at the end - so the drill-down and the "and 214 hosts" count stay
+            available without them.
         tiers: Which tiers to return. Defaults to infrastructure only - a
             switch with 200 MACs behind it makes a diagram nobody can read,
-            and those hosts are inventory rather than topology.
+            and those hosts are inventory rather than topology. This is a
+            separate axis from include_unmanaged: the edge tier holds managed
+            and unmanaged devices alike, so naming it says nothing about
+            which. The host tier is the exception - only an unmanaged
+            neighbour is ever in it, so asking for it can only mean one thing.
         expand: Node keys whose end hosts should be included even when the
             host tier is filtered out. This is the drill-down: click a switch
             and see what is behind it, without unfolding the whole network.
+            A click names one node, so it outranks both filters.
 
     Returns:
         dict with 'nodes', 'links' and 'stats'
@@ -372,9 +382,6 @@ def build_graph(
             if target not in nodes:
                 continue
         else:
-            if not include_unmanaged:
-                continue
-
             target = unmanaged_key(adjacency.remote_hostname)
             if target not in nodes:
                 nodes[target] = {
@@ -442,17 +449,33 @@ def build_graph(
     for key, count in hidden_children.items():
         nodes[key]["host_count"] = count
 
-    # Filter to the requested tiers. A node in an unwanted tier still appears
-    # when it hangs off a node the caller expanded.
-    def keep(node: Dict[str, Any]) -> bool:
-        if node.get("tier") in wanted_tiers:
-            return True
+    # Filter to what was asked for. Everything above ran over the whole graph,
+    # so the counts a hidden node contributes - host_count, hidden_hosts, a
+    # device's tier - are the same whatever is on screen.
+    def drilled_into(node: Dict[str, Any]) -> bool:
+        """Whether this node hangs off one the caller expanded"""
         return any(
-            link["key"]
-            for link in links.values()
-            if (link["source"] == node["key"] and link["target"] in expanded)
+            (link["source"] == node["key"] and link["target"] in expanded)
             or (link["target"] == node["key"] and link["source"] in expanded)
+            for link in links.values()
         )
+
+    def keep(node: Dict[str, Any]) -> bool:
+        if node.get("tier") not in wanted_tiers:
+            return drilled_into(node)
+
+        # In a wanted tier, and managed: always.
+        if node["managed"] or include_unmanaged:
+            return True
+
+        # An unmanaged neighbour in a wanted tier still has to have been asked
+        # for, or the network disappears among the phones plugged into it. The
+        # host tier is the one place that needs no flag: nothing managed is
+        # ever in it, so asking for it is already the request.
+        if node.get("tier") == TIER_HOST:
+            return True
+
+        return drilled_into(node)
 
     visible = {key: node for key, node in nodes.items() if keep(node)}
 
@@ -464,6 +487,15 @@ def build_graph(
     ]
 
     total_hosts = sum(1 for node in nodes.values() if node.get("tier") == TIER_HOST)
+
+    def unmanaged_infrastructure(collection) -> int:
+        """Unmanaged neighbours that are not end hosts - hosts are counted
+        separately, and counting them twice would read as double the total."""
+        return sum(
+            1
+            for node in collection
+            if not node["managed"] and node.get("tier") != TIER_HOST
+        )
 
     return {
         "nodes": node_list,
@@ -482,6 +514,10 @@ def build_graph(
                 1 for node in node_list if node.get("tier") == TIER_HOST
             ),
             "total_hosts": total_hosts,
+            # The same courtesy for the unmanaged filter: a switch that
+            # vanishes with no explanation is a bug report.
+            "hidden_unmanaged": unmanaged_infrastructure(nodes.values())
+            - unmanaged_infrastructure(node_list),
             "tiers": sorted(wanted_tiers),
             "by_tier": {
                 tier: sum(1 for node in nodes.values() if node.get("tier") == tier)

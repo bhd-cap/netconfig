@@ -249,16 +249,18 @@ export interface CompareResponse {
     changed_sections: number;
     total_changes: number;
   };
-  config1: {
-    path: string;
-    label?: string;
-    line_count: number;
-  };
-  config2: {
-    path: string;
-    label?: string;
-    line_count: number;
-  };
+  config1: ComparedConfig;
+  config2: ComparedConfig;
+}
+
+export interface ComparedConfig {
+  path: string;
+  label?: string;
+  line_count: number;
+  /** Present only when the comparison was asked for `include_content` */
+  content?: string | null;
+  /** True when the file was too large to return in full */
+  content_omitted?: boolean;
 }
 
 export interface DiffBlock {
@@ -497,6 +499,8 @@ export interface TopologyGraph {
     manual_links?: number;
     hidden_hosts?: number;
     total_hosts?: number;
+    /** Unmanaged neighbours the filter is holding back, end hosts aside */
+    hidden_unmanaged?: number;
     tiers?: string[];
     by_tier?: Record<string, number>;
   };
