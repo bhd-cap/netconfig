@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.cleanup",
         "app.tasks.discovery",
         "app.tasks.remote_backup",
+        "app.tasks.telemetry",
     ],
 )
 
@@ -68,6 +69,23 @@ celery_app.conf.beat_schedule = {
         "task": "app.tasks.discovery.age_inventory_task",
         "schedule": crontab(minute=20),
         "options": {"expires": 3000},
+    },
+    # Hardware inventory and environmental readings over SNMP, every half
+    # hour. Frequent enough for a temperature trend to mean something, rare
+    # enough that a hundred devices is a few minutes of walking rather than a
+    # constant load. Expires before the next run so a slow pass is skipped
+    # rather than queued behind itself.
+    "poll-snmp-telemetry": {
+        "task": "app.tasks.telemetry.poll_telemetry_task",
+        "schedule": crontab(minute="5,35"),
+        "options": {"expires": 1500},
+    },
+    # And prune what that writes: sensor_readings is the only table here that
+    # grows with time rather than with the size of the estate.
+    "prune-sensor-history": {
+        "task": "app.tasks.telemetry.prune_sensor_history_task",
+        "schedule": crontab(hour=3, minute=30),
+        "options": {"expires": 3600},
     },
 }
 

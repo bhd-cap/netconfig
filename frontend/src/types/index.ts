@@ -452,6 +452,15 @@ export interface TopologyNode {
   is_active: boolean;
   discovered: boolean;
   last_backup_status?: string | null;
+  last_auth_status?: string | null;
+  model?: string | null;
+  /**
+   * What sort of device this is, for the icon the diagram draws: router,
+   * switch, firewall, wireless, server, phone, printer, host or unknown.
+   * Worked out by the API from the model, description, advertised
+   * capabilities and platform, in that order of trust.
+   */
+  kind?: string | null;
   link_count: number;
   x?: number;
   y?: number;
@@ -815,6 +824,88 @@ export const INFRASTRUCTURE_TIERS: Tier[] = [
 export const ALL_TIERS: Tier[] = [...INFRASTRUCTURE_TIERS, 'host'];
 
 // ---------------------------------------------------------------------------
+// SNMP hardware inventory and environmental readings
+// ---------------------------------------------------------------------------
+
+/** One physical part of a device, from ENTITY-MIB */
+export interface DeviceComponentRow {
+  id: number;
+  device_id?: number;
+  device_hostname?: string;
+  entity_index: string;
+  parent_index?: string | null;
+  name?: string | null;
+  description?: string | null;
+  /** chassis, module, power, fan, stack, cpu, port, sensor, container, other */
+  component_class: string;
+  model_name?: string | null;
+  serial_number?: string | null;
+  hardware_rev?: string | null;
+  firmware_rev?: string | null;
+  software_rev?: string | null;
+  /** False once the part stops being reported: it was removed, not forgotten. */
+  is_active: boolean;
+  first_seen?: string;
+  last_seen?: string;
+}
+
+/** One sensor's current reading, with the history behind its chart */
+export interface DeviceSensorRow {
+  id: number;
+  device_id?: number;
+  device_hostname?: string;
+  sensor_key?: string;
+  name: string;
+  /** temperature, fan, voltage, current, power, cpu, memory, storage... */
+  sensor_type: string;
+  unit: string;
+  /** Null for a sensor that reports only a state, such as a failed supply. */
+  value: number | null;
+  status: string;
+  source: string;
+  last_reading_at?: string;
+  history?: Array<{ at: string; value: number | null }>;
+}
+
+export interface DeviceComponentsResponse {
+  device_id: number;
+  hostname: string;
+  polled_at?: string | null;
+  components: DeviceComponentRow[];
+}
+
+export interface DeviceSensorsResponse {
+  device_id: number;
+  hostname: string;
+  polled_at?: string | null;
+  sensors: DeviceSensorRow[];
+}
+
+export interface SensorTypeSummary {
+  sensor_type: string;
+  unit: string;
+  count: number;
+  min?: number | null;
+  avg?: number | null;
+  max?: number | null;
+  unhealthy: number;
+}
+
+export interface SensorOverview {
+  summary: SensorTypeSummary[];
+  items: DeviceSensorRow[];
+}
+
+/** What one telemetry poll reported for a device */
+export interface TelemetryPollOutcome {
+  device_id: number;
+  hostname: string;
+  components: number;
+  sensors: number;
+  sources: string[];
+  error?: string | null;
+}
+
 // Rediscovery
 // ---------------------------------------------------------------------------
 

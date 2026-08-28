@@ -420,6 +420,54 @@ writes them uppercase and a lookup normalises the MAC to lowercase. The bundled
 `app/data/oui_common.csv` is a 12-prefix starter set, not the registry; the
 real thing is imported from the system, a URL or IEEE.
 
+## Hardware Inventory and Environmental Telemetry
+
+A second thing SNMP is good for: what a device is made of and what it is doing.
+`app/services/snmp_inventory.py` walks ENTITY-MIB for the parts,
+ENTITY-SENSOR-MIB, CISCO-ENVMON-MIB and HOST-RESOURCES-MIB for the readings,
+and returns a `PollResult`. It is **pure**: parsing is separated from the walk
+(`parse_components()`, `parse_entity_sensors()`, `parse_cisco_envmon()`,
+`parse_utilisation()`) so every vendor quirk has a unit test against captured
+output rather than a live device.
+
+`app/services/telemetry.py` stores it, and the split across three tables is the
+thing to preserve:
+
+- `device_components` is aged, never deleted, like the rest of the inventory.
+  "The supply that used to be in slot B, serial ART2101B3QQ" is exactly what a
+  serial-number record is for.
+- `device_sensors` holds **one row per sensor**, upserted on
+  `(device_id, sensor_key)`. "What is this device doing now" is one indexed
+  read, not a scan of history.
+- `sensor_readings` is that history. It is the only table here that grows with
+  time rather than with the size of the estate, so
+  `prune_sensor_history_task` is not optional - one switch with twenty sensors
+  writes about a million rows a year at a poll every thirty minutes. Only
+  numeric readings are appended; a supply that reports "failed" and no number
+  would otherwise write a row of nulls twice an hour.
+
+**A sensor key is namespaced by where it came from** - `entity:1013`,
+`envmon:fan:2`, `cpu:hr:1` - because two MIBs describe the same fan and an
+un-namespaced index would collide.
+
+**ENTITY-SENSOR-MIB values need scaling before they mean anything.**
+`entPhySensorScale` is an SI exponent and `entPhySensorPrecision` a count of
+decimal places; a raw 41500 with scale `milli` and precision 3 is 41.5 °C.
+Storing the raw value gives a temperature chart with a y-axis in the tens of
+thousands.
+
+**Beat**: `poll_telemetry_task` at `crontab(minute="5,35")`, and
+`prune_sensor_history_task` daily at 03:30. The poll has `max_retries=0` on
+purpose - a pass that failed part way already stored what answered, and the
+next run is half an hour away.
+
+The estate-wide endpoints (`/devices/components`, `/devices/sensors`,
+`/devices/poll-telemetry`) are declared **before** `/devices/{device_id}`, or
+`components` is parsed as a device id. The `/devices/sensors` summary groups by
+`sensor_type` alone and coalesces the unit, because a state-only sensor carries
+no unit and grouping on it would split power into a tile of watts and a second,
+numberless tile.
+
 ## Scheduled Job Device Filters
 
 `BackupJob.device_filter` is a JSONB document resolved by
@@ -668,7 +716,7 @@ Things to know before changing it:
 ## Current Status
 
 **Complete**:
-- Backend API (98 endpoints)
+- Backend API (106 endpoints)
 - Authentication, roles and per-permission authorization
 - Device management over SSH, telnet and SNMP, with column sorting, a chosen
   page size, bulk edit and delete, a detail view of everything discovery
@@ -685,11 +733,15 @@ Things to know before changing it:
 - Editable, saved topology diagrams, full screen or in their own tab
 - Host inventory with first/last seen, the name each host announces over
   LLDP/CDP, and OUI vendor mapping
+- SNMP hardware inventory and environmental telemetry: chassis, modules,
+  supplies and fans with serial numbers; temperature, fan, power, voltage,
+  CPU and memory readings with a day of history, polled on a schedule and
+  shown on the Inventory page and each device's detail view
 - Connected-device reports and a CSV export
 - SFTP/FTP export of stored configurations
 - User administration, application settings and maintenance windows
 - Frontend pages for all of the above
-- Backend test suite (479 tests), installer update checks, and browser
+- Backend test suite (540 tests), installer update checks, and browser
   smoke tests
 - One-line installer
 

@@ -10,10 +10,12 @@
  * out, 4 credentials tried" is actionable, where an inactive flag on its own
  * leaves an operator guessing.
  */
-import React from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useMemo } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { toast } from 'react-hot-toast';
 import { format, formatDistanceToNow } from 'date-fns';
 import {
+  Activity,
   AlertTriangle,
   CheckCircle2,
   Clock,
@@ -27,7 +29,21 @@ import {
   XCircle,
 } from 'lucide-react';
 import api from '../../lib/api';
-import { AuthStatus, DeviceDetail } from '../../types';
+import {
+  ComponentTable,
+  SENSOR_LABELS,
+  SensorTable,
+  SensorTiles,
+  SensorTrend,
+} from '../telemetry/SensorViews';
+import {
+  AuthStatus,
+  DeviceComponentsResponse,
+  DeviceDetail,
+  DeviceSensorRow,
+  DeviceSensorsResponse,
+  TelemetryPollOutcome,
+} from '../../types';
 
 interface Props {
   deviceId: number;
@@ -100,10 +116,84 @@ const ProbeBadge: React.FC<{ result: string }> = ({ result }) => {
 };
 
 export const DeviceDetailPanel: React.FC<Props> = ({ deviceId, onClose }) => {
+  const queryClient = useQueryClient();
+
   const { data, isLoading, error } = useQuery<DeviceDetail>({
     queryKey: ['device-detail', deviceId],
     queryFn: async () => (await api.get(`/devices/${deviceId}/detail`)).data,
   });
+
+  // Hardware and readings are separate requests: they come from SNMP rather
+  // than from the device row, a device may have neither, and a detail view
+  // should open on what is already known rather than wait for both.
+  const { data: hardware } = useQuery<DeviceComponentsResponse>({
+    queryKey: ['device-components', deviceId],
+    queryFn: async () => (await api.get(`/devices/${deviceId}/components`)).data,
+  });
+
+  const { data: readings } = useQuery<DeviceSensorsResponse>({
+    queryKey: ['device-sensors', deviceId],
+    queryFn: async () => (await api.get(`/devices/${deviceId}/sensors`)).data,
+  });
+
+  const pollMutation = useMutation({
+    mutationFn: async () =>
+      (await api.post<TelemetryPollOutcome>(`/devices/${deviceId}/poll-telemetry`))
+        .data,
+    onSuccess: (outcome) => {
+      queryClient.invalidateQueries({ queryKey: ['device-components', deviceId] });
+      queryClient.invalidateQueries({ queryKey: ['device-sensors', deviceId] });
+
+      if (outcome.error) {
+        toast.error(`${outcome.hostname}: ${outcome.error}`, { duration: 7000 });
+        return;
+      }
+      toast.success(
+        `${outcome.hostname}: ${outcome.components} component(s), ` +
+          `${outcome.sensors} reading(s)`
+      );
+    },
+    onError: (error: any) => {
+      toast.error(error.response?.data?.detail || 'Poll failed');
+    },
+  });
+
+  const sensors = readings?.sensors ?? [];
+
+  // Grouped by type so each chart has one unit on its axis. A single y-scale
+  // is not negotiable: °C and RPM on one chart would need two, which is the
+  // most misread chart there is.
+  const byType = useMemo(() => {
+    const groups = new Map<string, DeviceSensorRow[]>();
+    sensors.forEach((sensor) => {
+      const group = groups.get(sensor.sensor_type);
+      if (group) group.push(sensor);
+      else groups.set(sensor.sensor_type, [sensor]);
+    });
+    return groups;
+  }, [sensors]);
+
+  const summary = useMemo(
+    () =>
+      [...byType.entries()].map(([sensor_type, group]) => {
+        const values = group
+          .map((sensor) => sensor.value)
+          .filter((value): value is number => value !== null && value !== undefined);
+
+        return {
+          sensor_type,
+          unit: group[0].unit,
+          count: group.length,
+          min: values.length ? Math.min(...values) : null,
+          max: values.length ? Math.max(...values) : null,
+          avg: values.length
+            ? values.reduce((total, value) => total + value, 0) / values.length
+            : null,
+          unhealthy: group.filter((sensor) => sensor.status !== 'ok').length,
+        };
+      }),
+    [byType]
+  );
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-start justify-center z-50 p-4 overflow-y-auto">
@@ -272,6 +362,83 @@ export const DeviceDetailPanel: React.FC<Props> = ({ deviceId, onClose }) => {
                 </dl>
               </section>
             </div>
+
+            {/* Hardware and environment, polled over SNMP */}
+            <section>
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <h3 className="text-sm font-semibold text-gray-500 uppercase">
+                  Hardware and environment
+                </h3>
+                <div className="flex items-center gap-2 text-xs text-gray-500">
+                  {readings?.polled_at && (
+                    <span>polled {relative(readings.polled_at)}</span>
+                  )}
+                  <button
+                    onClick={() => pollMutation.mutate()}
+                    disabled={pollMutation.isPending}
+                    data-testid="poll-telemetry"
+                    className="inline-flex items-center px-2 py-1 border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    <Activity
+                      className={`h-3.5 w-3.5 mr-1 ${
+                        pollMutation.isPending ? 'animate-pulse' : ''
+                      }`}
+                    />
+                    Poll now
+                  </button>
+                </div>
+              </div>
+
+              {sensors.length === 0 && !(hardware?.components.length ?? 0) ? (
+                <p className="text-sm text-gray-500">
+                  Nothing polled yet. This needs SNMP: give the device a
+                  community or point it at one in the credential vault, then
+                  poll.
+                </p>
+              ) : (
+                <div className="space-y-4">
+                  <SensorTiles summary={summary} />
+
+                  {/* One chart per sensor type, so each has a single unit on
+                      its axis. */}
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                    {[...byType.entries()].map(([type, group]) => (
+                      <SensorTrend
+                        key={type}
+                        sensors={group}
+                        unit={group[0].unit}
+                        title={SENSOR_LABELS[type] ?? type}
+                      />
+                    ))}
+                  </div>
+
+                  {sensors.length > 0 && (
+                    <details className="rounded-lg border border-gray-200 p-3" open>
+                      <summary className="text-sm font-medium text-gray-700 cursor-pointer">
+                        All {sensors.length} reading
+                        {sensors.length === 1 ? '' : 's'}
+                      </summary>
+                      <div className="mt-2">
+                        <SensorTable sensors={sensors} />
+                      </div>
+                    </details>
+                  )}
+
+                  {(hardware?.components.length ?? 0) > 0 && (
+                    <details className="rounded-lg border border-gray-200 p-3">
+                      <summary className="text-sm font-medium text-gray-700 cursor-pointer">
+                        {hardware!.components.length} hardware component
+                        {hardware!.components.length === 1 ? '' : 's'}, with
+                        serial numbers
+                      </summary>
+                      <div className="mt-2">
+                        <ComponentTable components={hardware!.components} />
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+            </section>
 
             {/* Probe results */}
             <section>

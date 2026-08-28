@@ -235,6 +235,45 @@ Authorization: Bearer {token}
               "last_discovered_at", "location", "model", "os_version", "transport"] }
 ```
 
+### Rediscover
+```http
+POST /devices/{id}/rediscover        # inline: one device, one answer
+POST /devices/rediscover             # queued: { "device_ids": [1, 2] }
+```
+
+Re-asks the questions discovery asked when the device was found: which
+transports answer, which vault credential logs in, and what platform it is.
+It may change `transport`, `device_type`, `is_active`, `credential_id` and the
+discovered facts; it never changes anything a person entered - the hostname,
+the address, the location, the tags.
+
+```json
+{
+  "device_id": 7,
+  "hostname": "acc-sw-fl2",
+  "ip_address": "10.30.0.21",
+  "reachable": true,
+  "authenticated": true,
+  "transport": "ssh",
+  "device_type": "cisco_ios",
+  "credential_name": "Network admin",
+  "identified_by": "ssh",
+  "changes": { "device_type": ["unknown", "cisco_ios"] },
+  "message": "Logs in over SSH as cisco_ios",
+  "error": null
+}
+```
+
+`changes` carries only the fields that moved, as `[before, after]`.
+`identified_by` names which source settled the platform: `ssh` (the server
+version string or pre-auth banner), `version`, `prompt` or `collection` (a
+vendor's own configuration command answered). Each transport's outcome is
+upserted into `device_probes`, so the detail view can say "SSH refused, telnet
+timed out, 4 credentials tried".
+
+The bulk form queues and returns `{ "queued": true, "task_id": … }`, because a
+probe walks every vault credential over SSH and then telnet.
+
 ### Change Many Devices
 ```http
 PATCH /devices/bulk
@@ -928,6 +967,101 @@ POST /inventory/oui/backfill
 small starter set shipped with the app), `ieee`, `url` (with `url`) or `file`
 (with `path`). `backfill` re-resolves inventory rows that have no vendor, so
 existing rows benefit from a fresh import without waiting to be seen again.
+
+---
+
+## Hardware and Environment (SNMP)
+
+What a device is made of and what it is doing: chassis, modules, supplies and
+fans with their serial numbers, plus temperature, fan speed, power draw,
+voltage, CPU and memory. Collected over SNMP, on a schedule (twice an hour) or
+on demand.
+
+```http
+POST /devices/poll-telemetry           { "device_ids": [1, 2], "run_async": true }
+GET  /devices/components?search=FOC2137L0AB&component_class=power
+GET  /devices/sensors?sensor_type=temperature&status=warning
+POST /devices/{id}/poll-telemetry
+GET  /devices/{id}/components
+GET  /devices/{id}/sensors?history_hours=24
+```
+
+Polling needs `discovery:run`; reading needs `inventory:read` for the
+estate-wide lists and `devices:read` for one device. `run_async` defaults to
+true and returns a task id; the per-device `POST` always runs inline, because
+it is one device and the caller is waiting for the answer.
+
+An SNMP-less device is skipped with a reason rather than failing the run - it
+has no community, and there is nothing to ask.
+
+### Components
+```json
+{
+  "total": 34,
+  "page": 1,
+  "items": [
+    {
+      "id": 23,
+      "device_id": 7,
+      "device_hostname": "acc-sw-fl2",
+      "entity_index": "1",
+      "component_class": "chassis",
+      "name": "Chassis",
+      "model_name": "C9200-48P",
+      "serial_number": "FOC2137L0AB",
+      "hardware_rev": "V02",
+      "firmware_rev": "17.09.4a",
+      "is_active": true,
+      "first_seen": "2025-11-20T23:28:01Z",
+      "last_seen": "2026-08-27T23:22:01Z"
+    }
+  ]
+}
+```
+
+`component_class` is `chassis`, `module`, `power`, `fan`, `stack`, `cpu`,
+`port`, `sensor`, `container` or `other`. A part that stops being reported is
+marked `is_active: false` and kept, so "the supply that used to be in slot B"
+still has a serial number against it.
+
+### Sensors
+```json
+{
+  "summary": [
+    { "sensor_type": "temperature", "unit": "C", "count": 14,
+      "min": 27.5, "avg": 46.79, "max": 74.0, "unhealthy": 1 }
+  ],
+  "items": [
+    { "id": 5, "device_id": 7, "device_hostname": "acc-sw-fl2",
+      "name": "Outlet temperature", "sensor_type": "temperature",
+      "unit": "C", "value": 61.0, "status": "ok", "source": "entity-sensor",
+      "last_reading_at": "2026-08-27T23:22:01Z" }
+  ]
+}
+```
+
+One summary row per `sensor_type`, not per unit: a supply that reports only a
+state carries no unit and belongs in its type's row, not a numberless one of
+its own. `status` is `ok`, `warning`, `critical`, `failed`, `shutdown` or
+`unknown`.
+
+`GET /devices/{id}/sensors` adds `history` per sensor - `[{ "at": …, "value":
+… }]` over `history_hours`, which is the shape a chart wants:
+
+```json
+{
+  "device_id": 7,
+  "hostname": "acc-sw-fl2",
+  "polled_at": "2026-08-27T23:22:01Z",
+  "sensors": [
+    { "id": 5, "name": "Outlet temperature", "sensor_type": "temperature",
+      "unit": "C", "value": 61.0, "status": "ok",
+      "history": [{ "at": "2026-08-27T22:52:01Z", "value": 60.4 }] }
+  ]
+}
+```
+
+Pass `history_hours=0` for the readings alone.
 
 ---
 

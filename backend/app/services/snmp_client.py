@@ -55,6 +55,56 @@ OID = {
     "dot1dTpFdbPort": "1.3.6.1.2.1.17.4.3.1.2",
     "dot1dBasePortIfIndex": "1.3.6.1.2.1.17.1.4.1.2",
     "ipNetToMediaPhysAddress": "1.3.6.1.2.1.4.22.1.2",
+
+    # --- ENTITY-MIB: the hardware a chassis is made of, with serial numbers.
+    # Every one of these is indexed by the same entPhysicalIndex, which is what
+    # lets a fan, its parent chassis and a sensor reading be tied together.
+    "entPhysicalDescr": "1.3.6.1.2.1.47.1.1.1.1.2",
+    "entPhysicalContainedIn": "1.3.6.1.2.1.47.1.1.1.1.4",
+    "entPhysicalClass": "1.3.6.1.2.1.47.1.1.1.1.5",
+    "entPhysicalName": "1.3.6.1.2.1.47.1.1.1.1.7",
+    "entPhysicalHardwareRev": "1.3.6.1.2.1.47.1.1.1.1.8",
+    "entPhysicalFirmwareRev": "1.3.6.1.2.1.47.1.1.1.1.9",
+    "entPhysicalSoftwareRev": "1.3.6.1.2.1.47.1.1.1.1.10",
+    "entPhysicalSerialNum": "1.3.6.1.2.1.47.1.1.1.1.11",
+    "entPhysicalModelName": "1.3.6.1.2.1.47.1.1.1.1.13",
+
+    # --- ENTITY-SENSOR-MIB: temperature, voltage, current, power, fan speed.
+    # Indexed by entPhysicalIndex too, so a reading knows which part it came
+    # from without any vendor-specific mapping.
+    "entPhySensorType": "1.3.6.1.2.1.99.1.1.1.1",
+    "entPhySensorScale": "1.3.6.1.2.1.99.1.1.1.2",
+    "entPhySensorPrecision": "1.3.6.1.2.1.99.1.1.1.3",
+    "entPhySensorValue": "1.3.6.1.2.1.99.1.1.1.4",
+    "entPhySensorOperStatus": "1.3.6.1.2.1.99.1.1.1.5",
+
+    # --- CISCO-ENVMON-MIB: what older Cisco hardware offers instead, and
+    # plenty of it is still in service.
+    "ciscoEnvMonVoltageDescr": "1.3.6.1.4.1.9.9.13.1.2.1.2",
+    "ciscoEnvMonVoltageValue": "1.3.6.1.4.1.9.9.13.1.2.1.3",
+    "ciscoEnvMonVoltageState": "1.3.6.1.4.1.9.9.13.1.2.1.7",
+    "ciscoEnvMonTemperatureDescr": "1.3.6.1.4.1.9.9.13.1.3.1.2",
+    "ciscoEnvMonTemperatureValue": "1.3.6.1.4.1.9.9.13.1.3.1.3",
+    "ciscoEnvMonTemperatureState": "1.3.6.1.4.1.9.9.13.1.3.1.6",
+    "ciscoEnvMonFanDescr": "1.3.6.1.4.1.9.9.13.1.4.1.2",
+    "ciscoEnvMonFanState": "1.3.6.1.4.1.9.9.13.1.4.1.3",
+    "ciscoEnvMonSupplyDescr": "1.3.6.1.4.1.9.9.13.1.5.1.2",
+    "ciscoEnvMonSupplyState": "1.3.6.1.4.1.9.9.13.1.5.1.3",
+
+    # --- HOST-RESOURCES-MIB: processor load and storage, which servers and
+    # most modern network operating systems both answer.
+    "hrProcessorLoad": "1.3.6.1.2.1.25.3.3.1.2",
+    "hrStorageDescr": "1.3.6.1.2.1.25.2.3.1.3",
+    "hrStorageAllocationUnits": "1.3.6.1.2.1.25.2.3.1.4",
+    "hrStorageSize": "1.3.6.1.2.1.25.2.3.1.5",
+    "hrStorageUsed": "1.3.6.1.2.1.25.2.3.1.6",
+
+    # --- Cisco's own CPU and memory, for the boxes that answer neither of the
+    # standard ones.
+    "cpmCPUTotal5minRev": "1.3.6.1.4.1.9.9.109.1.1.1.1.8",
+    "ciscoMemoryPoolName": "1.3.6.1.4.1.9.9.48.1.1.1.2",
+    "ciscoMemoryPoolUsed": "1.3.6.1.4.1.9.9.48.1.1.1.5",
+    "ciscoMemoryPoolFree": "1.3.6.1.4.1.9.9.48.1.1.1.6",
 }
 
 _NO_VALUE = (
